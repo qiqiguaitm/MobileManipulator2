@@ -30,6 +30,8 @@
 // ROS2 headers
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/panel.hpp>
+#include <rviz_common/display_context.hpp>
+#include <rviz_common/ros_integration/ros_node_abstraction_iface.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
 // Standard messages

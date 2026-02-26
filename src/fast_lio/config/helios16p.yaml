@@ -1,0 +1,52 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1              # ROS1 launch实际值
+        max_iteration: 8                 # ROS1 launch实际值
+        filter_size_surf: 0.1            # ROS1 launch实际值
+        filter_size_map: 0.1             # ROS1 launch实际值
+        cube_side_length: 500.0          # ROS1 launch实际值
+        runtime_pos_log_enable: false
+
+        common:
+            lid_topic: "/rslidar_points"
+            imu_topic: "/imu/data"
+            # 打开内置时间同步，让 LiDAR / IMU / 里程计在同一时间轴上工作
+            # 之前为 false，会导致你现在看到的 TF timestamp mismatch / Message Filter dropping message 这类问题
+            time_sync_en: true
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 2                # 2 for Velodyne/Robosense
+            scan_line: 16                # Helios 16P = 16线
+            blind: 0.8                   # ROS1默认值
+            timestamp_unit: 0            # 秒
+            scan_rate: 10                # 10Hz
+
+        mapping:
+            # ========== 减少静止抖动：增大IMU噪声协方差 ==========
+            # 增大这些值 = 告诉Fast-LIO "IMU噪声大，别太信任它"
+            # 原值：0.05（过于信任IMU，导致静止时也会跟随IMU噪声抖动）
+            # 新值：0.5（降低对IMU的信任，更依赖LiDAR点云）
+            acc_cov: 0.5                 # 加速度计噪声协方差 (从0.05增大到0.5)
+            gyr_cov: 0.5                 # 陀螺仪噪声协方差 (从0.05增大到0.5)
+            # ====================================================
+            b_acc_cov: 0.00005           # 加速度计偏置协方差 (保持不变)
+            b_gyr_cov: 0.00005           # 陀螺仪偏置协方差 (保持不变)
+            fov_degree: 360.0            # Helios 360° FOV
+            det_range: 100.0             # 检测范围 100m
+            extrinsic_est_en: false
+            extrinsic_T: [ 0.27254, 0.00035, 0.095 ]
+            extrinsic_R: [ 1., 0., 0.,
+                           0., 1., 0.,
+                           0., 0., 1. ]
+
+        publish:
+            path_en: true
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1
