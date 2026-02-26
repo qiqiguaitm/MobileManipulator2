@@ -53,6 +53,7 @@ from perception_core import (
     CoordinateTransformer,
     ScenePerceptionCore,
     DinoXDetectorOnline,
+    SAM3Online,
     DepthOptimizerOnline,
     SimpleConfig,
     fuse_dual_camera_positions,
@@ -162,6 +163,7 @@ class MultiCameraPerceptionNode(Node):
 
         self.get_logger().info('='*60)
         self.get_logger().info('Multi-Camera Perception Node 启动完成')
+        self.get_logger().info(f'  检测器: {self.detector_type.upper()}')
         self.get_logger().info(f'  Top相机: {"启用" if self.enable_top else "禁用"}')
         self.get_logger().info(f'  Chassis相机: {"启用" if self.enable_chassis else "禁用"}')
         self.get_logger().info(f'  LiDAR: {"启用" if self.enable_lidar else "禁用"}')
@@ -197,11 +199,15 @@ class MultiCameraPerceptionNode(Node):
         self.default_prompt = self.get_parameter('default_prompt').value
 
         # 检测服务
+        self.declare_parameter('detector_type', 'dinox')  # dinox | sam3
         self.declare_parameter('detector_url', 'http://192.168.112.14:10086')
+        self.declare_parameter('sam3_url', 'http://192.168.112.14:8080')
         self.declare_parameter('detector_timeout', 3.0)
         self.declare_parameter('min_score', 0.25)
         self.declare_parameter('iou_threshold', 0.5)
+        self.detector_type = self.get_parameter('detector_type').value
         self.detector_url = self.get_parameter('detector_url').value
+        self.sam3_url = self.get_parameter('sam3_url').value
         self.detector_timeout = self.get_parameter('detector_timeout').value
         self.min_score = self.get_parameter('min_score').value
         self.iou_threshold = self.get_parameter('iou_threshold').value
@@ -276,11 +282,18 @@ class MultiCameraPerceptionNode(Node):
             except Exception:
                 return False
 
-        # 检查 DINO-X 服务
-        if not check_service(self.detector_url, timeout=5.0):
-            self.get_logger().error(f'DINO-X 服务不可用: {self.detector_url}')
-            raise RuntimeError('DINO-X 服务不可用')
-        self.get_logger().info('  DINO-X service: OK')
+        # 根据 detector_type 检查对应服务
+        if self.detector_type == 'sam3':
+            if not check_service(self.sam3_url, timeout=5.0):
+                self.get_logger().error(f'SAM3 服务不可用: {self.sam3_url}')
+                raise RuntimeError('SAM3 服务不可用')
+            self.get_logger().info('  SAM3 service: OK')
+        else:
+            # 默认检查 DINO-X
+            if not check_service(self.detector_url, timeout=5.0):
+                self.get_logger().error(f'DINO-X 服务不可用: {self.detector_url}')
+                raise RuntimeError('DINO-X 服务不可用')
+            self.get_logger().info('  DINO-X service: OK')
 
         # CDM 服务可选
         if self.enable_depth_optimizer:
@@ -356,13 +369,24 @@ class MultiCameraPerceptionNode(Node):
         if not self.cameras:
             raise RuntimeError('没有可用的相机')
 
-        # 共享的检测器
-        detector_cfg = SimpleConfig(
-            url=self.detector_url,
-            min_score=self.min_score,
-            resize=(1280, 720),  # 标准输入尺寸
-        )
-        self.detector = DinoXDetectorOnline(detector_cfg)
+        # 共享的检测器（根据 detector_type 选择）
+        if self.detector_type == 'sam3':
+            detector_cfg = SimpleConfig(
+                url=self.sam3_url,
+                min_score=self.min_score,  # SAM3Online 会映射为 confidence
+                resize=(1280, 720),
+                return_mask=True,
+            )
+            self.detector = SAM3Online(detector_cfg)
+            self.get_logger().info(f'使用 SAM3 检测器: {self.sam3_url}')
+        else:
+            detector_cfg = SimpleConfig(
+                url=self.detector_url,
+                min_score=self.min_score,
+                resize=(1280, 720),
+            )
+            self.detector = DinoXDetectorOnline(detector_cfg)
+            self.get_logger().info(f'使用 DINO-X 检测器: {self.detector_url}')
 
         # 共享的深度优化器
         self.depth_optimizer = None

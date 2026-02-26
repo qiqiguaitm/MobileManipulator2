@@ -39,3 +39,8 @@ Thumbs.db
 
 # Deprecated files
 _deprecated_*
+
+# Sample/test data files
+samples/*.png
+samples/*.jpg
+samples/*.npy

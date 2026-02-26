@@ -810,3 +810,163 @@ class DepthOptimizerOnline:
         if result.get('success') and 'vis_image' in result:
             return result['vis_image']
         return None
+
+
+class SAM3Online:
+    """SAM3 分割检测服务客户端
+
+    基于 SAM3 (Segment Anything Model 3) 的图像分割服务。
+    通过 TensorRT 加速，支持文本提示的图像分割。
+    提供与 DinoXDetectorOnline 兼容的接口。
+    """
+    def __init__(self, cfg):
+        """初始化 SAM3 服务
+
+        Args:
+            cfg: 配置对象，包含：
+                - url: 服务地址，默认 http://192.168.112.14:8080
+                - confidence: 置信度阈值，默认 0.30
+                - return_mask: 是否返回 mask，默认 True
+                - tiled: 是否使用平铺模式，默认 False
+                - jpeg_quality: JPEG 压缩质量，默认 85
+                - resize: 图片缩放尺寸 (width, height)，默认 None
+                - warmup: 预热次数，默认 0
+        """
+        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8080')
+        self.api_url = f'{self.base_url}/api/predict'
+        self.health_url = f'{self.base_url}/api/health'
+        self.confidence = getattr(cfg, 'confidence', 0.30)
+        # 兼容 DinoX 参数名
+        if hasattr(cfg, 'min_score'):
+            self.confidence = cfg.min_score
+        self.return_mask = getattr(cfg, 'return_mask', True)
+        self.tiled = getattr(cfg, 'tiled', False)
+        self.jpeg_quality = getattr(cfg, 'jpeg_quality', 85)
+        self.resize = getattr(cfg, 'resize', None)
+
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.proxies = {'http': None, 'https': None}
+
+        warmup_runs = getattr(cfg, 'warmup', 0)
+        if warmup_runs > 0:
+            self._warmup(warmup_runs)
+
+    def _warmup(self, num_runs: int):
+        """预热服务"""
+        print(f"[SAM3Online] Warmup ({num_runs} runs)...")
+        dummy_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        for i in range(num_runs):
+            self.forward('object', dummy_img)
+            print(f"  warmup {i+1}/{num_runs}")
+        print("[SAM3Online] Warmup complete")
+
+    def check_health(self) -> Dict:
+        """检查服务健康状态"""
+        try:
+            response = self.session.get(self.health_url, timeout=5)
+            return response.json()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def forward(self, text: str, rgb: np.ndarray, _timing: Optional[Dict] = None, **kwargs) -> LocalTaskResult:
+        """根据文本描述进行图像分割检测
+
+        提供与 DinoXDetectorOnline 兼容的接口。
+
+        Args:
+            text: 目标描述文本，多个类别用逗号或句点分隔
+            rgb: RGB/BGR 图像 (numpy 数组)
+            _timing: 可选，用于记录内部耗时
+            **kwargs: 额外参数 (confidence, return_mask, tiled, min_score)
+
+        Returns:
+            LocalTaskResult: 包含检测结果
+                {'objects': [{'bbox': [x1, y1, x2, y2], 'score': float, 'category': str, 'mask': dict}, ...]}
+        """
+        t0 = time.time()
+
+        # 获取参数（兼容 DinoX 参数名）
+        confidence = kwargs.get('confidence', kwargs.get('min_score', self.confidence))
+        return_mask = kwargs.get('return_mask', self.return_mask)
+        tiled = kwargs.get('tiled', self.tiled)
+
+        # 记录原始尺寸
+        orig_h, orig_w = rgb.shape[:2]
+        scale_x, scale_y = 1.0, 1.0
+
+        # Resize
+        if self.resize is not None:
+            target_w, target_h = self.resize
+            rgb_resized = cv2.resize(rgb, (target_w, target_h))
+            scale_x = orig_w / target_w
+            scale_y = orig_h / target_h
+        else:
+            rgb_resized = rgb
+
+        t1 = time.time()
+
+        # JPEG 编码
+        _, img_encoded = cv2.imencode('.jpg', rgb_resized, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        img_bytes = img_encoded.tobytes()
+
+        t2 = time.time()
+
+        # 发送请求
+        files = {'images': ('image.jpg', img_bytes, 'image/jpeg')}
+        data = {
+            'text_prompt': text,
+            'confidence': str(confidence),
+            'return_mask': 'true' if return_mask else 'false',
+            'tiled': 'true' if tiled else 'false',
+        }
+
+        try:
+            response = self.session.post(self.api_url, files=files, data=data, timeout=30)
+            t3 = time.time()
+
+            if _timing is not None:
+                _timing['sam3_preprocess'] = (t1 - t0) * 1000
+                _timing['sam3_encode'] = (t2 - t1) * 1000
+                _timing['sam3_http'] = (t3 - t2) * 1000
+
+            response.raise_for_status()
+            result_json = response.json()
+
+            # 检查服务端错误
+            if not result_json.get('success'):
+                error_msg = result_json.get('error', 'Unknown error')
+                print(f"[SAM3Online] Server error: {error_msg}")
+                return LocalTaskResult({'objects': [], 'error': error_msg})
+
+            # 解析返回结果，转换为与 DinoXDetectorOnline 兼容的格式
+            objects = []
+            if 'results' in result_json and len(result_json['results']) > 0:
+                result = result_json['results'][0]
+                for obj in result.get('objects', []):
+                    # 获取 bbox 并映射回原始尺寸
+                    bbox = obj.get('bbox')
+                    if bbox and (scale_x != 1.0 or scale_y != 1.0):
+                        bbox = [
+                            bbox[0] * scale_x, bbox[1] * scale_y,
+                            bbox[2] * scale_x, bbox[3] * scale_y
+                        ]
+
+                    obj_data = {
+                        'bbox': bbox,
+                        'score': obj.get('score'),
+                        'category': obj.get('class_name', 'object'),
+                    }
+                    # 如果有 mask 信息也保留
+                    if 'mask' in obj:
+                        obj_data['mask'] = obj['mask']
+                    objects.append(obj_data)
+
+            return LocalTaskResult({'objects': objects})
+
+        except requests.exceptions.RequestException as e:
+            print(f"[SAM3Online] Request failed: {e}")
+            return LocalTaskResult({'objects': [], 'error': str(e)})
+        except json.JSONDecodeError as e:
+            print(f"[SAM3Online] JSON decode failed: {e}")
+            return LocalTaskResult({'objects': [], 'error': str(e)})

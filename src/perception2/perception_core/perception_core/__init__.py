@@ -12,6 +12,7 @@ from .percept import (
     DinoXDetectorOnline,
     GraspAnythingOnline,
     SAM2TrackerOnline,
+    SAM3Online,
     DepthOptimizerOnline,
     LocalTaskResult,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "DinoXDetectorOnline",
     "GraspAnythingOnline",
     "SAM2TrackerOnline",
+    "SAM3Online",
     "DepthOptimizerOnline",
     "LocalTaskResult",
     "DualCameraMatcher",

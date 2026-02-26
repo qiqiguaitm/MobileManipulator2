@@ -86,27 +86,35 @@ def main():
     num_runs = 10
     warmup_runs = 3
 
-    # 测试图片路径
+    # 测试图片路径 - 使用真实深度数据
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    img_path = os.path.join(script_dir, './../samples/', 'dino_test.jpg')
+    samples_dir = '/home/didi/workspace/MobileManipulator2/src/perception/samples'
+    rgb_path = os.path.join(samples_dir, '001-rgb.jpg')
+    depth_path = os.path.join(samples_dir, '001-dpt.png')
 
-    if not os.path.exists(img_path):
-        print(f"测试图片不存在: {img_path}")
+    if not os.path.exists(rgb_path):
+        print(f"测试 RGB 图片不存在: {rgb_path}")
+        sys.exit(1)
+    if not os.path.exists(depth_path):
+        print(f"测试深度图不存在: {depth_path}")
         sys.exit(1)
 
     # 加载测试图片
-    rgb = cv2.imread(img_path)
+    rgb = cv2.imread(rgb_path)
     if rgb is None:
-        print(f"无法读取图片: {img_path}")
+        print(f"无法读取 RGB 图片: {rgb_path}")
         sys.exit(1)
 
-    rgb = cv2.resize(rgb, dsize=(1280, 720))
-    # 生成模拟深度图 (用于 CDM 测试)
-    depth_mm = np.random.randint(500, 2000, (720, 1280), dtype=np.uint16)
+    # 加载真实深度图 (16-bit PNG)
+    depth_mm = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth_mm is None:
+        print(f"无法读取深度图: {depth_path}")
+        sys.exit(1)
 
-    print(f"测试图片: {img_path}")
-    print(f"图片尺寸: {rgb.shape}")
-    print(f"深度尺寸: {depth_mm.shape} (模拟数据)")
+    print(f"RGB 图片: {rgb_path}")
+    print(f"深度图: {depth_path}")
+    print(f"RGB 尺寸: {rgb.shape}")
+    print(f"深度尺寸: {depth_mm.shape}, dtype={depth_mm.dtype} (真实数据)")
     print(f"测试次数: {num_runs}")
     print(f"预热次数: {warmup_runs}")
 
@@ -184,7 +192,7 @@ def main():
     # ========== 4. CDM 测试 ==========
     try:
         cfg = MMConfig()
-        cfg.url = 'http://192.168.112.14:8086'
+        cfg.url = 'http://192.168.112.14:8081'
         cfg.chosen_policy = 'dn'
         cfg.warmup = warmup_runs
         cdm_service = DepthOptimizerOnline(cfg)

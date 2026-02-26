@@ -77,6 +77,12 @@ def generate_launch_description():
         description='Performance mode: 0=minimal, 1=power_saving, 2=balanced(default), 3=high_performance'
     )
     
+    # 检测器类型
+    detector_type_arg = DeclareLaunchArgument(
+        'detector_type', default_value='dinox',
+        description='Detector type: dinox or sam3'
+    )
+
     # 检测参数
     auto_detect_rate_arg = DeclareLaunchArgument(
         'auto_detect_rate', default_value='2.0',
@@ -141,6 +147,7 @@ def generate_launch_description():
         parameters=[
             {'enable_top': LaunchConfiguration('enable_top')},
             {'enable_chassis': LaunchConfiguration('enable_chassis')},
+            {'detector_type': LaunchConfiguration('detector_type')},
             {'auto_detect_rate': LaunchConfiguration('auto_detect_rate')},
             {'default_prompt': 'bottle.cup.box.barrel.toy.cabinet'},
             # 匈牙利匹配融合参数
@@ -250,6 +257,7 @@ def generate_launch_description():
         enable_chassis_arg,
         top_serial_arg,
         chassis_serial_arg,
+        detector_type_arg,
         perf_mode_arg,
         auto_detect_rate_arg,
         lidar_topic_arg,

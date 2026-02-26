@@ -6,6 +6,7 @@
 #
 # Options:
 #   --camera=NAME       相机名称 (top | chassis | hand | dual | none), 默认: top
+#   --detector=TYPE     检测器类型 (dinox | sam3), 默认: dinox
 #   --rviz              启动 RViz 3D 可视化
 #   --skip-camera       跳过相机启动（假设相机已运行）
 #   --test              启动后自动测试服务
@@ -29,6 +30,7 @@ source "$SCRIPT_DIR/_ros2_env.sh"
 # 默认参数
 # ============================================================================
 CAMERA_NAME="top"
+DETECTOR_TYPE="dinox"
 ENABLE_RVIZ="false"
 SKIP_CAMERA="false"
 RUN_TEST="false"
@@ -42,6 +44,9 @@ for arg in "$@"; do
     case $arg in
         --camera=*)
             CAMERA_NAME="${arg#*=}"
+            ;;
+        --detector=*)
+            DETECTOR_TYPE="${arg#*=}"
             ;;
         --rviz)
             ENABLE_RVIZ="true"
@@ -59,7 +64,7 @@ for arg in "$@"; do
             EXTRINSICS_SUFFIX="_new"
             ;;
         -h|--help)
-            head -24 "$0" | tail -22
+            head -25 "$0" | tail -23
             exit 0
             ;;
         *)
@@ -94,6 +99,7 @@ echo "========================================"
 echo "Scene Perception 3D (ROS2)"
 echo "========================================"
 echo "Camera:     $CAMERA_NAME"
+echo "Detector:   $DETECTOR_TYPE"
 echo "RViz:       $ENABLE_RVIZ"
 echo "SkipCamera: $SKIP_CAMERA"
 echo "Test:       $RUN_TEST"
@@ -110,14 +116,23 @@ echo -e "${GREEN}   ✓ 环境已配置${NC}"
 # 检查外部服务
 # ============================================================================
 echo "[2/5] 检查外部服务..."
-DINOX_OK=false
-check_service "$DINOX_URL" "DINO-X 服务" && DINOX_OK=true
-check_service "$CDM_URL" "CDM 服务" || true
+DETECTOR_OK=false
 
-if [ "$DINOX_OK" = false ]; then
-    echo -e "${RED}   ✗ DINO-X 服务必须可用${NC}"
-    exit 1
+if [ "$DETECTOR_TYPE" = "sam3" ]; then
+    check_service "$SAM3_URL" "SAM3 服务" && DETECTOR_OK=true
+    if [ "$DETECTOR_OK" = false ]; then
+        echo -e "${RED}   ✗ SAM3 服务必须可用${NC}"
+        exit 1
+    fi
+else
+    check_service "$DINOX_URL" "DINO-X 服务" && DETECTOR_OK=true
+    if [ "$DETECTOR_OK" = false ]; then
+        echo -e "${RED}   ✗ DINO-X 服务必须可用${NC}"
+        exit 1
+    fi
 fi
+
+check_service "$CDM_URL" "CDM 服务" || true
 
 # ============================================================================
 # 清理旧进程
@@ -193,18 +208,19 @@ else
 fi
 
 RVIZ_ARG="rviz:=$ENABLE_RVIZ"
+DETECTOR_ARG="detector_type:=$DETECTOR_TYPE"
 EXTRINSICS_ARG=""
 if [ -n "$EXTRINSICS_SUFFIX" ]; then
     EXTRINSICS_ARG="extrinsics_suffix:=$EXTRINSICS_SUFFIX"
     echo -e "${YELLOW}   使用新外参: $EXTRINSICS_SUFFIX${NC}"
 fi
 
-echo "   启动: ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $EXTRINSICS_ARG"
+echo "   启动: ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG"
 echo ""
 
 # 如果需要测试，后台启动
 if [ "$RUN_TEST" = "true" ]; then
-    ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $EXTRINSICS_ARG > /tmp/perception_launch.log 2>&1 &
+    ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG > /tmp/perception_launch.log 2>&1 &
     LAUNCH_PID=$!
 
     # 等待节点启动
@@ -251,5 +267,5 @@ if [ "$RUN_TEST" = "true" ]; then
     wait $LAUNCH_PID
 else
     # 前台启动
-    exec ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $EXTRINSICS_ARG
+    exec ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG
 fi

@@ -19,7 +19,7 @@ ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
         build build-all build-drivers build-slam build-nav build-perception \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
-        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-stop \
+        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-stop \
         status stop clean kill-ros health
 
 help:
@@ -40,7 +40,8 @@ help:
 	@echo "  make percept-multi    - 双相机融合感知"
 	@echo "  make percept-3d-rviz  - 3D感知 + RViz"
 	@echo "  make percept-multi-rviz - 双相机感知 + RViz"
-	@echo "  make percept-full     - 一键启动 (相机+感知+RViz)"
+	@echo "  make percept-full     - 一键启动 (相机+感知+RViz, DINOX)"
+	@echo "  make percept-full-sam3- 一键启动 (相机+感知+RViz, SAM3)"
 	@echo "  make percept-check    - 检查感知依赖"
 	@echo "  make percept-stop     - 停止感知节点"
 	@echo ""
@@ -376,9 +377,13 @@ percept-3d-rviz:
 percept-multi-rviz:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --skip-camera --rviz
 
-# 一键启动 (相机 + 感知 + RViz)
+# 一键启动 (相机 + 感知 + RViz) - DINOX 检测器
 percept-full:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz
+
+# 一键启动 - 使用 SAM3 检测器
+percept-full-sam3:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3
 
 # 一键启动 - 使用新标定外参（测试用）
 percept-full-new:
