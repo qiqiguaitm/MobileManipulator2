@@ -16,7 +16,7 @@ sys.path.insert(0, '/home/agilex/MobileManipulator/src/perception/src')
 import cv2
 import numpy as np
 from mmengine.config import Config as MMConfig
-from percept import DinoXDetectorOnline, GraspAnythingOnline, DepthOptimizerOnline
+from percept import DinoXDetectorOnline, GraspAnythingOnline, DepthOptimizerOnline, SAM3Online
 
 
 def benchmark_with_timing(func, args, kwargs, name, num_runs=10):
@@ -136,10 +136,34 @@ def main():
         import traceback
         traceback.print_exc()
 
-    # ========== 2. GraspAnything 测试 ==========
+    # ========== 2. SAM3 测试 ==========
     try:
         cfg = MMConfig()
-        cfg.server_list = os.path.join(script_dir, 'config', 'server_grasp.json')
+        cfg.url = 'http://192.168.112.14:8080'
+        cfg.confidence = 0.30
+        cfg.return_mask = False  # 不返回 mask 以加快速度
+        cfg.warmup = warmup_runs
+        sam3_service = SAM3Online(cfg)
+
+        text_prompt = 'pen,box,phone,bottle,toy'  # SAM3 使用逗号分隔
+
+        result = benchmark_with_timing(
+            func=sam3_service.forward,
+            args=(text_prompt, rgb),
+            kwargs={},
+            name='SAM3',
+            num_runs=num_runs
+        )
+        all_results.append(result)
+    except Exception as e:
+        print(f"\n[SAM3] 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ========== 3. GraspAnything 测试 ==========
+    try:
+        cfg = MMConfig()
+        cfg.server_list = os.path.join(script_dir, '..', 'config', 'server_grasp.json')
         cfg.model_name = 'full'
         cfg.warmup = warmup_runs
         grasp_service = GraspAnythingOnline(cfg)
@@ -157,7 +181,7 @@ def main():
         import traceback
         traceback.print_exc()
 
-    # ========== 3. CDM 测试 ==========
+    # ========== 4. CDM 测试 ==========
     try:
         cfg = MMConfig()
         cfg.url = 'http://192.168.112.14:8086'

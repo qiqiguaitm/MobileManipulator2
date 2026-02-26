@@ -1,0 +1,11 @@
+<library path="piper_grasp_panel">
+  <class name="piper_grasp/PiperGraspPanel"
+         type="piper_grasp::PiperGraspPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Control panel for Piper arm grasp operations (ROS2).
+      Provides interactive control for arm enable/disable, position,
+      gripper, and grasp operations (observe/pick/place).
+    </description>
+  </class>
+</library>

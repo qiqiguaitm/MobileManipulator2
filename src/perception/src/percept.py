@@ -979,6 +979,183 @@ class SAM2TrackerOnline:
         }
 
 
+class SAM3Online:
+    """在线 SAM3 分割检测服务类
+
+    基于 SAM3 (Segment Anything Model 3) 的图像分割服务。
+    通过 TensorRT 加速，支持文本提示和几何提示的图像分割。
+    提供与 DinoXDetectorOnline 兼容的检测接口。
+    """
+    def __init__(self, cfg):
+        """初始化 SAM3 服务
+
+        Args:
+            cfg: 配置对象，包含：
+                - url: 服务地址，默认为 http://192.168.112.14:8080
+                - confidence: 置信度阈值，默认 0.30
+                - return_mask: 是否返回 mask，默认 True
+                - tiled: 是否使用平铺模式，默认 False
+                - jpeg_quality: JPEG 压缩质量，默认 85
+                - resize: 图片缩放尺寸 (width, height)，默认 None（不缩放）
+                - warmup: 预热次数，默认 0（不预热）
+        """
+        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8080')
+        self.api_url = f'{self.base_url}/api/predict'
+        self.health_url = f'{self.base_url}/api/health'
+        self.confidence = getattr(cfg, 'confidence', 0.30)
+        self.return_mask = getattr(cfg, 'return_mask', True)
+        self.tiled = getattr(cfg, 'tiled', False)
+        self.jpeg_quality = getattr(cfg, 'jpeg_quality', 85)
+        self.resize = getattr(cfg, 'resize', None)
+
+        # 创建不使用代理的 Session，用于内网服务器访问
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.proxies = {'http': None, 'https': None}
+
+        # Warmup
+        warmup_runs = getattr(cfg, 'warmup', 0)
+        if warmup_runs > 0:
+            self._warmup(warmup_runs)
+
+    def _warmup(self, num_runs):
+        """预热，排除冷启动影响"""
+        print(f"[SAM3Online] Warmup ({num_runs} 次)...")
+        dummy_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        dummy_text = 'object'
+        for i in range(num_runs):
+            self.forward(dummy_text, dummy_img)
+            print(f"  warmup {i+1}/{num_runs}")
+        print("[SAM3Online] Warmup 完成")
+
+    def check_health(self):
+        """检查服务健康状态
+
+        Returns:
+            dict: 健康状态信息，包含 status, engine_loaded, gpu_id 等
+        """
+        try:
+            response = self.session.get(self.health_url, timeout=5)
+            return response.json()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def forward(self, text, rgb, _timing=None, **kwargs):
+        """前向推理函数，根据文本描述进行图像分割检测
+
+        提供与 DinoXDetectorOnline 兼容的接口。
+
+        Args:
+            text: 目标描述文本，多个类别用逗号或句点分隔
+            rgb: RGB 图像 (numpy 数组)
+            _timing: 可选的 dict，用于记录内部耗时分布
+            **kwargs: 额外参数
+                - confidence: 覆盖默认的置信度阈值
+                - return_mask: 覆盖默认的 mask 返回设置
+                - tiled: 覆盖默认的平铺模式设置
+                - boxes: 可选的 box prompt (JSON 格式字符串)
+
+        Returns:
+            LocalTaskResult: 包含 result 属性的对象，格式为:
+                {'objects': [{'bbox': [x1, y1, x2, y2], 'score': float, 'category': str}, ...]}
+        """
+        import time as _time
+        _t0 = _time.time()
+
+        # 获取参数
+        confidence = kwargs.get('confidence', self.confidence)
+        return_mask = kwargs.get('return_mask', self.return_mask)
+        tiled = kwargs.get('tiled', self.tiled)
+        boxes = kwargs.get('boxes', None)
+
+        # 记录原始尺寸，用于坐标映射
+        orig_h, orig_w = rgb.shape[:2]
+        scale_x, scale_y = 1.0, 1.0
+
+        # Resize 图像（如果配置了）
+        if self.resize is not None:
+            target_w, target_h = self.resize
+            rgb_resized = cv2.resize(rgb, (target_w, target_h))
+            scale_x = orig_w / target_w
+            scale_y = orig_h / target_h
+        else:
+            rgb_resized = rgb
+
+        _t1 = _time.time()  # 预处理完成
+
+        # 将图像编码为 JPEG 格式
+        _, img_encoded = cv2.imencode('.jpg', rgb_resized, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        img_bytes = img_encoded.tobytes()
+
+        _t2 = _time.time()  # JPEG 编码完成
+
+        # 准备 multipart form data
+        files = {
+            'images': ('image.jpg', img_bytes, 'image/jpeg')
+        }
+        data = {
+            'text_prompt': text,
+            'confidence': str(confidence),
+            'return_mask': 'true' if return_mask else 'false',
+            'tiled': 'true' if tiled else 'false',
+        }
+        if boxes:
+            data['boxes'] = boxes
+
+        try:
+            response = self.session.post(self.api_url, files=files, data=data, timeout=30)
+            _t3 = _time.time()  # HTTP 请求完成
+
+            # 记录时间分布
+            if _timing is not None:
+                _timing['sam3_preprocess'] = (_t1 - _t0) * 1000
+                _timing['sam3_encode'] = (_t2 - _t1) * 1000
+                _timing['sam3_http'] = (_t3 - _t2) * 1000
+
+            response.raise_for_status()
+            result_json = response.json()
+
+            # 检查服务端错误
+            if not result_json.get('success'):
+                error_msg = result_json.get('error', 'Unknown error')
+                print(f"[SAM3Online] 服务端错误: {error_msg}")
+                return LocalTaskResult({'objects': [], 'error': error_msg})
+
+            # 解析返回结果，转换为与 DinoXDetectorOnline 兼容的格式
+            objects = []
+            if 'results' in result_json and len(result_json['results']) > 0:
+                result = result_json['results'][0]  # 只处理第一张图片
+                for obj in result.get('objects', []):
+                    # 获取 bbox 并映射回原始尺寸
+                    bbox = obj.get('bbox')
+                    if bbox and (scale_x != 1.0 or scale_y != 1.0):
+                        bbox = [
+                            bbox[0] * scale_x,
+                            bbox[1] * scale_y,
+                            bbox[2] * scale_x,
+                            bbox[3] * scale_y
+                        ]
+
+                    obj_data = {
+                        'bbox': bbox,
+                        'score': obj.get('score'),
+                        'category': obj.get('class_name', 'object'),
+                    }
+                    # 如果有 mask 信息也保留
+                    if 'mask' in obj:
+                        obj_data['mask'] = obj['mask']
+                    objects.append(obj_data)
+
+            return LocalTaskResult({'objects': objects})
+
+        except requests.exceptions.RequestException as e:
+            print(f"[SAM3Online] 请求失败: {e}")
+            return LocalTaskResult({'objects': [], 'error': str(e)})
+        except json.JSONDecodeError as e:
+            print(f"[SAM3Online] JSON 解析失败: {e}")
+            return LocalTaskResult({'objects': [], 'error': str(e)})
+
+
 class DepthOptimizerOnline:
     """在线深度图去噪优化服务类
 
