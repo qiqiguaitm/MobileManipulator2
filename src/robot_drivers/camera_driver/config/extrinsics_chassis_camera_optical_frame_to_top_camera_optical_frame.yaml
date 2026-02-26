@@ -1,0 +1,22 @@
+child_frame_id: top_camera_optical_frame
+frame_id: chassis_camera_optical_frame
+header:
+  calibration_date: '2026-02-06'
+  method: matlab_stereo_calibration
+  source: MATLAB Stereo Camera Calibrator App
+  note: Camera1=Chassis, Camera2=Top in MATLAB. This is T_chassis^top (transform points from top frame to chassis frame)
+  description: >
+    MATLAB Stereo Camera Calibrator outputs transform from Camera2 to Camera1.
+    Camera1=Chassis (parent), Camera2=Top (child).
+    This file stores T_chassis^top: P_chassis = T * P_top
+  original_backup: 'extrinsics_top_to_chassis_old_interactive.yaml'
+transform:
+  rotation:
+    w: 0.9995230146132023
+    x: -0.026638899575045095
+    y: -0.00880492354719765
+    z: 0.012906804767053064
+  translation:
+    x: 0.0492811
+    y: -0.5603896
+    z: -0.5374690

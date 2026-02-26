@@ -1,0 +1,69 @@
+# perception_grasp.yaml - 抓取感知节点配置 (ROS2)
+
+perception_grasp_node:
+  ros__parameters:
+    # 相机 Topic 配置
+    camera:
+      rgb_topic: '/camera/hand/color/image_raw'
+      depth_topic: '/camera/hand/aligned_depth_to_color/image_raw'
+      camera_info_topic: '/camera/hand/color/camera_info'
+
+    # 触发模式配置
+    trigger:
+      realtime_mode:
+        enabled: true
+        rate: 1.0
+        default_prompt: 'pen.box.phone.bottle.toy'
+        prompt_topic: '/usr/prompt/grasp'
+
+    # 检测服务配置
+    services:
+      grasp:
+        server_list: ''  # 需要在 launch 中设置完整路径
+        model_name: 'full'
+        warmup: true
+      dinox:
+        url: 'http://192.168.112.14:10086'
+      cdm:
+        url: 'http://192.168.112.14:8086'
+        enabled: true
+
+    # 深度有效范围 (米)
+    depth:
+      min_depth: 0.20
+      max_depth: 2.0
+
+    # Chosen Object 选择策略
+    chosen_policy:
+      grasp_score_weight: 0.2
+      distance_weight: 0.8
+      distance_mode: 'reciprocal'
+      normalize_distance: true
+      debug: false
+
+    # 过滤参数
+    filter:
+      min_grasp_score: 0.3
+      min_object_score: 0.25
+      max_gripper_width: 0.090
+      bbox_size_filter:
+        enabled: true
+        size_ratio: 2.0
+
+    # 输出坐标系
+    frame_id: 'camera/hand_color_optical_frame'
+
+
+perception_grasp_rviz_node:
+  ros__parameters:
+    frame_id: 'hand_camera_color_optical_frame'
+    pointcloud_scale: 0.5
+    marker_lifetime: 3.0
+    depth_min: 0.001
+    depth_max: 2.0
+    temporal_filter_size: 3
+
+    rgb_topic: '/camera/hand/color/image_raw'
+    depth_topic: 'perception_grasp_node/depth'
+    result_topic: 'perception_grasp_node/result'
+    camera_info_topic: '/camera/hand/color/camera_info'

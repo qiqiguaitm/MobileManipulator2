@@ -1,0 +1,38 @@
+# PiperPick.action - /piper/pick
+# Execute pick action using last observe result
+
+# === Goal ===
+bool use_last_observe          # true=use last observe result (default)
+float32[] target_offset        # manual offset [dx,dy,dz] mm (use_last_observe=false)
+float32 target_angle           # manual angle degrees
+
+int32 speed                    # 1-100% (default 30)
+float32 min_z                  # minimum Z mm (NaN=use config, default=-150)
+float32 gripper_width          # gripper width mm (0=use observe)
+float32 lift_height            # lift height mm (default 200)
+bool return_to_ready           # return to ready after pick (default false)
+---
+# === Result ===
+bool success
+string error_message
+string category
+float32[] grasp_position       # [x, y, z] mm
+float32 execution_time_ms
+---
+# === Feedback ===
+uint8 state
+uint8 IDLE = 0
+uint8 CHECKING = 1
+uint8 APPROACHING = 2
+uint8 OPENING = 3
+uint8 DESCENDING = 4
+uint8 CLOSING = 5
+uint8 VERIFYING = 6
+uint8 LIFTING = 7
+uint8 RETURNING = 8
+uint8 DONE = 9
+uint8 ERROR = 255
+
+string step_name
+float32 progress               # 0.0-1.0
+string message

@@ -1,0 +1,136 @@
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 640
+image_height: 480
+reprojection_error: 8.1341379581703982e-02
+distortion_parameters:
+   k1: 1.0232702841933654e-01
+   k2: -2.0260076913563116e-01
+   p1: 1.1667444683403855e-03
+   p2: -1.6753014688628970e-03
+projection_parameters:
+   fx: 5.9722945530264758e+02
+   fy: 5.9757431825059302e+02
+   cx: 3.2956707922510481e+02
+   cy: 2.4758128904585885e+02
+
+
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 848
+image_height: 480
+reprojection_error: 8.7578707804661426e-02
+distortion_parameters:
+   k1: 1.0207809412746313e-01
+   k2: -1.9174793769012255e-01
+   p1: 1.0826227030409680e-03
+   p2: -1.1837936182336449e-03
+projection_parameters:
+   fx: 5.9745835141797352e+02
+   fy: 5.9783339551248980e+02
+   cx: 4.3373093996773355e+02
+   cy: 2.4735225955177378e+02
+
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 424
+image_height: 240
+reprojection_error: 2.1775740125826526e-01
+distortion_parameters:
+   k1: 1.1015812788182734e-01
+   k2: -2.1754105434662457e-01
+   p1: 1.0312964976748342e-03
+   p2: -1.8061668702447252e-05
+projection_parameters:
+   fx: 2.9824320245971921e+02
+   fy: 2.9831648171472062e+02
+   cx: 2.1830553325120141e+02
+   cy: 1.2398069588577215e+02
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 640
+image_height: 360
+reprojection_error: 9.4036819269060323e-02
+distortion_parameters:
+   k1: 9.9283093145445020e-02
+   k2: -1.8951727854906059e-01
+   p1: 5.0172308659581584e-04
+   p2: -1.8162087564664912e-04
+projection_parameters:
+   fx: 4.4739082769451284e+02
+   fy: 4.4757860824214680e+02
+   cx: 3.2842956779383519e+02
+   cy: 1.8532107441440161e+02
+
+
+
+
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 960
+image_height: 540
+reprojection_error: 1.0734584493603018e-01
+distortion_parameters:
+   k1: 9.4423398180137216e-02
+   k2: -1.7560876482805007e-01
+   p1: 5.3531226876140725e-04
+   p2: -5.5465377652666448e-04
+projection_parameters:
+   fx: 6.7075863443082255e+02
+   fy: 6.7133545057799120e+02
+   cx: 4.9118502450162015e+02
+   cy: 2.7850687072707785e+02
+
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 1280
+image_height: 720
+reprojection_error: 1.2464799620424173e-01
+distortion_parameters:
+   k1: 1.0125683103407820e-01
+   k2: -1.9645874948483505e-01
+   p1: 1.0259852648044673e-03
+   p2: -4.8785868683588122e-04
+projection_parameters:
+   fx: 8.9561235831460976e+02
+   fy: 8.9626276829630729e+02
+   cx: 6.5582789674521950e+02
+   cy: 3.7215745906907944e+02
+
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: chassis_camera
+image_width: 1920
+image_height: 1080
+reprojection_error: 1.8095891120853858e-01
+distortion_parameters:
+   k1: 1.0136499071048136e-01
+   k2: -2.0222243280052801e-01
+   p1: 5.2488682951903258e-04
+   p2: -3.6910464337394812e-04
+projection_parameters:
+   fx: 1.3402810482700845e+03
+   fy: 1.3411175970901213e+03
+   cx: 9.8425599810301537e+02
+   cy: 5.5611152374468043e+02
+
+
+    

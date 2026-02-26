@@ -1,0 +1,16 @@
+# GetStatus.srv - /piper/get_status
+# Get detailed arm status
+
+# Request (empty)
+---
+# Response
+bool success                   # True if status read successfully
+bool connected
+bool enabled
+string error_state             # NORMAL/WARNING/CRITICAL
+string error_description
+
+float32[] position             # [x,y,z,r,p,y] mm/degrees (flange)
+float32[] gripper_center       # [x,y,z,r,p,y] mm/degrees (gripper center)
+float32[] joints               # [j1-j6] degrees
+float32 gripper_position       # mm

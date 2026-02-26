@@ -1,0 +1,25 @@
+# EnableEnhanced.srv - /piper/enable
+# Enhanced enable service with multiple actions
+
+# Request
+uint8 action
+uint8 ACTION_ENABLE = 1        # Enable arm
+uint8 ACTION_DISABLE = 2       # Disable (go_zero + damped_stop + disable)
+uint8 ACTION_FORCE_ENABLE = 3  # Force enable (recover from stop/error)
+uint8 ACTION_CLEAN_ERROR = 4   # Clear error state
+uint8 ACTION_RECONNECT = 5     # Reconnect (disconnect + connect)
+uint8 ACTION_SHUTDOWN = 6      # Safe shutdown (keep node running)
+
+bool go_zero                   # Go to zero before action (default false)
+---
+# Response
+bool success
+uint8 connection_state
+uint8 CONN_DISCONNECTED = 0
+uint8 CONN_CONNECTED = 1
+uint8 CONN_ENABLED = 2
+uint8 CONN_ERROR = 255
+
+string error_severity          # NORMAL / WARNING / CRITICAL
+string error_description
+string message

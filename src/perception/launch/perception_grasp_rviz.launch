@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Perception Grasp RViz 节点 - 抓取感知可视化 -->
+
+  <!-- 参数 -->
+  <!-- 性能模式: 0=禁用, 1=节能模式(1Hz), 3=高性能模式(3Hz) -->
+  <arg name="perf_mode" default="1" doc="性能模式: 0=禁用实时可视化, 1=节能模式(默认), 3=高性能模式"/>
+  <arg name="rviz" default="true" doc="是否启动 RViz"/>
+
+  <!-- 加载机器人模型 (robot_description) -->
+  <include file="$(find mobile_manipulator2_description)/launch/load_description.launch"/>
+
+  <!-- Joint State Publisher: 仅当没有真实机械臂驱动时启用 -->
+  <!-- 如果 piper 驱动运行中，设置环境变量 ROBOT_DRIVER_RUNNING=true 跳过此节点 -->
+  <!-- 或者启动 piper: roslaunch piper piper_bringup.launch -->
+  <arg name="use_fake_joints" default="true" doc="使用假关节状态 (true=默认零位, false=需要真实驱动)"/>
+  <node name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher" if="$(arg use_fake_joints)">
+    <param name="rate" value="10"/>
+  </node>
+
+  <!-- RViz 可视化节点 (始终启动，支持 service 结果可视化) -->
+  <!-- perf_mode=0 时禁用实时可视化，但保留节点以显示 service 调用结果 -->
+  <node name="perception_grasp_rviz_node" pkg="perception" type="perception_grasp_rviz_node.py" output="screen"
+        respawn="true" respawn_delay="3">
+    <rosparam file="$(find perception)/config/perception_grasp_rviz.yaml" command="load"/>
+    <!-- 性能模式参数覆盖 (perf_mode=0 时使用最低参数) -->
+    <param name="perception_grasp_rviz/pointcloud_scale" value="$(eval 0.1 if arg('perf_mode')==0 else (0.25 if arg('perf_mode')==1 else 0.4))"/>
+    <param name="perception_grasp_rviz/temporal_filter_size" value="$(eval 1 if arg('perf_mode')==0 else (2 if arg('perf_mode')==1 else 3))"/>
+    <param name="perception_grasp_rviz/marker_lifetime" value="$(eval 10.0 if arg('perf_mode')==0 else (5.0 if arg('perf_mode')==1 else 3.0))"/>
+  </node>
+
+  <!-- RViz (使用 wrapper 脚本确保窗口装饰正常显示) -->
+  <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find perception)/rviz/perception_grasp.rviz"
+        launch-prefix="$(find integration)/scripts/rviz_wrapper.sh"/>
+
+</launch>

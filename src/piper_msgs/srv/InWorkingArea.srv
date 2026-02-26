@@ -1,0 +1,17 @@
+# InWorkingArea.srv - /piper/in_working_area
+# Check if a position is within the working area limits
+#
+# All length units: mm (consistent with PiperAPI)
+# All angle units: degrees
+#
+# Provide exactly ONE of: offset, point3d_cam, or point_in_base (not multiple)
+
+# Request
+float32[] offset              # [x, y, z] offset in mm (empty [] if not provided)
+float32 yaw                   # yaw angle in degrees (NaN if not provided)
+float32[] point3d_cam         # [x, y, z] point in camera frame in mm (empty [] if not provided)
+float32[] end_pose            # [x, y, z, roll, pitch, yaw] end effector pose (mm, degrees)
+float32[] point_in_base       # [x, y, z] absolute position in base frame in mm (empty [] if not provided)
+---
+# Response
+bool in_area                  # true if within working area limits

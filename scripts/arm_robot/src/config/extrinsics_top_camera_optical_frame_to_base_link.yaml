@@ -1,0 +1,15 @@
+header:
+  calibration_date: '2026-01-15'
+  source: 'Computed: inv(base_link → optical)'
+  frame_id: top_camera_optical_frame
+  child_frame_id: base_link
+transform:
+  translation:
+    x: 0.011295781372430917
+    y: 0.567023126850296
+    z: 0.17434176293168735
+  rotation:
+    x: -0.509061009976257
+    y: 0.5235390959066051
+    z: -0.4725615753622898
+    w: -0.49340577689195997

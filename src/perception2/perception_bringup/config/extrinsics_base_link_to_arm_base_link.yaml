@@ -1,0 +1,15 @@
+header:
+  calibration_date: '2026-01-15'
+  source: 'URDF: base_link → box_link → arm_base'
+  frame_id: base_link
+  child_frame_id: arm_base_link
+transform:
+  translation:
+    x: 0.118
+    y: 0.0
+    z: 0.1
+  rotation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0

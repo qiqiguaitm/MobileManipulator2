@@ -1,0 +1,22 @@
+hdl_global_localization:
+  ros__parameters:
+    bbs/max_range: 15.0
+    # 搜索范围根据实际地图大小调整（地图约12m x 12m）
+    bbs/min_tx: -10.0
+    bbs/max_tx: 10.0
+    bbs/min_ty: -10.0
+    bbs/max_ty: 10.0
+    bbs/min_theta: -3.15
+    bbs/max_theta: 3.15
+    # 地图Z切片范围（地面机器人，只取地面附近的水平切片）
+    bbs/map_min_z: -0.5
+    bbs/map_max_z: 1.5
+    bbs/map_width: 512
+    bbs/map_height: 1024
+    bbs/map_resolution: 0.5
+    bbs/max_points_per_cell: 5
+    bbs/map_pyramid_level: 6
+    # 扩大扫描点云的Z范围，包含激光雷达高度范围内的点
+    # 点云在base_link坐标系下，激光雷达高度约0.5m，需要覆盖地面到天花板
+    bbs/scan_min_z: -1.0
+    bbs/scan_max_z: 2.0

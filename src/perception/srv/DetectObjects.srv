@@ -1,0 +1,9 @@
+# 物体检测服务
+# 响应时间约 500ms
+
+string prompt                      # 检测提示词 (如 "bottle.cup.box")
+bool enable_lidar                  # 是否启用 LiDAR 测量
+---
+bool success                       # 是否成功
+string error_message               # 错误信息 (失败时)
+perception/Object3DArray result    # 检测结果

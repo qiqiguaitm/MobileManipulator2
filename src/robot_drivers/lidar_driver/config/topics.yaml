@@ -1,0 +1,5 @@
+topics:
+  outputs:
+    scan:
+      name: /sensors/lidar/scan
+      type: sensor_msgs/LaserScan

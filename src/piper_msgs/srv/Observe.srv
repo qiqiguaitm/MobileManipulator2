@@ -1,0 +1,27 @@
+# Observe.srv - /piper/observe
+# Detect and locate grasp target
+
+# Request
+string prompt                  # target object (e.g. "bottle.cup")
+bool enable_cdm                # depth optimization (default true)
+---
+# Response
+bool success
+string error_message
+
+# Perception output (camera frame)
+string category
+float32 score
+float32[] point3d_camera       # [x, y, z] mm
+float32 angle_camera           # degrees
+
+# Transformed (base frame)
+float32[] point3d_base         # [x, y, z] mm
+float32[] offset               # [dx, dy, dz] mm (relative to current position)
+float32 angle_base             # degrees
+
+# Gripper parameters
+float32 gripper_width          # mm
+
+# Statistics
+float32 detection_time_ms

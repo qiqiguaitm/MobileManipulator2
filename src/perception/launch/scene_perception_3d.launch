@@ -1,0 +1,65 @@
+<launch>
+  <!-- Scene Perception 3D 启动文件 -->
+  <!-- 支持模式: 检测 / 检测+跟踪 / 检测+跟踪+可视化 -->
+
+  <!-- 基础参数 -->
+  <arg name="camera_name" default="top"/>
+  <arg name="enable_lidar" default="false"/>
+  <arg name="prompt_source" default="default" doc="default=实时模式, service=按需检测"/>
+  <arg name="auto_detect_rate" default="1.0" doc="实时检测频率Hz (0=禁用)"/>
+  <arg name="target_frame" default="base_link"/>
+  <arg name="enable_accuracy_log" default="false"/>
+  <arg name="enable_depth_optimizer" default="true"/>
+  <arg name="enable_visualization" default="false"/>
+  <arg name="results_dir" default="/home/agilex/MobileManipulator/src/perception/results"/>
+
+  <!-- Tracker 参数 -->
+  <arg name="enable_tracker" default="false"/>
+  <arg name="tracker_url" default="http://192.168.112.14:11086"/>
+  <arg name="track_rate" default="5.0"/>
+
+  <!-- RViz 可视化参数 -->
+  <arg name="enable_rviz_viz" default="false"/>
+
+  <!-- ==================== 检测节点 ==================== -->
+  <node name="scene_perception_3d" pkg="perception" type="scene_perception_3d_node.py" output="screen"
+        respawn="true" respawn_delay="3">
+    <rosparam file="$(find perception)/config/scene_perception_3d.yaml"/>
+    <param name="camera_name" value="$(arg camera_name)"/>
+    <param name="enable_lidar" value="$(arg enable_lidar)"/>
+    <param name="prompt_source" value="$(arg prompt_source)"/>
+    <param name="auto_detect_rate" value="$(arg auto_detect_rate)"/>
+    <param name="target_frame" value="$(arg target_frame)"/>
+    <param name="enable_accuracy_log" value="$(arg enable_accuracy_log)"/>
+    <param name="enable_depth_optimizer" value="$(arg enable_depth_optimizer)"/>
+    <param name="enable_visualization" value="$(arg enable_visualization)"/>
+    <param name="results_dir" value="$(arg results_dir)"/>
+  </node>
+
+  <!-- ==================== Tracker 节点 (可选) ==================== -->
+  <group if="$(arg enable_tracker)">
+    <node name="object_tracker" pkg="perception" type="object_tracker_node.py" output="screen"
+          respawn="true" respawn_delay="3">
+      <param name="track_rate" value="$(arg track_rate)"/>
+      <param name="tracker_url" value="$(arg tracker_url)"/>
+      <param name="target_frame" value="$(arg target_frame)"/>
+      <!-- 自动连接到 perception_3d 的输出 -->
+      <param name="detection_topic" value="/scene_perception_3d/objects_3d"/>
+      <param name="rgb_topic" value="/camera/$(arg camera_name)/color/image_raw"/>
+      <param name="depth_topic" value="/camera/$(arg camera_name)/aligned_depth_to_color/image_raw"/>
+      <param name="camera_info_topic" value="/camera/$(arg camera_name)/color/camera_info"/>
+    </node>
+  </group>
+
+  <!-- ==================== RViz 可视化节点 (可选) ==================== -->
+  <group if="$(arg enable_rviz_viz)">
+    <node name="perception_viz" pkg="perception" type="perception_viz_node.py" output="screen"
+          respawn="true" respawn_delay="3">
+      <param name="camera_name" value="$(arg camera_name)"/>
+      <param name="target_frame" value="$(arg target_frame)"/>
+      <param name="detection_topic" value="/scene_perception_3d/objects_3d"/>
+      <param name="tracking_topic" value="/object_tracker/tracked_objects"/>
+    </node>
+  </group>
+
+</launch>

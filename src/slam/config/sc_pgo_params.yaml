@@ -1,0 +1,33 @@
+# SC-PGO (Scan Context Pose Graph Optimization) 参数配置
+# 从ROS1 fastlio2pgo.launch迁移
+
+sc_pgo:
+  ros__parameters:
+    # ==================== 保存路径 ====================
+    save_directory: "/home/didi/workspace/MobileManipulator2/maps/sc_pgo/"
+
+    # ==================== LiDAR设置 ====================
+    scan_line: 16                    # Helios 16P = 16线
+    minimum_range: 0.3               # 最小距离0.3m
+    lidar_type: "VLP-16"             # LiDAR类型
+
+    # ==================== 关键帧选择 ====================
+    # 室内场景需要更密集的关键帧
+    keyframe_meter_gap: 0.5          # 每0.5m一帧
+    keyframe_deg_gap: 10.0           # 每10度一帧
+
+    # ==================== Scan Context回环检测 ====================
+    # 室内7x8m场景优化
+    sc_dist_thres: 0.15              # 相似度阈值(越小越严格)
+    sc_max_radius: 20.0              # 最大检测半径(室内20m足够)
+
+    # ==================== 地图分辨率 ====================
+    mapping_line_resolution: 0.04    # 4cm线特征分辨率
+    mapping_plane_resolution: 0.05   # 5cm面特征分辨率
+    mapviz_filter_size: 0.05         # 5cm体素过滤
+
+    # ==================== 话题配置 ====================
+    # 与ROS2 FAST_LIO对接
+    odom_topic: "/Odometry"
+    cloud_topic: "/cloud_registered_body"
+    gps_topic: "/gps/fix"            # 可选

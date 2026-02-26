@@ -1,0 +1,4 @@
+hdl_global_localization:
+  ros__parameters:
+    fpfh/normal_estimation_radius: 2.0
+    fpfh/search_radius: 4.0

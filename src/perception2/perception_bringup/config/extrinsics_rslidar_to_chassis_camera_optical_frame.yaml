@@ -1,0 +1,20 @@
+# Extrinsics: rslidar -> chassis_camera_optical_frame
+# Source: Computed from rslidar->top and top->chassis
+# Generated: 2026-02-09
+
+header:
+  calibration_date: '2026-02-09'
+  source: computed_from_top_chassis_chain
+  frame_id: rslidar
+  child_frame_id: chassis_camera_optical_frame
+
+transform:
+  translation:
+    x: -0.3678125529
+    y: -0.5558023869
+    z: -0.0621915839
+  rotation:
+    x: 0.5245583306
+    y: -0.4997861038
+    z: 0.4843966270
+    w: -0.4903185861

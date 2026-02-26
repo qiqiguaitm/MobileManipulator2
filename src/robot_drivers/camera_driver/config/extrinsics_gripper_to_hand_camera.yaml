@@ -1,0 +1,15 @@
+      
+header:
+  calibration_date: 2025-07-22
+  frame_id: gripper
+child_frame_id: hand_camera
+transform:
+  translation:
+    x: -0.07837287
+    y: 0.03741733
+    z: 0.03058189
+  rotation: 
+    x: -0.142122
+    y: 0.142388
+    z: -0.681295
+    w: 0.704387

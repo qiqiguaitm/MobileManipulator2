@@ -1,0 +1,34 @@
+<launch>
+  <!-- Object Tracker 启动文件 -->
+  <!-- 基于 SAM2TrackerOnline 的 2D 跟踪 + 深度测量获取 3D 位置 -->
+
+  <!-- 参数 -->
+  <arg name="track_rate" default="5.0"/>
+  <arg name="target_frame" default="base_link"/>
+
+  <!-- SAM2 Tracker 服务地址 -->
+  <arg name="tracker_url" default="http://192.168.112.14:11086"/>
+
+  <!-- 相机话题 -->
+  <arg name="rgb_topic" default="/top_camera/color/image_raw"/>
+  <arg name="depth_topic" default="/top_camera/aligned_depth_to_color/image_raw"/>
+  <arg name="camera_info_topic" default="/top_camera/color/camera_info"/>
+
+  <!-- 检测输入 -->
+  <arg name="detection_topic" default="/perception_3d/objects"/>
+
+  <!-- 输出话题 -->
+  <arg name="output_topic" default="/object_tracker/tracked_objects"/>
+
+  <!-- 节点 -->
+  <node name="object_tracker" pkg="perception" type="object_tracker_node.py" output="screen">
+    <param name="track_rate" value="$(arg track_rate)"/>
+    <param name="target_frame" value="$(arg target_frame)"/>
+    <param name="tracker_url" value="$(arg tracker_url)"/>
+    <param name="rgb_topic" value="$(arg rgb_topic)"/>
+    <param name="depth_topic" value="$(arg depth_topic)"/>
+    <param name="camera_info_topic" value="$(arg camera_info_topic)"/>
+    <param name="detection_topic" value="$(arg detection_topic)"/>
+    <param name="output_topic" value="$(arg output_topic)"/>
+  </node>
+</launch>

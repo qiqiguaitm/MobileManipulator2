@@ -1,0 +1,10 @@
+# GetPosition.srv - /piper/get_position
+# Get current position
+
+# Request
+bool gripper_center            # return gripper center (default true)
+---
+# Response
+bool success
+float32[] position             # [x,y,z,r,p,y] mm/degrees
+float32 gripper_position       # mm

@@ -1,0 +1,7 @@
+# BBS, FPFH_RANSAC, FPFH_TEASER
+# globalmap_downsample_resolution: 0.5 会把这图下采样到约 8 点（体素过大），BBS 需要 ≥128 点
+hdl_global_localization:
+  ros__parameters:
+    global_localization_engine: BBS
+    globalmap_downsample_resolution: 0.2
+    query_downsample_resolution: 0.2

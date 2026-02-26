@@ -1,0 +1,19 @@
+# Extrinsics: base_link -> top_camera_link
+# Source: rtabmap_slam.launch TF chain
+# Generated: 2026-01-14
+
+header:
+  calibration_date: '2026-01-14'
+  source: rtabmap_slam.launch TF chain
+  frame_id: base_link
+  child_frame_id: top_camera_link
+transform:
+  translation:
+    x: -0.13591800108791197
+    y: 0.04782100945753698
+    z: 0.5781619641305787
+  rotation:
+    x: 0.014957797426546038
+    y: 0.03440365846229561
+    z: 0.0022721860627810298
+    w: 0.999293858735073

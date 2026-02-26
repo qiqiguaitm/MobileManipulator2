@@ -1,0 +1,19 @@
+# Extrinsics: base_link -> rslidar
+# Source: rtabmap_slam.launch
+# Generated: 2026-01-15
+
+header:
+  calibration_date: '2026-01-15'
+  source: rtabmap_slam.launch
+  frame_id: base_link
+  child_frame_id: rslidar
+transform:
+  translation:
+    x: 0.27254
+    y: 0.00035292
+    z: 0.095
+  rotation:
+    x: -0.00218012051
+    y: 0.000590033588
+    z: 1.0e-08
+    w: 0.999997449

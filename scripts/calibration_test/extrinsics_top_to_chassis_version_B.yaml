@@ -1,0 +1,16 @@
+frame_id: top_camera_optical_frame
+child_frame_id: chassis_camera_optical_frame
+header:
+  calibration_date: '2026-02-05'
+  method: matlab_interpretation_B
+  source: matlab_stereo_calibration
+transform:
+  translation:
+    x: -0.049280000000000004
+    y: 0.5603899999999999
+    z: 0.53747
+  rotation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0

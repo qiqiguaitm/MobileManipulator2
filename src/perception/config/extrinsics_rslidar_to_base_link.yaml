@@ -1,0 +1,15 @@
+header:
+  calibration_date: '2026-01-15'
+  source: 'Computed: inv(base_link → rslidar)'
+  frame_id: rslidar
+  child_frame_id: base_link
+transform:
+  translation:
+    x: -0.27254
+    y: -0.00035292
+    z: -0.095
+  rotation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0

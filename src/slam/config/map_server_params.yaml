@@ -1,0 +1,7 @@
+# map_server 专用参数；launch 中 overlay yaml_filename
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    yaml_filename: "/home/didi/workspace/MobileManipulator2/maps/sc_pgo/map.yaml"
+    frame_id: map
+    topic_name: map

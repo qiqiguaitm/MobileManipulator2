@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+install/
+devel/
+
+# Logs
+log/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS bags (large files)
+*.bag
+
+# Temporary files
+*.tmp
+*.bak
+
+# Deprecated files
+_deprecated_*

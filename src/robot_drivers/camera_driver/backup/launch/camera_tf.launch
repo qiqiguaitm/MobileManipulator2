@@ -1,0 +1,24 @@
+<!-- 相机TF发布器Launch文件 -->
+<launch>
+
+  <!-- 参数配置 -->
+  <arg name="config_path" default="$(find camera_driver)/config" 
+       doc="相机外参配置文件路径"/>
+  
+  <!-- 相机TF发布节点 -->
+  <node name="camera_tf_publisher" 
+        pkg="camera_driver" 
+        type="camera_tf_publisher.py" 
+        output="screen"
+        respawn="true">
+    <param name="config_path" value="$(arg config_path)"/>
+  </node>
+  
+  <!-- 可选：发布TF树可视化信息 -->
+  <node name="tf_tree_publisher" 
+        pkg="tf2_tools" 
+        type="view_frames.py" 
+        output="log"
+        if="false"/>
+
+</launch>

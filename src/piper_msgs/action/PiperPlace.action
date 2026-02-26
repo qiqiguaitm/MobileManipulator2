@@ -1,0 +1,30 @@
+# PiperPlace.action - /piper/place
+# Execute place action
+
+# === Goal ===
+bool use_default_place         # use default place position (default true)
+float32[] place_position       # manual position [x,y,z,r,p,y] mm/degrees (use_default_place=false)
+
+int32 speed                    # 1-100% (default 30)
+bool return_to_ready           # return to ready after place (default true)
+---
+# === Result ===
+bool success
+string error_message
+float32[] final_position
+float32 execution_time_ms
+---
+# === Feedback ===
+uint8 state
+uint8 IDLE = 0
+uint8 MOVING = 1
+uint8 DESCENDING = 2
+uint8 OPENING = 3
+uint8 LIFTING = 4
+uint8 RETURNING = 5
+uint8 DONE = 6
+uint8 ERROR = 255
+
+string step_name
+float32 progress               # 0.0-1.0
+string message

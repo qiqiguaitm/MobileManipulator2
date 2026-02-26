@@ -1,0 +1,167 @@
+piper_ros:
+  # === Connection ===
+  can_port: "can0"
+  auto_connect: true
+  auto_enable: true
+  publish_rate: 200              # Hz
+
+  # === Gripper ===
+  gripper:
+    max_mm: 90.0                 # max opening mm
+    offset_mm: 135.03            # flange to gripper center offset mm (Z-axis)
+    default_speed: 500           # default speed 1-1000
+
+  # === Safety ===
+  safety:
+    damping_ratio: 0.98
+    enable_timeout: 5.0          # seconds
+    disconnect_go_zero: true
+    disconnect_damped_stop: true
+
+  calibration:
+    # Camera to flange transform (from hand-eye calibration, in meters)
+    # === Hand-eye calibration (20260109) ===
+    #T_cam2flan: [-0.07583874846136467, 0.05292914229358449, 0.05706895145407312]  # meters
+    #q_cam2flan: [0.1558761610824957, -0.16214154506130807, 0.6975255175538586, -0.6803461575790205]  # [x,y,z,w]
+    # === Hand-eye calibration (20260125) ===
+    T_cam2flan: [-0.05564710239993588,0.03727781226794723,0.031246679490387654]
+    q_cam2flan: [-0.12905985339122353,0.11551209453132931,-0.677635370030719,0.7147103018307148]
+    # Gripper to flange offset (in meters)
+    T_gripper2flan: [0.0, 0.0, 0.13503]  # meters (~135mm Z offset)
+    # Z correction for grasp (empirical, in meters; 0.005m = 5mm)
+    # Set to 0.000 to let grasp_depth_mm handle all descent (avoids duplication)
+    z_correction_m: 0.000
+
+  # === Predefined positions ===
+  positions:
+    ready:                       # observation/ready position (gripper center coords)
+      x: 317                     # Gripper center X (mm)
+      y: 15                      # Gripper center Y (mm)
+      z: 248                     # Gripper center Z (mm). With roll=180°, flange Z ≈ 267mm (higher!)
+      roll: 180                  # Roll=180° means gripper points down, offset direction flips
+      pitch: 30                  # Actual flange: (332.5, 0, 266.9)mm - well within workspace
+      yaw: 180                   # Yaw (degrees)
+    place:                       # default place position (flange/end-effector coords)
+      x: -86                      # flange X (mm)
+      y: -150                    # flange Y (mm)
+      z: 300                     # flange Z (mm)
+      # Quaternion [x, y, z, w] - from robot_piper.py (accurate orientation)
+      quat: [0.8740,0.4486,-0.1396,0.1232]
+    zero:
+      joints: [0, 0, 0, 0, 0, 0]
+
+  # === Working Area Limits (all in mm) ===
+  working_area:
+    offset_xmin: -50              # mm (was -0.05m)
+    offset_xmax: 150              # mm (was 0.15m)
+    offset_ymin: -150             # mm (was -0.15m)
+    offset_ymax: 150              # mm (was 0.15m)
+    offset_zmin: -400             # mm (was -0.4m)
+    offset_zmax: -150             # mm (was -0.15m)
+    yaw_min: 90                  # degrees  #170
+    yaw_max: 270                  # degrees, in [0, 360], default angle is 180   #190
+
+  # === Grasp ===
+  grasp:
+    enabled: true
+    perception_service: "/perception_grasp_node/detect"
+    default_speed: 30            # %
+    approach_speed: 20           # %
+    min_z: -245                  # mm (min Z during grasp), -245 in real
+    max_z: 400                   # mm (max Z, prevent collision)
+    safe_z: 200                  # mm (safe height for horizontal movement)
+    lift_height: 200             # mm
+    observe_cache_timeout: 30.0  # seconds
+    ready_position_tolerance: 30 # mm
+
+    # Approach pitch angle for vertical grasping
+    # 0° = perfect vertical (may hit singularity)
+    # 10° = slight tilt for safer approach (23mm XY offset)
+    # 30° = significant tilt (67mm XY offset, higher collision risk)
+    approach_pitch: 10           # degrees, pitch angle during approach and grasp
+
+    # Grasp depth: how much further to descend after reaching object surface
+    # Setting this too high risks collision; too low may not grip properly
+    # Recommended: 10mm for most objects
+    grasp_depth_mm: 20           # mm default additional descent after object surface
+
+    # Category-specific grasp depths (overrides default)
+    # Use this to fine-tune grasp depth for specific object categories
+    category_depths:
+      bottle: 30                 # mm - bottles need deeper grasp for stability
+      pen: 15                    # mm - pens need shallower grasp (small objects)
+      # cup: 15                  # mm - example: cups need shallower grasp
+      # box: 25                  # mm - example: boxes need moderate depth
+
+    # Gripper margin for safe descent (prevent collision)
+    # Each side clearance = max(base, width * ratio) / 2
+    # Example: width=40mm -> margin=max(20, 40*0.4)=20mm -> each side 10mm clearance
+    gripper_margin_base: 30      # mm minimum total margin
+    gripper_margin_ratio: 0.4    # 40% of object width
+
+    # Motion mode for descent/lift
+    # MoveL = straight line (precise but may fail near singularity)
+    # MoveJ = curved path (fast and reliable but less precise)
+    # Segmented = multiple small MoveJ steps (reliable + near-straight)
+    # IK = Pinocchio IK-planned trajectory (precise straight line with XY monitoring)
+    use_segmented_descent: true  # Use segmented MoveJ for descent (recommended)
+    descent_segment_size: 100     # mm per segment (smaller = straighter path)
+    use_movel_descent: false     # MoveL for descending (has retract issue)
+    use_movel_lift: false        # MoveL for lifting
+
+    # === Blacklist System (Dual-Layer) ===
+    blacklist:
+      enabled: true              # Enable blacklist system
+
+      # Spatial blacklist: Precise location matching
+      spatial:
+        radius: 30               # mm - precise radius for location matching
+        max_age: 600             # seconds (10 minutes) - how long to remember
+        max_entries: 100         # max number of spatial entries
+
+      # Object blacklist: Track specific objects (allows movement)
+      object:
+        radius: 60               # mm - larger radius allows object movement
+        max_age: 300             # seconds (5 minutes)
+        max_entries: 50          # max number of object entries
+        require_id: false        # false = use pseudo-ID (category + position)
+
+      # Persistence
+      persist_file: "/tmp/piper_grasp_blacklist.json"
+
+  # === IK Trajectory Planning (Pinocchio + CasADi) ===
+  ik_planning:
+    enabled: false               # Disabled: use segmented MoveJ as default
+    headless: true               # Disable Meshcat visualization (required for ROS)
+
+    # Trajectory planning parameters
+    num_waypoints: 10            # Number of waypoints for straight-line trajectory
+    xy_tolerance_mm: 5.0         # Max XY drift before stopping (mm)
+
+    # Fallback behavior
+    fallback_to_segmented: true  # Use segmented MoveJ if IK fails
+
+    # IK solver parameters
+    max_iterations: 50           # Max IPOPT iterations per solve
+    tolerance: 1e-4              # IK solver convergence tolerance
+
+    # Speed limits
+    descent_speed: 15            # % speed for IK trajectory descent
+    lift_speed: 20               # % speed for IK trajectory lift
+
+    # Observe retry
+    observe:
+      timeout: 5.0               # seconds
+      retry_count: 3
+      retry_delay: 0.5           # seconds
+      min_score: 0.3
+
+  # === Recovery ===
+  recovery:
+    enabled: true
+    on_startup:
+      go_zero: true
+      go_ready: false    # Stay at zero position; go_ready triggered by Observe/Let's Grasp
+      close_gripper: true
+      check_error: true
+    timeout: 10.0                # seconds

@@ -1,0 +1,100 @@
+# Collision Configuration for Mobile Manipulator
+# All dimensions in meters (m)
+
+# Safety margin added to all collision bodies
+safety_margin: 0.01  # 10mm
+
+# Static bodies (relative to base_link)
+static_bodies:
+  lidar:
+    type: cylinder
+    center: [0.273, 0.0, 0.05]
+    radius: 0.05
+    height: 0.10
+
+  box:
+    type: box
+    center: [0.0, 0.0, 0.05]
+    half_extents: [0.22, 0.18, 0.06]
+
+  lifting:
+    type: box
+    center: [-0.24, 0.0, 0.32]
+    half_extents: [0.10, 0.08, 0.32]
+
+  arm_base:
+    type: cylinder
+    center: [0.118, 0.0, 0.16]
+    radius: 0.04
+    height: 0.12
+
+# Arm link parameters for capsule approximation
+arm_links:
+  link2:
+    radius: 0.035
+    length: 0.284
+  link3:
+    radius: 0.030
+    length: 0.242
+  link5:
+    radius: 0.025
+    length: 0.091
+  gripper:
+    radius: 0.045
+    length: 0.135
+
+# Environment planes
+# Note: base_link is at chassis center, actual ground is below
+environment:
+  ground:
+    z: -0.10         # Ground Z relative to base_link (below chassis ~100mm)
+    margin: 0.02     # 20mm safety margin
+  # Uncomment to add table constraint:
+  # table:
+  #   z: -0.10       # Table surface Z
+  #   margin: 0.01   # 10mm safety margin
+
+# Collision pairs to check
+# Format: [arm_link, obstacle]
+collision_pairs:
+  # High priority: Arm vs Lidar
+  - [link2, lidar]
+  - [link3, lidar]
+  - [gripper, lidar]
+
+  # High priority: Arm vs Box/Chassis
+  - [link3, box]
+  - [gripper, box]
+
+  # Medium priority: Arm vs Lifting mechanism
+  - [link2, lifting]
+  - [link3, lifting]
+  - [gripper, lifting]
+
+  # Environment: Gripper vs Ground
+  - [gripper, ground]
+
+# Trajectory planning parameters
+planning:
+  safe_height_mm: 150        # Default safe height
+  lift_increment_mm: 50      # Height increment for replan
+  max_replan_attempts: 5     # Max replan tries
+  waypoint_spacing_mm: 5     # Min spacing between waypoints
+
+  # Orientation adjustment ranges for replan
+  pitch_options: [0, 15, 30, 45]    # degrees
+  yaw_adjustments: [-30, -15, 0, 15, 30]  # degrees
+
+# Workspace boundaries (from exploration results)
+workspace:
+  x_range: [300, 600]    # mm
+  y_range: [-200, 200]   # mm
+  z_range: [-250, 200]   # mm (relative to base_link)
+
+  # Known problematic areas (Y=0 centerline has issues)
+  avoid_regions:
+    - name: centerline_deep
+      x_range: [400, 600]
+      y_range: [-30, 30]
+      z_range: [-250, -100]
+      reason: "IK instability on centerline at depth"

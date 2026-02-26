@@ -1,0 +1,17 @@
+      
+header:
+  calibration_date: 2025-09-24
+  frame_id: flan    #link6 end_pose
+child_frame_id: hand_camera
+transform:
+  translation:
+    x: -0.037725004140489474
+    y: 0.055531435146424855
+    z: -0.03465247884995946
+  rotation: 
+    x: -0.12495857338558437
+    y: 0.13211109754104494
+    z: -0.6931344344339802
+    w:  0.6974931316119368
+
+
