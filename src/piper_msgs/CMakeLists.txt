@@ -29,7 +29,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Observe.srv"
   "srv/SetGripper.srv"
   "srv/SetPosition.srv"
-  "srv/GraspDetect.srv"
+  # Note: GraspDetect is defined in perception_interfaces, not here
   # Actions
   "action/PiperPick.action"
   "action/PiperPlace.action"

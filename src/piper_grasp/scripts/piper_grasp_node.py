@@ -47,9 +47,12 @@ from piper_msgs.srv import (
     Enable, Gripper, GoZero,
     EnableEnhanced, SetPosition, SetGripper,
     GetStatus, GetPosition, GoReady,
-    Observe, InWorkingArea, GraspDetect
+    Observe, InWorkingArea
 )
 from piper_msgs.action import PiperPick, PiperPlace
+
+# Import perception service (must use perception_interfaces, not piper_msgs)
+from perception_interfaces.srv import GraspDetect
 
 # Unit conversion constants
 M_TO_MM = 1000.0
@@ -119,28 +122,63 @@ class PiperGraspNode(Node):
         self.get_logger().info("Piper Grasp Node initialized")
 
     def _load_config(self) -> dict:
-        """Load configuration from parameter or file"""
+        """Load configuration from parameter or file, then apply ROS parameter overrides
+
+        ROS parameters can override config file values (matching ROS1 piper_grasp_node.launch):
+        - can_port: CAN port name
+        - auto_connect: auto connect on startup
+        - auto_enable: auto enable motors on startup
+        - enable_grasp: enable grasp functionality
+        """
+        # Declare ROS parameters for launch file compatibility
         self.declare_parameter('config_file', '')
+        self.declare_parameter('can_port', '')
+        self.declare_parameter('auto_connect', True)
+        self.declare_parameter('auto_enable', True)
+        self.declare_parameter('enable_grasp', True)
+
         config_file = self.get_parameter('config_file').value
 
+        # Load from config file
+        config = {}
         if config_file and os.path.exists(config_file):
             with open(config_file, 'r') as f:
-                config = yaml.safe_load(f)
-                return config.get('piper_ros', config)
+                loaded = yaml.safe_load(f)
+                config = loaded.get('piper_ros', loaded) if loaded else {}
+        else:
+            default_paths = [
+                '/data/workspace/MobileManipulator2/src/piper_grasp/config/piper_grasp_node.yaml',
+                os.path.join(os.path.dirname(__file__), '../config/piper_grasp_node.yaml'),
+            ]
 
-        default_paths = [
-            '/data/workspace/MobileManipulator2/src/piper_grasp/config/piper_grasp_node.yaml',
-            os.path.join(os.path.dirname(__file__), '../config/piper_grasp_node.yaml'),
-        ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    with open(path, 'r') as f:
+                        loaded = yaml.safe_load(f)
+                        config = loaded.get('piper_ros', loaded) if loaded else {}
+                        break
 
-        for path in default_paths:
-            if os.path.exists(path):
-                with open(path, 'r') as f:
-                    config = yaml.safe_load(f)
-                    return config.get('piper_ros', config)
+        if not config:
+            self.get_logger().warn("No config file found, using defaults")
+            config = {}
 
-        self.get_logger().warn("No config file found, using defaults")
-        return {}
+        # Apply ROS parameter overrides (matching ROS1 piper_grasp_node.launch)
+        can_port_param = self.get_parameter('can_port').value
+        if can_port_param:  # Only override if explicitly set
+            config['can_port'] = can_port_param
+
+        auto_connect_param = self.get_parameter('auto_connect').value
+        config['auto_connect'] = auto_connect_param
+
+        auto_enable_param = self.get_parameter('auto_enable').value
+        config['auto_enable'] = auto_enable_param
+
+        enable_grasp_param = self.get_parameter('enable_grasp').value
+        if 'grasp' not in config:
+            config['grasp'] = {}
+        config['grasp']['enabled'] = enable_grasp_param
+
+        return config
 
     @property
     def is_connected(self) -> bool:
@@ -775,11 +813,12 @@ class PiperGraspNode(Node):
 
             _, pos = self.arm.get_position(return_gripper_center=True)
             response.success = True
-            response.final_position = [float(p) for p in pos]
+            response.message = "Ready"
+            response.position = [float(p) for p in pos]
 
         except Exception as e:
             response.success = False
-            response.error_message = str(e)
+            response.message = str(e)
 
         return response
 
@@ -813,10 +852,12 @@ class PiperGraspNode(Node):
         grasp_cfg = self.config.get('grasp', {})
 
         try:
-            # Move to ready position if requested
-            if request.go_ready_first:
+            # Move to ready position if requested (optional field, default False)
+            go_ready_first = getattr(request, 'go_ready_first', False)
+            if go_ready_first:
                 ready_cfg = self.config.get('positions', {}).get('ready', {})
-                speed = request.speed if request.speed > 0 else 30
+                speed = getattr(request, 'speed', 0)
+                speed = speed if speed > 0 else 30
                 self.arm.go_ready(ready_cfg, speed=speed)
 
             # Get current end pose
@@ -1464,6 +1505,7 @@ class PiperGraspNode(Node):
             status.error_state = self.error_state
             status.error_description = self.error_description
             status.position = [float(p) for p in pos]
+            status.gripper_center = [float(p) for p in gc_pos]
             status.joints = [j * 180.0 / math.pi for j in joints_rad[:6]]
             status.gripper_position = gripper_mm
             self.pub_status.publish(status)

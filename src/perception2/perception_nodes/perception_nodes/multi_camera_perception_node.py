@@ -59,6 +59,8 @@ from perception_core import (
     fuse_dual_camera_positions,
     DualCameraMatcher,
     DetectionWithDepth,
+    ByteTracker3D,
+    TrackerConfig,
 )
 from .synced_sensor_subscriber import SyncedSensorSubscriber
 from .utils import SENSOR_QOS, LATCHED_QOS, ThrottledLogger
@@ -122,6 +124,7 @@ class MultiCameraPerceptionNode(Node):
         self._current_iou_threshold = self.iou_threshold
         self._last_detect_time = 0.0
         self._last_results = {'top': None, 'chassis': None, 'fused': None}
+        self._results_lock = threading.Lock()  # 保护 _last_results 和 fusion 的线程安全
 
         # CV Bridge
         self._bridge = CvBridge()
@@ -153,7 +156,8 @@ class MultiCameraPerceptionNode(Node):
         # 工作线程（每相机一个）
         self._worker_threads: Dict[str, threading.Thread] = {}
         # 共享线程池（避免频繁创建销毁）
-        self._detection_executor = ThreadPoolExecutor(max_workers=2)
+        # 双相机并发时需要 4 个 worker: 2×DINO-X + 2×CDM
+        self._detection_executor = ThreadPoolExecutor(max_workers=4)
         self._measure_executor = ThreadPoolExecutor(max_workers=4)
         # 启动工作线程（每个相机一个，避免竞争）
         self._init_worker_threads()
@@ -227,7 +231,7 @@ class MultiCameraPerceptionNode(Node):
         self.distance_offset_default = self.get_parameter('distance_offset').value
 
         # 自动检测配置
-        self.declare_parameter('auto_detect_rate', 5.0)
+        self.declare_parameter('auto_detect_rate', 10.0)  # 默认 10Hz
         self.auto_detect_rate = self.get_parameter('auto_detect_rate').value
 
         # 时间同步参数
@@ -268,6 +272,27 @@ class MultiCameraPerceptionNode(Node):
             f"[FUSION] 匈牙利匹配器已初始化: "
             f"dist_thresh={self.fusion_threshold}m, max_cost={fusion_max_cost}, "
             f"weights=[dist:{fusion_weight_distance}, cat:{fusion_weight_category}]"
+        )
+
+        # 初始化 ByteTracker3D 跟踪器（跟踪融合后的结果）
+        # 根据检测率动态计算参数
+        detect_rate = max(self.auto_detect_rate, 1.0)  # 至少 1Hz
+        track_buffer = int(detect_rate * 3.0)  # 3秒最大丢失时间
+        confirm_frames = max(2, int(detect_rate * 0.3))  # 0.3秒确认时间，至少2帧
+
+        tracker_cfg = TrackerConfig(
+            match_thresh=0.15,       # 第一阶段: 15cm 匹配阈值
+            second_thresh=0.25,      # 第二阶段: 25cm (ByteTrack低置信度恢复)
+            track_buffer=track_buffer,
+            confirm_frames=confirm_frames,
+        )
+        self._tracker = ByteTracker3D(tracker_cfg, self.get_logger())
+        self.get_logger().info(
+            f"[TRACKER] ByteTracker3D 已初始化: "
+            f"match_thresh={tracker_cfg.match_thresh}m, "
+            f"second_thresh={tracker_cfg.second_thresh}m, "
+            f"buffer={track_buffer} ({detect_rate}Hz×3s), "
+            f"confirm={confirm_frames}"
         )
 
     def _health_check(self):
@@ -456,6 +481,12 @@ class MultiCameraPerceptionNode(Node):
 
         period = 1.0 / self.auto_detect_rate
         now = time.time()
+
+        # 智能相位偏移：周期的 50% 除以相机数量
+        # 10Hz 时: 100ms * 0.5 / 2 = 25ms 偏移
+        # 5Hz 时: 200ms * 0.5 / 2 = 50ms 偏移
+        num_cameras = len(self.cameras)
+        phase_step = (period * 0.5) / num_cameras if num_cameras > 1 else 0
         phase_offset = 0.0
 
         for camera_name in self.cameras.keys():
@@ -468,9 +499,10 @@ class MultiCameraPerceptionNode(Node):
                 lambda name=camera_name: self._on_camera_timer_with_phase(name)
             )
             self._camera_timers[camera_name] = timer
-            phase_offset += 0.1  # 100ms 相位差
+            phase_offset += phase_step
 
-        self.get_logger().info(f'自动检测已启用: {self.auto_detect_rate} Hz, 相位偏移: 100ms')
+        phase_ms = phase_step * 1000
+        self.get_logger().info(f'自动检测已启用: {self.auto_detect_rate} Hz, 相位偏移: {phase_ms:.0f}ms')
 
     def _on_camera_timer_with_phase(self, camera_name: str):
         """带相位偏移的定时器回调（跳过启动延迟期）"""
@@ -524,7 +556,11 @@ class MultiCameraPerceptionNode(Node):
             # 3. 检查队列是否已满（防止堆积）
             camera_queue = self._task_queues.get(camera_name)
             if camera_queue is None or camera_queue.full():
-                self._log.debug(f'[{camera_name}] 队列满或不存在，跳过本次检测')
+                # 使用节流 warn，让用户知道检测频率可能过高
+                self._log.warn(
+                    f'[{camera_name}] 队列满，跳过检测（检测频率可能过高或服务响应慢）',
+                    period=5.0
+                )
                 return
             
             # 4. 预查询 TF 变换（在主线程执行，避免后台线程竞争）
@@ -590,11 +626,14 @@ class MultiCameraPerceptionNode(Node):
                 # 发布结果
                 if result and camera_name in self.pubs:
                     self.pubs[camera_name]['objects'].publish(result)
-                    self._last_results[camera_name] = result
-                    self._publish_status()
 
-                    # 尝试融合多相机结果
-                    self._try_publish_fusion()
+                    # 线程安全地更新结果并尝试融合
+                    with self._results_lock:
+                        self._last_results[camera_name] = result
+                        # 融合在锁内执行，避免竞态条件
+                        self._try_publish_fusion()
+
+                    self._publish_status()
 
             except Exception as e:
                 self._log.warn(f'[Worker-{camera_name}] 检测失败: {e}', period=5.0)
@@ -980,8 +1019,11 @@ class MultiCameraPerceptionNode(Node):
         """
         尝试融合并发布多相机结果（用于auto_detect模式）
 
-        检查_last_results中是否有多个相机的最新结果，
-        如果有则进行融合并发布。
+        流程：
+        1. 收集各相机最新结果
+        2. 匈牙利融合去重
+        3. ByteTracker3D 跟踪（分配持久 track_id）
+        4. 发布跟踪后的结果
         """
         try:
             # 收集有效的最新结果（只考虑相机，排除 'fused' 键）
@@ -991,19 +1033,99 @@ class MultiCameraPerceptionNode(Node):
                 if result and len(result.objects) > 0:
                     valid_results[camera_name] = result
 
-            # 如果有任意相机的结果，进行融合（单相机情况也发布到 fused 话题）
+            # 如果有任意相机的结果，进行融合
             if len(valid_results) >= 1:
                 fused = self._fuse_results(valid_results)
                 if fused and len(fused.objects) > 0:
-                    self.pub_fused.publish(fused)
-                    self._last_results['fused'] = fused
-                    self.get_logger().info(f'[FUSION] 发布 fused 话题: {len(fused.objects)} objects')
+                    # === ByteTracker3D 跟踪 ===
+                    tracked_result = self._apply_tracking(fused)
+
+                    # 发布跟踪后的结果
+                    self.pub_fused.publish(tracked_result)
+                    self._last_results['fused'] = tracked_result
+                    self.get_logger().info(
+                        f'[FUSION] 发布 fused 话题: {len(tracked_result.objects)} objects (tracked)'
+                    )
                 else:
-                    self.get_logger().warn(f'[FUSION] fused 结果为空或无效: fused={fused is not None}, count={len(fused.objects) if fused else 0}')
+                    self.get_logger().warn(
+                        f'[FUSION] fused 结果为空或无效: '
+                        f'fused={fused is not None}, count={len(fused.objects) if fused else 0}'
+                    )
         except Exception as e:
             import traceback
             self.get_logger().error(f'[AUTO] 融合发布失败: {e}')
             self.get_logger().error(traceback.format_exc())
+
+    def _apply_tracking(self, fused: Object3DArray) -> Object3DArray:
+        """
+        应用 ByteTracker3D 跟踪算法
+
+        ByteTrack 核心逻辑：
+        - 高置信度检测（source='fused'）优先匹配
+        - 低置信度检测（source='*_only'）用于恢复丢失轨迹
+        - 返回带有持久 track_id 的结果
+        """
+        # 将 Object3D 转换为 tracker 期望的格式
+        fused_objects = []
+        for obj in fused.objects:
+            # 安全处理 bbox（避免 numpy 数组真值判断问题）
+            bbox = obj.bbox
+            if bbox is not None and len(bbox) >= 4:
+                bbox_list = list(bbox[:4])
+            else:
+                bbox_list = [0, 0, 0, 0]
+
+            fused_objects.append({
+                'object_id': obj.object_id,
+                'category': obj.category,
+                'score': obj.score,
+                'position': np.array([obj.position.x, obj.position.y, obj.position.z]),
+                'source': obj.source_camera,  # 'fused', 'top', 'chassis'
+                'confidence': obj.confidence,
+                'bbox': bbox_list,
+                # 保留原始对象用于后续构建消息
+                '_original': obj,
+            })
+
+        # 调用 ByteTracker3D
+        tracked_objects = self._tracker.update(fused_objects)
+
+        # 构建跟踪后的 Object3DArray
+        result = Object3DArray()
+        result.header = fused.header
+
+        for track in tracked_objects:
+            original_obj = track.get('_original')
+            if not original_obj:
+                continue
+
+            obj = Object3D()
+
+            # 根据是否有 track_id 决定 object_id
+            track_id = track.get('track_id')
+            if track_id is not None:
+                # 已确认轨迹：使用持久 track_id
+                obj.object_id = f"track_{track_id}"
+            else:
+                # 未确认检测：保持原始 object_id
+                obj.object_id = original_obj.object_id
+
+            obj.category = track['category']
+            obj.score = track.get('score', original_obj.score)
+            obj.bbox = original_obj.bbox
+            obj.position = Point(
+                x=float(track['position'][0]),
+                y=float(track['position'][1]),
+                z=float(track['position'][2])
+            )
+            obj.distance = float(np.linalg.norm(track['position']))
+            obj.confidence = track.get('confidence', original_obj.confidence)
+            obj.position_optical = original_obj.position_optical
+            obj.depth = original_obj.depth
+            obj.source_camera = track.get('source', original_obj.source_camera)
+            result.objects.append(obj)
+
+        return result
 
     def _fuse_results(self, results: Dict[str, Object3DArray]) -> Object3DArray:
         """

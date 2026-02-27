@@ -36,11 +36,11 @@
     enable_accuracy_log: false
 
     # 自动检测配置
-    auto_detect_rate: 5.0           # 自动检测频率 (Hz), 0=禁用
+    auto_detect_rate: 10.0          # 自动检测频率 (Hz), 0=禁用
                                     # 性能模式配置:
                                     #   0 = 禁用，仅 service 模式
-                                    #   1.0 = 节能模式 (默认)
-                                    #   3.0 = 高性能模式
+                                    #   5.0 = 标准模式
+                                    #   10.0 = 高性能模式 (默认)
 
     # 时间同步参数
     sync_slop: 0.2                 # 同步容差 200ms

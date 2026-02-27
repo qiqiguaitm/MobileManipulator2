@@ -83,43 +83,72 @@ PiperGraspPanel::PiperGraspPanel(QWidget* parent)
 
 void PiperGraspPanel::onInitialize()
 {
+    // Get display context with null check
+    auto context = getDisplayContext();
+    if (!context) {
+        RCLCPP_ERROR(rclcpp::get_logger("piper_grasp_panel"), "Display context is null");
+        return;
+    }
+
     // Get node from RViz context
-    auto ros_node_abstraction = getDisplayContext()->getRosNodeAbstraction().lock();
+    auto ros_node_abstraction = context->getRosNodeAbstraction().lock();
     if (!ros_node_abstraction) {
         RCLCPP_ERROR(rclcpp::get_logger("piper_grasp_panel"), "Failed to get ROS node abstraction");
         return;
     }
 
     // Create our own node for subscriptions and services
-    node_ = std::make_shared<rclcpp::Node>("piper_grasp_panel_node");
-    executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
-    executor_->add_node(node_);
+    // Use unique node name to avoid conflicts
+    try {
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        std::string node_name = "piper_grasp_panel_" + std::to_string(now % 100000);
+        node_ = std::make_shared<rclcpp::Node>(node_name);
+        executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+        executor_->add_node(node_);
 
-    setupRos();
+        setupRos();
 
-    // Start spin timer (10Hz)
-    spin_timer_->start(100);
+        // Start spin timer (10Hz)
+        spin_timer_->start(100);
 
-    RCLCPP_INFO(node_->get_logger(), "[PiperGraspPanel] ROS2 panel initialized");
+        RCLCPP_INFO(node_->get_logger(), "[PiperGraspPanel] ROS2 panel initialized");
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(rclcpp::get_logger("piper_grasp_panel"), "Failed to initialize: %s", e.what());
+    }
 }
 
 PiperGraspPanel::~PiperGraspPanel()
 {
     panel_alive_.store(false);
-    spin_timer_->stop();
 
-    // Cancel any running actions
-    if (current_pick_goal_) {
-        pick_client_->async_cancel_goal(current_pick_goal_);
+    if (spin_timer_) {
+        spin_timer_->stop();
     }
-    if (current_place_goal_) {
-        place_client_->async_cancel_goal(current_place_goal_);
+    if (error_clear_timer_) {
+        error_clear_timer_->stop();
+    }
+    if (auto_cycle_timer_) {
+        auto_cycle_timer_->stop();
+    }
+
+    // Cancel any running actions (with null checks)
+    if (pick_client_ && current_pick_goal_) {
+        try {
+            pick_client_->async_cancel_goal(current_pick_goal_);
+        } catch (...) {}
+    }
+    if (place_client_ && current_place_goal_) {
+        try {
+            place_client_->async_cancel_goal(current_place_goal_);
+        } catch (...) {}
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     if (executor_) {
-        executor_->cancel();
+        try {
+            executor_->cancel();
+        } catch (...) {}
     }
 }
 
@@ -132,7 +161,18 @@ void PiperGraspPanel::spinOnce()
 
 void PiperGraspPanel::setupUi()
 {
-    QVBoxLayout* main_layout = new QVBoxLayout(this);
+    // Use QScrollArea to make panel scrollable in RViz2
+    QVBoxLayout* outer_layout = new QVBoxLayout(this);
+    outer_layout->setSpacing(0);
+    outer_layout->setContentsMargins(0, 0, 0, 0);
+
+    QScrollArea* scroll_area = new QScrollArea();
+    scroll_area->setWidgetResizable(true);
+    scroll_area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll_area->setFrameShape(QFrame::NoFrame);
+
+    QWidget* scroll_content = new QWidget();
+    QVBoxLayout* main_layout = new QVBoxLayout(scroll_content);
     main_layout->setSpacing(5);
     main_layout->setContentsMargins(5, 5, 5, 5);
 
@@ -287,7 +327,7 @@ void PiperGraspPanel::setupUi()
     group_statistics_ = new QGroupBox("AUTO CLEAR STATISTICS");
     QVBoxLayout* stats_layout = new QVBoxLayout(group_statistics_);
 
-    btn_stats_toggle_ = new QPushButton("Statistics");
+    btn_stats_toggle_ = new QPushButton("▼ Statistics");
     btn_stats_toggle_->setStyleSheet("text-align: left; font-weight: bold;");
     btn_stats_toggle_->setFlat(true);
     connect(btn_stats_toggle_, &QPushButton::clicked, this, &PiperGraspPanel::onStatisticsPanelToggled);
@@ -308,6 +348,24 @@ void PiperGraspPanel::setupUi()
     label_object_types_->setStyleSheet("font-family: monospace;");
     label_duration_->setStyleSheet("font-family: monospace;");
     label_avg_time_->setStyleSheet("font-family: monospace;");
+
+    // Add all labels to layout immediately (they own the widgets now)
+    stats_layout->addWidget(label_cycle_count_);
+    stats_layout->addWidget(label_success_count_);
+    stats_layout->addWidget(label_fail_count_);
+    stats_layout->addWidget(label_success_rate_);
+    stats_layout->addWidget(label_object_types_);
+    stats_layout->addWidget(label_duration_);
+    stats_layout->addWidget(label_avg_time_);
+
+    // Initially hide stats labels (collapsed state)
+    label_cycle_count_->setVisible(false);
+    label_success_count_->setVisible(false);
+    label_fail_count_->setVisible(false);
+    label_success_rate_->setVisible(false);
+    label_object_types_->setVisible(false);
+    label_duration_->setVisible(false);
+    label_avg_time_->setVisible(false);
 
     group_statistics_->setVisible(false);
     main_layout->addWidget(group_statistics_);
@@ -391,6 +449,14 @@ void PiperGraspPanel::setupUi()
 
     main_layout->addWidget(group_details_);
     main_layout->addStretch();
+
+    // Finish scroll area setup
+    scroll_area->setWidget(scroll_content);
+    outer_layout->addWidget(scroll_area);
+
+    // Set reasonable size policy for RViz2 dock
+    setMinimumWidth(280);
+    setMaximumWidth(400);
 }
 
 void PiperGraspPanel::setupRos()
@@ -1230,7 +1296,15 @@ void PiperGraspPanel::onAutoClearClicked()
 
     group_statistics_->setVisible(true);
     statistics_panel_expanded_ = true;
-    btn_stats_toggle_->setText("Statistics");
+    btn_stats_toggle_->setText("▲ Statistics");
+    // Show all stats labels
+    label_cycle_count_->setVisible(true);
+    label_success_count_->setVisible(true);
+    label_fail_count_->setVisible(true);
+    label_success_rate_->setVisible(true);
+    label_object_types_->setVisible(true);
+    label_duration_->setVisible(true);
+    label_avg_time_->setVisible(true);
 
     btn_auto_clear_->setEnabled(false);
     btn_end_clear_->setEnabled(true);
@@ -1253,28 +1327,17 @@ void PiperGraspPanel::onStatisticsPanelToggled()
 {
     statistics_panel_expanded_ = !statistics_panel_expanded_;
 
-    if (statistics_panel_expanded_) {
-        btn_stats_toggle_->setText("Statistics");
-        QVBoxLayout* stats_layout = qobject_cast<QVBoxLayout*>(group_statistics_->layout());
-        if (stats_layout) {
-            stats_layout->addWidget(label_cycle_count_);
-            stats_layout->addWidget(label_success_count_);
-            stats_layout->addWidget(label_fail_count_);
-            stats_layout->addWidget(label_success_rate_);
-            stats_layout->addWidget(label_object_types_);
-            stats_layout->addWidget(label_duration_);
-            stats_layout->addWidget(label_avg_time_);
-        }
-    } else {
-        btn_stats_toggle_->setText("Statistics");
-        label_cycle_count_->setParent(nullptr);
-        label_success_count_->setParent(nullptr);
-        label_fail_count_->setParent(nullptr);
-        label_success_rate_->setParent(nullptr);
-        label_object_types_->setParent(nullptr);
-        label_duration_->setParent(nullptr);
-        label_avg_time_->setParent(nullptr);
-    }
+    // Toggle visibility of statistics labels
+    bool show = statistics_panel_expanded_;
+    label_cycle_count_->setVisible(show);
+    label_success_count_->setVisible(show);
+    label_fail_count_->setVisible(show);
+    label_success_rate_->setVisible(show);
+    label_object_types_->setVisible(show);
+    label_duration_->setVisible(show);
+    label_avg_time_->setVisible(show);
+
+    btn_stats_toggle_->setText(show ? "▲ Statistics" : "▼ Statistics");
 }
 
 void PiperGraspPanel::startNextAutoCycle()

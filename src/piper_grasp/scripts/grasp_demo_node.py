@@ -26,11 +26,17 @@ class DemoClient(Node):
     def __init__(self, prompt='bottle.cup.pen', enable_cdm=True, speed=30, place_after=True):
         super().__init__('demo_client_node')
 
-        # Parameters
-        self.prompt = prompt
-        self.enable_cdm = enable_cdm
-        self.speed = speed
-        self.place_after = place_after
+        # Declare ROS parameters (for launch file compatibility)
+        self.declare_parameter('prompt', prompt)
+        self.declare_parameter('enable_cdm', enable_cdm)
+        self.declare_parameter('speed', speed)
+        self.declare_parameter('place_after', place_after)
+
+        # Get parameters (ROS params override constructor args)
+        self.prompt = self.get_parameter('prompt').value
+        self.enable_cdm = self.get_parameter('enable_cdm').value
+        self.speed = self.get_parameter('speed').value
+        self.place_after = self.get_parameter('place_after').value
 
         # Service clients
         self.get_logger().info("Waiting for services...")

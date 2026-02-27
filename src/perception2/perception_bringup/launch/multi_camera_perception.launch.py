@@ -62,7 +62,7 @@ def generate_launch_description():
 
     # 自动检测频率
     auto_detect_rate_arg = DeclareLaunchArgument(
-        'auto_detect_rate', default_value='5.0',
+        'auto_detect_rate', default_value='10.0',
         description='Auto detection rate in Hz (0=disable)'
     )
 

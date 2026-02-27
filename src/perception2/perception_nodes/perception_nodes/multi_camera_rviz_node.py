@@ -51,6 +51,14 @@ SENSOR_QOS = QoSProfile(
     depth=1
 )
 
+# 检测结果 QoS (深度更大，避免高频发布时丢失消息)
+DETECTION_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10  # 足够容纳10Hz的检测结果
+)
+
 
 @dataclass
 class CameraVizState:
@@ -122,6 +130,8 @@ class MultiCameraRVizNode(Node):
         # === 融合结果状态 ===
         self._latest_fused_objects = None
         self._fused_lock = threading.Lock()
+        self._previous_fused_ids = set()  # 追踪之前的fused marker IDs，避免DELETEALL导致闪烁
+        self._previous_camera_ids = {}  # 追踪每个相机的marker IDs {camera_name: set()}
 
         # 加载外参
         self._load_extrinsics()
@@ -146,12 +156,12 @@ class MultiCameraRVizNode(Node):
             PointCloud2, self._lidar_topic, self._lidar_callback, SENSOR_QOS
         )
 
-        # === 订阅融合结果（使用 LATCHED_QOS 匹配发布端）===
+        # === 订阅融合结果（使用 DETECTION_QOS 深度10，避免高频发布时丢失消息）===
         fused_topic = f'/{self._perception_node_name}/fused/objects_3d'
         self._fused_sub = self.create_subscription(
-            Object3DArray, fused_topic, self._fused_objects_callback, LATCHED_QOS
+            Object3DArray, fused_topic, self._fused_objects_callback, DETECTION_QOS
         )
-        self.get_logger().info(f"Subscribe fused results: {fused_topic} (TRANSIENT_LOCAL)")
+        self.get_logger().info(f"Subscribe fused results: {fused_topic} (depth=10)")
 
         # === 定时发布 ===
         if self._publish_rate > 0:
@@ -405,9 +415,8 @@ class MultiCameraRVizNode(Node):
             # 发布 RGB-D 点云
             self._publish_rgb_pointcloud(camera_name, rgb_copy, depth_copy, stamp)
 
-            # 发布物体可视化
-            if objects is not None and len(objects.objects) > 0:
-                self._publish_object_visualization(camera_name, objects, depth_copy, stamp)
+            # 发布物体可视化（即使没有物体也要调用，以便清理旧markers）
+            self._publish_object_visualization(camera_name, objects, depth_copy, stamp)
 
     def _get_category_color(self, category: str, camera_name: str) -> Tuple:
         """根据类别和相机获取固定颜色"""
@@ -500,27 +509,19 @@ class MultiCameraRVizNode(Node):
         cloud_msg = self._create_colored_pointcloud(points_base, colors, stamp, self._target_frame)
         self.pubs[camera_name]['rgb_pointcloud'].publish(cloud_msg)
 
-    def _publish_object_visualization(self, camera_name: str, 
-                                      objects_msg: Object3DArray, 
+    def _publish_object_visualization(self, camera_name: str,
+                                      objects_msg: Optional[Object3DArray],
                                       depth: np.ndarray, stamp):
-        """发布物体可视化"""
+        """发布物体可视化（增量更新，避免闪烁）"""
         state = self._cameras[camera_name]
         markers = MarkerArray()
 
-        # 只清空本相机的 markers（使用独立 namespace）
-        # 注意：DELETEALL markers 需要使用不会与实际 markers 冲突的 id
-        # 使用 -1 避免与实际物体 markers (id >= 0) 冲突
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        delete_marker.ns = f"{camera_name}_object_bbox"
-        delete_marker.id = -1  # 避免与实际 markers 的 id 冲突
-        markers.markers.append(delete_marker)
+        # 初始化该相机的marker ID追踪集合
+        if camera_name not in self._previous_camera_ids:
+            self._previous_camera_ids[camera_name] = set()
 
-        delete_label = Marker()
-        delete_label.action = Marker.DELETEALL
-        delete_label.ns = f"{camera_name}_distance_labels"
-        delete_label.id = -2  # 使用不同的 id 避免冲突
-        markers.markers.append(delete_label)
+        # 收集本次的marker IDs
+        current_ids = set()
 
         # 收集所有物体点云
         all_object_points = []
@@ -529,9 +530,12 @@ class MultiCameraRVizNode(Node):
         fx, fy = state.intrinsics['fx'], state.intrinsics['fy']
         cx, cy = state.intrinsics['cx'], state.intrinsics['cy']
 
-        for i, obj in enumerate(objects_msg.objects):
+        # 处理物体（即使没有物体也要继续，以便清理旧markers）
+        objects_list = objects_msg.objects if objects_msg is not None else []
+        for i, obj in enumerate(objects_list):
             color = self._get_category_color(obj.category, camera_name)
             global_id = self._get_global_marker_id(camera_name, i)
+            current_ids.add(global_id)
 
             # 边界框 marker
             bbox_marker = self._create_bbox_marker(obj, global_id, color, stamp, camera_name)
@@ -585,6 +589,30 @@ class MultiCameraRVizNode(Node):
                 clr = np.array([[int(color[2]*255), int(color[1]*255), int(color[0]*255)]])
                 all_object_colors.append(np.tile(clr, (len(pts), 1)))
 
+        # 删除不再需要的旧markers（增量删除，避免DELETEALL导致闪烁）
+        stale_ids = self._previous_camera_ids[camera_name] - current_ids
+        for stale_id in stale_ids:
+            # 删除边界框
+            del_bbox = Marker()
+            del_bbox.header.frame_id = self._target_frame
+            del_bbox.header.stamp = stamp
+            del_bbox.ns = f"{camera_name}_object_bbox"
+            del_bbox.id = stale_id
+            del_bbox.action = Marker.DELETE
+            markers.markers.append(del_bbox)
+
+            # 删除标签
+            del_label = Marker()
+            del_label.header.frame_id = self._target_frame
+            del_label.header.stamp = stamp
+            del_label.ns = f"{camera_name}_distance_labels"
+            del_label.id = stale_id
+            del_label.action = Marker.DELETE
+            markers.markers.append(del_label)
+
+        # 更新追踪集合
+        self._previous_camera_ids[camera_name] = current_ids
+
         # 发布 markers
         self.pubs[camera_name]['object_markers'].publish(markers)
 
@@ -618,7 +646,7 @@ class MultiCameraRVizNode(Node):
         # 添加相机前缀
         prefix = "[TOP]" if camera_name == 'top' else "[CHS]"
         marker.text = f"{prefix} {obj.object_id}"
-        marker.lifetime.sec = int(1.0 / self._publish_rate) + 1
+        marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
 
@@ -664,7 +692,7 @@ class MultiCameraRVizNode(Node):
         marker.color.b = 1.0
         marker.color.a = 1.0
 
-        marker.lifetime.sec = int(1.0 / self._publish_rate) + 1
+        marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
 
@@ -930,46 +958,71 @@ class MultiCameraRVizNode(Node):
         self._publish_fused_visualization(msg)
 
     def _publish_fused_visualization(self, objects_msg: Object3DArray):
-        """发布融合结果可视化"""
-        if objects_msg is None or len(objects_msg.objects) == 0:
-            return
+        """发布融合结果可视化（增量更新，避免闪烁）"""
+        try:
+            markers = MarkerArray()
+            stamp = self.get_clock().now().to_msg()
 
-        markers = MarkerArray()
-        stamp = self.get_clock().now().to_msg()
+            # 融合结果使用独特的颜色（金色/黄色），区别于top绿色和chassis红色
+            fused_color = (1.0, 0.84, 0.0, 0.8)  # 金色 (r, g, b, a)
 
-        # 清空之前的 markers
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        delete_marker.ns = "fused_object_bbox"
-        delete_marker.id = -1
-        markers.markers.append(delete_marker)
+            # 收集本次需要的marker IDs
+            current_ids = set()
+            valid_count = 0
 
-        delete_label = Marker()
-        delete_label.action = Marker.DELETEALL
-        delete_label.ns = "fused_distance_labels"
-        delete_label.id = -2
-        markers.markers.append(delete_label)
+            # 处理物体（即使没有物体也要继续，以便清理旧markers）
+            if objects_msg is not None and len(objects_msg.objects) > 0:
+                for i, obj in enumerate(objects_msg.objects):
+                    try:
+                        # 使用独立的marker ID范围 (2000-2999)
+                        marker_id = 2000 + i
+                        current_ids.add(marker_id)
 
-        # 融合结果使用独特的颜色（金色/黄色），区别于top绿色和chassis红色
-        fused_color = (1.0, 0.84, 0.0, 0.8)  # 金色 (r, g, b, a)
+                        # 边界框 marker
+                        bbox_marker = self._create_fused_bbox_marker(obj, marker_id, fused_color, stamp)
+                        markers.markers.append(bbox_marker)
 
-        for i, obj in enumerate(objects_msg.objects):
-            # 使用独立的marker ID范围 (2000-2999)
-            marker_id = 2000 + i
+                        # 距离标签 marker
+                        label_marker = self._create_fused_distance_label(obj, marker_id, stamp)
+                        markers.markers.append(label_marker)
+                        valid_count += 1
+                    except Exception as e:
+                        self.get_logger().warn(f'[FUSED_VIZ] 创建 marker {i} 失败: {e}')
 
-            # 边界框 marker
-            bbox_marker = self._create_fused_bbox_marker(obj, marker_id, fused_color, stamp)
-            markers.markers.append(bbox_marker)
+            # 删除不再需要的旧markers（增量删除，避免DELETEALL导致闪烁）
+            stale_ids = self._previous_fused_ids - current_ids
+            for stale_id in stale_ids:
+                # 删除边界框
+                del_bbox = Marker()
+                del_bbox.header.frame_id = self._target_frame
+                del_bbox.header.stamp = stamp
+                del_bbox.ns = "fused_object_bbox"
+                del_bbox.id = stale_id
+                del_bbox.action = Marker.DELETE
+                markers.markers.append(del_bbox)
 
-            # 距离标签 marker
-            label_marker = self._create_fused_distance_label(obj, marker_id, stamp)
-            markers.markers.append(label_marker)
+                # 删除标签
+                del_label = Marker()
+                del_label.header.frame_id = self._target_frame
+                del_label.header.stamp = stamp
+                del_label.ns = "fused_distance_labels"
+                del_label.id = stale_id
+                del_label.action = Marker.DELETE
+                markers.markers.append(del_label)
 
-        # 发布融合结果 markers
-        self.pub_fused_markers.publish(markers)
+            # 更新追踪集合
+            self._previous_fused_ids = current_ids
 
-        # 也添加到合并的markers中
-        self.pub_combined_markers.publish(markers)
+            # 发布融合结果 markers
+            self.pub_fused_markers.publish(markers)
+            self.get_logger().debug(f'[FUSED_VIZ] 发布 {valid_count} 个 fused markers, 删除 {len(stale_ids)} 个旧 markers')
+
+            # 也添加到合并的markers中
+            self.pub_combined_markers.publish(markers)
+        except Exception as e:
+            self.get_logger().error(f'[FUSED_VIZ] _publish_fused_visualization 异常: {e}')
+            import traceback
+            traceback.print_exc()
 
     def _create_fused_bbox_marker(self, obj, idx: int, color: Tuple, stamp) -> Marker:
         """创建融合结果的边界框 Marker"""
@@ -997,7 +1050,7 @@ class MultiCameraRVizNode(Node):
         marker.color.a = color[3]
 
         marker.text = f"[FUSED] {obj.object_id}"
-        marker.lifetime.sec = int(1.0 / self._publish_rate) + 1 if self._publish_rate > 0 else 2
+        marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
 
@@ -1046,7 +1099,7 @@ class MultiCameraRVizNode(Node):
         marker.color.b = 0.0
         marker.color.a = 1.0
 
-        marker.lifetime.sec = int(1.0 / self._publish_rate) + 1 if self._publish_rate > 0 else 2
+        marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
 

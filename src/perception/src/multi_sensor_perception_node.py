@@ -67,6 +67,9 @@ from dual_camera_matcher import (
     DualCameraMatcher, DetectionWithDepth, MatchPair
 )
 
+# 导入ByteTracker3D
+from byte_tracker_3d import ByteTracker3D, TrackerConfig
+
 
 # ============================================================================
 # 相机数据容器
@@ -230,11 +233,15 @@ class MultiSensorPerceptionNode:
         )
         self.log.info("Matcher initialized (Hungarian, N=20 optimized)")
 
-        # === 初始化跟踪器 ===
-        self.tracker = SimpleTracker(
-            max_missing_frames=3,
-            distance_threshold=0.15  # 15cm
+        # === 初始化跟踪器 (ByteTracker3D 替换 SimpleTracker) ===
+        tracker_cfg = TrackerConfig(
+            match_thresh=0.15,       # 第一阶段: 15cm
+            second_thresh=0.25,      # 第二阶段: 25cm (恢复匹配)
+            track_buffer=15,         # 5Hz × 3秒
+            confirm_frames=2,        # 2帧确认新轨迹
         )
+        self.tracker = ByteTracker3D(tracker_cfg, self.log)
+        self.log.info("ByteTracker3D initialized (replaces SimpleTracker)")
 
         # === 订阅相机（使用message_filters同步） ===
         self._init_camera_subscribers()

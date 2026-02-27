@@ -19,33 +19,58 @@ from mmengine.config import Config as MMConfig
 from percept import DinoXDetectorOnline, GraspAnythingOnline, DepthOptimizerOnline, SAM3Online
 
 
-def benchmark_with_timing(func, args, kwargs, name, num_runs=10):
-    """带详细时间分布的基准测试"""
+def benchmark_with_timing(func, args_list, kwargs, name, num_runs=10, warmup_runs=3):
+    """带详细时间分布的基准测试，支持多数据集轮换
+
+    Args:
+        func: 测试函数
+        args_list: 参数列表，每个元素是一组 (data_name, args) 元组
+        kwargs: 额外参数
+        name: 测试名称
+        num_runs: 每个数据集测试次数
+        warmup_runs: 预热次数
+    """
     times = []
     timing_stats = {}
+    num_datasets = len(args_list)
+    total_runs = num_runs * num_datasets
 
     print(f"\n{'='*70}")
-    print(f"[{name}] 开始测试 ({num_runs} 次)")
+    print(f"[{name}] 开始测试 ({num_datasets} 组数据, 每组 {num_runs} 次, 预热 {warmup_runs} 次)")
     print(f"{'='*70}")
 
-    for i in range(num_runs):
+    # 预热阶段 - 不计入统计，轮换数据集
+    for i in range(warmup_runs):
+        data_name, args = args_list[i % num_datasets]
         timing = {}
         kwargs['_timing'] = timing
-
         start = time.perf_counter()
-        result = func(*args, **kwargs)
+        func(*args, **kwargs)
         elapsed = time.perf_counter() - start
-        times.append(elapsed)
+        print(f"  [预热] 第 {i+1:2d} 次 [{data_name}]: {elapsed*1000:7.1f}ms")
 
-        # 收集时间分布
-        for k, v in timing.items():
-            if k not in timing_stats:
-                timing_stats[k] = []
-            timing_stats[k].append(v)
+    # 正式测试 - 轮换数据集
+    run_idx = 0
+    for r in range(num_runs):
+        for data_name, args in args_list:
+            run_idx += 1
+            timing = {}
+            kwargs['_timing'] = timing
 
-        # 打印单次结果
-        timing_str = ' | '.join([f"{k}:{v:.0f}" for k, v in timing.items()])
-        print(f"  第 {i+1:2d} 次: {elapsed*1000:7.1f}ms | {timing_str}")
+            start = time.perf_counter()
+            result = func(*args, **kwargs)
+            elapsed = time.perf_counter() - start
+            times.append(elapsed)
+
+            # 收集时间分布
+            for k, v in timing.items():
+                if k not in timing_stats:
+                    timing_stats[k] = []
+                timing_stats[k].append(v)
+
+            # 打印单次结果
+            timing_str = ' | '.join([f"{k}:{v:.0f}" for k, v in timing.items()])
+            print(f"  第 {run_idx:2d} 次 [{data_name}]: {elapsed*1000:7.1f}ms | {timing_str}")
 
     # 统计
     avg_time = statistics.mean(times)
@@ -84,41 +109,45 @@ def benchmark_with_timing(func, args, kwargs, name, num_runs=10):
 
 def main():
     num_runs = 10
-    warmup_runs = 3
+    warmup_runs = 3  # 预热次数（不计入统计）
 
     # 测试图片路径 - 使用真实深度数据
     script_dir = os.path.dirname(os.path.abspath(__file__))
     samples_dir = '/home/didi/workspace/MobileManipulator2/src/perception/samples'
-    rgb_path = os.path.join(samples_dir, '001-rgb.jpg')
-    depth_path = os.path.join(samples_dir, '001-dpt.png')
 
-    if not os.path.exists(rgb_path):
-        print(f"测试 RGB 图片不存在: {rgb_path}")
-        sys.exit(1)
-    if not os.path.exists(depth_path):
-        print(f"测试深度图不存在: {depth_path}")
+    # 可用数据集
+    datasets = ['001', '002', '666', '770']
+
+    # 加载所有数据集
+    all_data = []
+    for ds in datasets:
+        rgb_path = os.path.join(samples_dir, f'{ds}-rgb.jpg')
+        depth_path = os.path.join(samples_dir, f'{ds}-dpt.png')
+
+        if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+            print(f"跳过数据集 {ds}: 文件不完整")
+            continue
+
+        rgb = cv2.imread(rgb_path)
+        depth_mm = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+
+        if rgb is None or depth_mm is None:
+            print(f"跳过数据集 {ds}: 读取失败")
+            continue
+
+        all_data.append({'name': ds, 'rgb': rgb, 'depth': depth_mm})
+        print(f"加载数据集 {ds}: RGB {rgb.shape}, Depth {depth_mm.shape}")
+
+    if not all_data:
+        print("没有可用的测试数据")
         sys.exit(1)
 
-    # 加载测试图片
-    rgb = cv2.imread(rgb_path)
-    if rgb is None:
-        print(f"无法读取 RGB 图片: {rgb_path}")
-        sys.exit(1)
-
-    # 加载真实深度图 (16-bit PNG)
-    depth_mm = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-    if depth_mm is None:
-        print(f"无法读取深度图: {depth_path}")
-        sys.exit(1)
-
-    print(f"RGB 图片: {rgb_path}")
-    print(f"深度图: {depth_path}")
-    print(f"RGB 尺寸: {rgb.shape}")
-    print(f"深度尺寸: {depth_mm.shape}, dtype={depth_mm.dtype} (真实数据)")
-    print(f"测试次数: {num_runs}")
-    print(f"预热次数: {warmup_runs}")
+    print(f"\n共加载 {len(all_data)} 组数据")
+    print(f"每组测试 {num_runs} 次, 预热 {warmup_runs} 次")
 
     all_results = []
+    text_prompt_dinox = 'pen.box.phone.bottle.toy'
+    text_prompt_sam3 = 'pen,box,phone,bottle,toy'
 
     # ========== 1. DinoX 测试 ==========
     try:
@@ -126,17 +155,18 @@ def main():
         cfg.url = 'http://192.168.112.14:10086'
         cfg.min_score = 0.25
         cfg.iou_threshold = 0.5
-        cfg.warmup = warmup_runs
+        cfg.warmup = 0
         dinox_service = DinoXDetectorOnline(cfg)
 
-        text_prompt = 'pen.box.phone.bottle.toy'
+        args_list = [(d['name'], (text_prompt_dinox, d['rgb'])) for d in all_data]
 
         result = benchmark_with_timing(
             func=dinox_service.forward,
-            args=(text_prompt, rgb),
+            args_list=args_list,
             kwargs={},
             name='DinoX',
-            num_runs=num_runs
+            num_runs=num_runs,
+            warmup_runs=warmup_runs
         )
         all_results.append(result)
     except Exception as e:
@@ -149,18 +179,19 @@ def main():
         cfg = MMConfig()
         cfg.url = 'http://192.168.112.14:8080'
         cfg.confidence = 0.30
-        cfg.return_mask = False  # 不返回 mask 以加快速度
-        cfg.warmup = warmup_runs
+        cfg.return_mask = False
+        cfg.warmup = 0
         sam3_service = SAM3Online(cfg)
 
-        text_prompt = 'pen,box,phone,bottle,toy'  # SAM3 使用逗号分隔
+        args_list = [(d['name'], (text_prompt_sam3, d['rgb'])) for d in all_data]
 
         result = benchmark_with_timing(
             func=sam3_service.forward,
-            args=(text_prompt, rgb),
+            args_list=args_list,
             kwargs={},
             name='SAM3',
-            num_runs=num_runs
+            num_runs=num_runs,
+            warmup_runs=warmup_runs
         )
         all_results.append(result)
     except Exception as e:
@@ -173,15 +204,18 @@ def main():
         cfg = MMConfig()
         cfg.server_list = os.path.join(script_dir, '..', 'config', 'server_grasp.json')
         cfg.model_name = 'full'
-        cfg.warmup = warmup_runs
+        cfg.warmup = 0
         grasp_service = GraspAnythingOnline(cfg)
+
+        args_list = [(d['name'], (d['rgb'],)) for d in all_data]
 
         result = benchmark_with_timing(
             func=grasp_service.forward,
-            args=(rgb,),
+            args_list=args_list,
             kwargs={'depth': None},
             name='GraspAnything',
-            num_runs=num_runs
+            num_runs=num_runs,
+            warmup_runs=warmup_runs
         )
         all_results.append(result)
     except Exception as e:
@@ -194,15 +228,18 @@ def main():
         cfg = MMConfig()
         cfg.url = 'http://192.168.112.14:8081'
         cfg.chosen_policy = 'dn'
-        cfg.warmup = warmup_runs
+        cfg.warmup = 0
         cdm_service = DepthOptimizerOnline(cfg)
+
+        args_list = [(d['name'], (d['rgb'], d['depth'])) for d in all_data]
 
         result = benchmark_with_timing(
             func=cdm_service.forward,
-            args=(rgb, depth_mm),
+            args_list=args_list,
             kwargs={'chosen_policy': 'dn'},
             name='CDM',
-            num_runs=num_runs
+            num_runs=num_runs,
+            warmup_runs=warmup_runs
         )
         all_results.append(result)
     except Exception as e:
@@ -213,7 +250,7 @@ def main():
     # ========== 汇总对比 ==========
     if all_results:
         print(f"\n{'='*70}")
-        print("串行执行性能汇总")
+        print(f"串行执行性能汇总 ({len(all_data)} 组数据轮换测试)")
         print(f"{'='*70}")
         print(f"{'服务':<15} {'平均(ms)':<12} {'最小(ms)':<12} {'最大(ms)':<12} {'本地(ms)':<12} {'HTTP(ms)':<12}")
         print("-" * 75)

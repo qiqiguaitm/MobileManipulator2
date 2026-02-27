@@ -1172,11 +1172,14 @@ class DepthOptimizerOnline:
                     - 'dn,vis': 去噪+可视化（默认）
                     - 'dn': 仅去噪
                     - 'vis': 仅可视化
+                - target_size: letterbox 目标尺寸，默认 518
                 - warmup: 预热次数，默认 0（不预热）
         """
         self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8086')
         self.api_url = f'{self.base_url}/api/predict'
         self.chosen_policy = getattr(cfg, 'chosen_policy', 'dn,vis')
+        self.target_long = getattr(cfg, 'target_long', 924)   # 长边目标尺寸
+        self.target_short = getattr(cfg, 'target_short', 518)  # 短边目标尺寸
 
         # 创建不使用代理的 Session，用于内网服务器访问
         self.session = requests.Session()
@@ -1198,6 +1201,78 @@ class DepthOptimizerOnline:
             self.forward(dummy_rgb, dummy_depth)
             print(f"  warmup {i+1}/{num_runs}")
         print("[DepthOptimizerOnline] Warmup 完成")
+
+    def _letterbox(self, img, target_long, target_short, fill_value=0):
+        """Letterbox padding，保持宽高比缩放到目标矩形尺寸
+
+        Args:
+            img: 输入图像 (H, W) 或 (H, W, C)
+            target_long: 长边目标尺寸
+            target_short: 短边目标尺寸
+            fill_value: 填充值
+
+        Returns:
+            tuple: (padded_img, scale, pad_top, pad_left, target_h, target_w)
+        """
+        h, w = img.shape[:2]
+
+        # 确定目标尺寸（根据原图方向）
+        if w >= h:
+            # 横向图：宽为长边
+            target_w, target_h = target_long, target_short
+        else:
+            # 纵向图：高为长边
+            target_w, target_h = target_short, target_long
+
+        # 计算缩放比例（保持宽高比，取较小值确保不超出目标框）
+        scale = min(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+
+        # Resize
+        if len(img.shape) == 3:
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+        # Padding
+        pad_top = (target_h - new_h) // 2
+        pad_bottom = target_h - new_h - pad_top
+        pad_left = (target_w - new_w) // 2
+        pad_right = target_w - new_w - pad_left
+
+        if len(img.shape) == 3:
+            padded = cv2.copyMakeBorder(resized, pad_top, pad_bottom, pad_left, pad_right,
+                                        cv2.BORDER_CONSTANT, value=(fill_value, fill_value, fill_value))
+        else:
+            padded = cv2.copyMakeBorder(resized, pad_top, pad_bottom, pad_left, pad_right,
+                                        cv2.BORDER_CONSTANT, value=fill_value)
+
+        return padded, scale, pad_top, pad_left, target_h, target_w
+
+    def _unletterbox(self, img, orig_h, orig_w, scale, pad_top, pad_left):
+        """去除 letterbox padding，恢复原始尺寸
+
+        Args:
+            img: letterbox 后的图像
+            orig_h, orig_w: 原始尺寸
+            scale: 缩放比例
+            pad_top, pad_left: padding 偏移
+
+        Returns:
+            恢复到原始尺寸的图像
+        """
+        new_h, new_w = int(orig_h * scale), int(orig_w * scale)
+
+        # 去除 padding
+        cropped = img[pad_top:pad_top + new_h, pad_left:pad_left + new_w]
+
+        # Resize 回原始尺寸
+        if len(img.shape) == 3:
+            restored = cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            restored = cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+        return restored
 
     def forward(self, rgb, depth, chosen_policy=None, _timing=None, **kwargs):
         """前向推理函数，调用深度去噪服务
@@ -1233,42 +1308,43 @@ class DepthOptimizerOnline:
 
         policy = chosen_policy or self.chosen_policy
 
-        # 处理 RGB 图像
+        # 读取图像（如果是文件路径或 bytes）
         if isinstance(rgb, str):
-            with open(rgb, 'rb') as f:
-                rgb_bytes = f.read()
-            rgb_filename = os.path.basename(rgb)
-        elif isinstance(rgb, np.ndarray):
-            _, rgb_encoded = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            rgb_bytes = rgb_encoded.tobytes()
-            rgb_filename = 'rgb.jpg'
+            rgb = cv2.imread(rgb)
         elif isinstance(rgb, bytes):
-            rgb_bytes = rgb
-            rgb_filename = 'rgb.jpg'
-        else:
-            raise TypeError(f'不支持的 RGB 类型: {type(rgb)}')
+            rgb = cv2.imdecode(np.frombuffer(rgb, dtype=np.uint8), cv2.IMREAD_COLOR)
 
-        _t1 = _time.time()  # RGB编码完成
-
-        # 处理深度图
         if isinstance(depth, str):
-            with open(depth, 'rb') as f:
-                depth_bytes = f.read()
-            depth_filename = os.path.basename(depth)
-        elif isinstance(depth, np.ndarray):
-            # 确保是 uint16 格式
-            if depth.dtype != np.uint16:
-                depth = depth.astype(np.uint16)
-            _, depth_encoded = cv2.imencode('.png', depth)
-            depth_bytes = depth_encoded.tobytes()
-            depth_filename = 'depth.png'
+            depth = cv2.imread(depth, cv2.IMREAD_UNCHANGED)
         elif isinstance(depth, bytes):
-            depth_bytes = depth
-            depth_filename = 'depth.png'
-        else:
-            raise TypeError(f'不支持的深度图类型: {type(depth)}')
+            depth = cv2.imdecode(np.frombuffer(depth, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
 
-        _t2 = _time.time()  # Depth编码完成
+        # 确保深度图是 uint16 格式
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16)
+
+        # 记录原始尺寸
+        orig_h, orig_w = rgb.shape[:2]
+
+        # Letterbox padding 到 target_long x target_short
+        rgb_padded, scale, pad_top, pad_left, _, _ = self._letterbox(
+            rgb, self.target_long, self.target_short, fill_value=0)
+        depth_padded, _, _, _, _, _ = self._letterbox(
+            depth, self.target_long, self.target_short, fill_value=0)
+
+        _t1 = _time.time()  # 预处理完成
+
+        # 编码 RGB
+        _, rgb_encoded = cv2.imencode('.jpg', rgb_padded, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        rgb_bytes = rgb_encoded.tobytes()
+        rgb_filename = 'rgb.jpg'
+
+        # 编码深度图
+        _, depth_encoded = cv2.imencode('.png', depth_padded)
+        depth_bytes = depth_encoded.tobytes()
+        depth_filename = 'depth.png'
+
+        _t2 = _time.time()  # 编码完成
 
         # 准备请求
         files = {
@@ -1283,56 +1359,79 @@ class DepthOptimizerOnline:
 
             # 记录时间分布
             if _timing is not None:
-                _timing['cdm_rgb_encode'] = (_t1 - _t0) * 1000
-                _timing['cdm_depth_encode'] = (_t2 - _t1) * 1000
+                _timing['cdm_preprocess'] = (_t1 - _t0) * 1000
+                _timing['cdm_encode'] = (_t2 - _t1) * 1000
                 _timing['cdm_http'] = (_t3 - _t2) * 1000
 
-            result = response.json()
+            # 检查 Content-Type，服务端现在直接返回 PNG 二进制
+            content_type = response.headers.get('Content-Type', '')
 
-            # 检查服务端错误
-            if not response.ok or result.get('error'):
-                error_msg = result.get('error', f'HTTP {response.status_code}')
-                print(f"[DepthOptimizerOnline] 服务端错误: {error_msg}")
-                return {
-                    'success': False,
-                    'error': error_msg,
-                }
+            if 'image/png' in content_type:
+                # 新 API：直接返回 PNG 二进制
+                if not response.ok:
+                    return {'success': False, 'error': f'HTTP {response.status_code}'}
 
-            if not result.get('success'):
-                return {
-                    'success': False,
-                    'error': result.get('error', 'Unknown error'),
-                }
-
-            output = {
-                'success': True,
-                'device': result.get('device'),
-                'original_resolution': result.get('original_resolution'),
-                'depth_resolution': result.get('depth_resolution'),
-                'chosen_policy': result.get('chosen_policy'),
-            }
-
-            # 解码去噪后的深度图
-            if result.get('depth'):
-                depth_b64 = result['depth']
-                depth_data = base64.b64decode(depth_b64)
                 depth_arr = cv2.imdecode(
-                    np.frombuffer(depth_data, dtype=np.uint8),
+                    np.frombuffer(response.content, dtype=np.uint8),
                     cv2.IMREAD_UNCHANGED  # 保持 16-bit
                 )
-                output['depth'] = depth_arr
 
-            # 解码可视化图像
-            if result.get('vis_images') and len(result['vis_images']) > 0:
-                vis_b64 = result['vis_images'][0]
-                vis_data = base64.b64decode(vis_b64)
-                vis_arr = cv2.imdecode(
-                    np.frombuffer(vis_data, dtype=np.uint8),
-                    cv2.IMREAD_COLOR
-                )
-                output['vis_image'] = vis_arr
+                # Unletterbox: 恢复到原始尺寸
+                depth_arr = self._unletterbox(depth_arr, orig_h, orig_w, scale, pad_top, pad_left)
 
-            return output
+                _t4 = _time.time()
+                if _timing is not None:
+                    _timing['cdm_postprocess'] = (_t4 - _t3) * 1000
+
+                return {
+                    'success': True,
+                    'depth': depth_arr,
+                    'chosen_policy': policy,
+                }
+            else:
+                # 旧 API：返回 JSON + base64（兼容）
+                result = response.json()
+
+                # 检查服务端错误
+                if not response.ok or result.get('error'):
+                    error_msg = result.get('error', f'HTTP {response.status_code}')
+                    print(f"[DepthOptimizerOnline] 服务端错误: {error_msg}")
+                    return {'success': False, 'error': error_msg}
+
+                if not result.get('success'):
+                    return {'success': False, 'error': result.get('error', 'Unknown error')}
+
+                output = {
+                    'success': True,
+                    'device': result.get('device'),
+                    'original_resolution': result.get('original_resolution'),
+                    'depth_resolution': result.get('depth_resolution'),
+                    'chosen_policy': result.get('chosen_policy'),
+                }
+
+                # 解码去噪后的深度图
+                if result.get('depth'):
+                    depth_b64 = result['depth']
+                    depth_data = base64.b64decode(depth_b64)
+                    depth_arr = cv2.imdecode(
+                        np.frombuffer(depth_data, dtype=np.uint8),
+                        cv2.IMREAD_UNCHANGED
+                    )
+                    # Unletterbox: 恢复到原始尺寸
+                    depth_arr = self._unletterbox(depth_arr, orig_h, orig_w, scale, pad_top, pad_left)
+                    output['depth'] = depth_arr
+
+                # 解码可视化图像
+                if result.get('vis_images') and len(result['vis_images']) > 0:
+                    vis_b64 = result['vis_images'][0]
+                    vis_data = base64.b64decode(vis_b64)
+                    vis_arr = cv2.imdecode(
+                        np.frombuffer(vis_data, dtype=np.uint8),
+                        cv2.IMREAD_COLOR
+                    )
+                    output['vis_image'] = vis_arr
+
+                return output
 
         except requests.exceptions.RequestException as e:
             print(f"[DepthOptimizerOnline] 请求失败: {e}")

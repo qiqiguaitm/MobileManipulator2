@@ -24,6 +24,7 @@ from .dual_camera_matcher import (
     CategoryCompatibility,
 )
 from .intelligent_fusion import fuse_dual_camera_positions
+from .byte_tracker_3d import ByteTracker3D, TrackerConfig
 
 __version__ = "1.0.0"
 __all__ = [
@@ -44,4 +45,6 @@ __all__ = [
     "MatchQuality",
     "CategoryCompatibility",
     "fuse_dual_camera_positions",
+    "ByteTracker3D",
+    "TrackerConfig",
 ]
