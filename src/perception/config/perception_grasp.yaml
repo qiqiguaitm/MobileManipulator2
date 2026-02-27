@@ -1,80 +1,82 @@
-# perception_grasp.yaml - 抓取感知节点配置
+# perception_grasp.yaml - 抓取感知节点配置 (ROS2)
 
-perception_grasp:
-  # 相机 Topic 配置 (订阅 camera_driver)
-  camera:
+perception_grasp_node:
+  ros__parameters:
+    # 相机 Topic 配置
+    camera:
+      rgb_topic: '/camera/hand/color/image_raw'
+      depth_topic: '/camera/hand/aligned_depth_to_color/image_raw'
+      camera_info_topic: '/camera/hand/color/camera_info'
+
+    # 触发模式配置
+    trigger:
+      realtime_mode:
+        enabled: true
+        rate: 1.0
+        default_prompt: 'pen.box.phone.bottle.toy'
+        prompt_topic: '/usr/prompt/grasp'
+
+    # 检测服务配置
+    services:
+      grasp:
+        # server_list: 默认自动发现 perception/config/server_grasp.json
+        model_name: 'full'
+        warmup: true
+      detector_type: 'sam3'  # dinox | sam3
+      dinox:
+        url: 'http://192.168.112.14:10086'
+      sam3:
+        url: 'http://192.168.112.14:8080'
+      cdm:
+        url: 'http://192.168.112.14:8081'
+        enabled: true
+
+    # 深度有效范围 (米)
+    depth:
+      min_depth: 0.20
+      max_depth: 2.0
+
+    # Chosen Object 选择策略
+    chosen_policy:
+      grasp_score_weight: 0.2
+      distance_weight: 0.8
+      distance_mode: 'reciprocal'
+      normalize_distance: true
+      debug: true
+
+    # 过滤参数
+    filter:
+      min_grasp_score: 0.3
+      min_object_score: 0.25
+      max_gripper_width: 0.090  # 夹爪最大宽度 (米), Piper 物理限制 90mm
+
+      # 规则2: bbox 短边尺寸过滤（基于 mask rotated bbox）
+      bbox_size_filter:
+        enabled: true
+        size_ratio: 2.0           # 短边阈值 = max_gripper_width * size_ratio
+                                   # 例：90mm * 2.0 = 180mm，超过此值的物体会被过滤
+
+      # 规则1: Affordance 旋转矩形过滤
+      affordance_mask_overlap:
+        enabled: false            # 临时禁用，调试 score=0 问题
+        expand_ratio: 1.5
+        overlap_threshold: 0.9
+        rect_height_ratio: 0.4
+
+    # 输出坐标系
+    frame_id: 'camera/hand_color_optical_frame'
+
+
+perception_grasp_rviz_node:
+  ros__parameters:
+    frame_id: 'hand_camera_color_optical_frame'
+    pointcloud_scale: 0.5
+    marker_lifetime: 3.0
+    depth_min: 0.001
+    depth_max: 2.0
+    temporal_filter_size: 3
+
     rgb_topic: '/camera/hand/color/image_raw'
-    depth_topic: '/camera/hand/aligned_depth_to_color/image_raw'
+    depth_topic: 'perception_grasp_node/depth'
+    result_topic: 'perception_grasp_node/result'
     camera_info_topic: '/camera/hand/color/camera_info'
-    width: 1280
-    height: 720
-
-  # 触发模式配置
-  trigger:
-    # Service 模式 (始终启用)
-    service_name: "~detect"
-
-    # 实时检测模式 (默认启用, 同时支持 service 模式)
-    realtime_mode:
-      enabled: true                         # 是否启用实时模式
-      rate: 1.0                             # 实时模式帧率 Hz (调整为1Hz以降低计算负载)
-      default_prompt: "pen.box.phone.bottle.toy"  # 默认检测提示词
-      prompt_topic: "/usr/prompt/grasp"     # 输入: 检测提示词 (可选覆盖)
-      result_topic: "~result"               # 输出: 检测结果 (GraspObjectArray)
-
-  # 检测服务 (三个服务并行调用)
-  services:
-    grasp:
-      server_list: 'config/server_grasp.json'  # 服务器列表配置文件
-      model_name: 'full'                       # 模型名称: 'full' 或 'lite'
-      timeout: 10
-      warmup: true               # 启动时预热
-
-    dinox:
-      url: 'http://192.168.112.14:10086'
-      timeout: 10
-
-    cdm:  # 深度优化服务
-      url: 'http://192.168.112.14:8086'
-      timeout: 10
-      enabled: true              # 是否启用 CDM 深度优化 (实时模式使用此配置)
-      chosen_policy: 'dn'        # 'dn' 仅去噪, 'dn,vis' 去噪+可视化
-
-  # 深度有效范围 (米)
-  depth:
-    min_depth: 0.20              # 提高最小深度以过滤夹爪 (夹爪通常在20cm以内)
-    max_depth: 2.0
-
-  # Chosen Object 选择策略
-  chosen_policy:
-    method: "weighted_sum"         # 加权组合策略
-    grasp_score_weight: 0.2        # 抓取质量权重（极端距离优先）
-    distance_weight: 0.8           # 距离权重（极端距离优先）
-    distance_mode: "reciprocal"    # "reciprocal" | "linear" | "gaussian"
-    normalize_distance: true       # reciprocal 模式下是否归一化到 [0, 1]
-                                   # true: 对齐 grasp_score 范围 (推荐)
-                                   # false: 原始倒数 [0.1, 1.0]，近距离权重更高
-    debug: true                    # 是否打印每个候选的组合分数（建议初期启用）
-
-  # 过滤参数
-  filter:
-    min_grasp_score: 0.3
-    min_object_score: 0.25
-    max_gripper_width: 0.090  # 夹爪最大宽度 (米), Piper 物理限制 90mm
-
-    # 规则2: bbox 短边尺寸过滤（基于 mask rotated bbox）
-    bbox_size_filter:
-      enabled: true             # 是否启用此规则
-      size_ratio: 2.0           # 短边阈值 = max_gripper_width * size_ratio
-                                # 例：90mm * 2.0 = 180mm，超过此值的物体会被过滤
-
-    # 规则1: Affordance 旋转矩形过滤
-    affordance_mask_overlap:
-      enabled: false            # 临时禁用，调试 score=0 问题
-      expand_ratio: 1.5         # 旋转矩形扩展倍数（从中心）
-      overlap_threshold: 0.9    # 重叠率阈值（mask 覆盖扩展矩形超过此值则过滤）
-      rect_height_ratio: 0.4    # 旋转矩形高度 = 宽度 * 此比例（与可视化一致）
-
-  # 输出坐标系 (用于发布的消息)
-  rviz:
-    frame_id: "camera/hand_color_optical_frame"

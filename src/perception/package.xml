@@ -1,38 +1,53 @@
 <?xml version="1.0"?>
-<package format="2">
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
   <name>perception</name>
-  <version>1.0.0</version>
-  <description>Scene Perception 3D - 3D object detection with camera and LiDAR fusion</description>
-
-  <maintainer email="dev@example.com">Developer</maintainer>
+  <version>2.0.0</version>
+  <description>
+    MobileManipulator perception system.
+    Provides 3D scene perception, object detection, grasp detection,
+    and multi-camera fusion with ROS2 message/service interfaces.
+  </description>
+  <maintainer email="developer@example.com">Developer</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>catkin</buildtool_depend>
+  <!-- Build tools -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
-  <build_depend>message_generation</build_depend>
-  <build_depend>rospy</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>std_msgs</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>geometry_msgs</build_depend>
-  <build_depend>visualization_msgs</build_depend>
-  <build_depend>rviz</build_depend>
-  <build_depend>qtbase5-dev</build_depend>
+  <!-- ROS2 dependencies -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>visualization_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+  <depend>tf2_ros</depend>
+  <depend>image_transport</depend>
 
-  <exec_depend>common</exec_depend>
-  <exec_depend>message_runtime</exec_depend>
-  <exec_depend>rospy</exec_depend>
-  <exec_depend>roscpp</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>visualization_msgs</exec_depend>
-  <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>rviz</exec_depend>
-  <exec_depend>libqt5-core</exec_depend>
-  <exec_depend>libqt5-widgets</exec_depend>
+  <!-- Runtime -->
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <!-- Python dependencies -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-requests</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <exec_depend>python3-pycocotools</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <!-- Test -->
+  <test_depend>python3-pytest</test_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
-    <rviz plugin="${prefix}/plugin_description.xml"/>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

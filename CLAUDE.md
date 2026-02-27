@@ -181,7 +181,7 @@ claude mcp add spec-workflow-mcp -s user -- npx -y spec-workflow-mcp@latest
 ```
 
 ## 进一步附加要求
-- 如果有权限问题，sudo 的密码是agx
+- 如果有权限问题，sudo 的密码是didi
 - 使用中文来回答用户问题。
 - please keep ultrathink！
 - 执行ros相关程序前，先清理一下现有的ros进程，构建一个干净的环境，如rosnode kill 对应node, 然后再执行

@@ -49,7 +49,7 @@ class ApproachConfig:
     depth_detect_width: float = 0.4         # 前方检测宽度 (米)，左右各此值
 
     # ========== 外参标定文件 ==========
-    extrinsics_file: str = "/home/didi/workspace/MobileManipulator2/src/perception2/perception_bringup/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
+    extrinsics_file: str = "/home/didi/workspace/MobileManipulator2/src/perception/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
 
     # ========== 机器人几何参数 ==========
     # 来源: 外参标定 extrinsics_chassis_camera_optical_frame_to_base_link.yaml

@@ -4,6 +4,8 @@ Scene Perception 3D - 核心测量算法
 
 从 depth_accuracy_analyzer.py 提取的核心 3D 测量算法，
 支持可配置的目标坐标系 (base_link / arm_base_link)。
+
+这是一个纯 Python 模块，不依赖 ROS。
 """
 
 from dataclasses import dataclass, field
@@ -12,8 +14,7 @@ from typing import Optional, Dict, Any, List
 import cv2
 import numpy as np
 
-from coordinate_transformer import CoordinateTransformer
-from percept import DepthOptimizerOnline
+from perception.coordinate_transformer import CoordinateTransformer
 
 
 @dataclass
@@ -26,6 +27,16 @@ class MeasurementResult:
     distance: float = 0.0                      # 到目标坐标系原点的距离
     stats: Dict[str, Any] = field(default_factory=dict)
     error_msg: Optional[str] = None
+
+
+class SimpleConfig:
+    """简单的配置类，用于初始化服务客户端"""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 class ScenePerceptionCore:
@@ -45,13 +56,13 @@ class ScenePerceptionCore:
                  transformer: CoordinateTransformer,
                  intrinsics: dict,
                  target_frame: str = 'base_link',
-                 depth_optimizer: DepthOptimizerOnline = None):
+                 depth_optimizer=None):
         """
         Args:
             transformer: 坐标变换器
             intrinsics: 相机内参 {fx, fy, cx, cy, width, height}
             target_frame: 目标坐标系 ('base_link' 或 'arm_base_link')
-            depth_optimizer: CDM 深度优化器 (可选)
+            depth_optimizer: CDM 深度优化器实例 (可选，DepthOptimizerOnline)
         """
         self.transformer = transformer
         self.intrinsics = intrinsics
@@ -60,7 +71,7 @@ class ScenePerceptionCore:
 
         # 验证目标坐标系
         if target_frame not in ('base_link', 'arm_base_link'):
-            raise ValueError(f"不支持的目标坐标系: {target_frame}")
+            raise ValueError(f"Unsupported target frame: {target_frame}")
 
     def optimize_depth(self, rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
         """
@@ -85,7 +96,7 @@ class ScenePerceptionCore:
             optimized = result['depth'].astype(np.float32) / 1000.0
             return optimized
         else:
-            print(f"[WARN] 深度优化失败: {result.get('error', 'unknown')}")
+            print(f"[WARN] Depth optimization failed: {result.get('error', 'unknown')}")
             return depth
 
     def camera_3d_percept(self, depth: np.ndarray, mask: np.ndarray,
@@ -110,7 +121,7 @@ class ScenePerceptionCore:
         eroded_mask = cv2.erode(mask, kernel, iterations=1)
 
         if eroded_mask.sum() < self.MIN_DEPTH_POINTS:
-            result.error_msg = f"腐蚀后 mask 太小: {eroded_mask.sum()}"
+            result.error_msg = f"Eroded mask too small: {eroded_mask.sum()}"
             return result
 
         # 2. 提取深度值
@@ -121,7 +132,7 @@ class ScenePerceptionCore:
         depth_values = depth_values[valid_mask]
 
         if len(depth_values) < self.MIN_DEPTH_POINTS:
-            result.error_msg = f"有效深度点太少: {len(depth_values)}"
+            result.error_msg = f"Too few valid depth points: {len(depth_values)}"
             return result
 
         # 4. IQR 异常值剔除
@@ -132,7 +143,7 @@ class ScenePerceptionCore:
         depth_values = depth_values[(depth_values >= lower_bound) & (depth_values <= upper_bound)]
 
         if len(depth_values) < self.MIN_DEPTH_POINTS:
-            result.error_msg = f"IQR 后深度点太少: {len(depth_values)}"
+            result.error_msg = f"Too few points after IQR: {len(depth_values)}"
             return result
 
         # 5. 生成 3D 点云 (optical frame) - 向量化优化
@@ -148,7 +159,7 @@ class ScenePerceptionCore:
                 (ds > self.DEPTH_MIN) & (ds < self.DEPTH_MAX)
 
         if valid.sum() < self.MIN_DEPTH_POINTS:
-            result.error_msg = f"3D 点太少: {valid.sum()}"
+            result.error_msg = f"Too few 3D points: {valid.sum()}"
             return result
 
         # 向量化反投影
@@ -195,6 +206,131 @@ class ScenePerceptionCore:
 
         return result
 
+    def batch_camera_3d_percept(self, depth: np.ndarray,
+                                detections: List[Dict[str, Any]],
+                                skip_transform: bool = False) -> List[MeasurementResult]:
+        """
+        批量 bbox-scoped 3D 测量（替代逐物体全图 np.where 扫描）
+
+        Args:
+            depth: 深度图 (H, W) float32, 单位: 米
+            detections: 检测列表，每项含 'mask' (H,W uint8) 和 'bbox' [x1,y1,x2,y2]
+            skip_transform: 是否跳过坐标变换
+
+        Returns:
+            list[MeasurementResult]，与 detections 一一对应
+        """
+        H, W = depth.shape[:2]
+        fx, fy = self.intrinsics['fx'], self.intrinsics['fy']
+        cx, cy = self.intrinsics['cx'], self.intrinsics['cy']
+        kernel = np.ones((self.MASK_ERODE_KERNEL, self.MASK_ERODE_KERNEL), np.uint8)
+
+        results = []
+        for det in detections:
+            result = MeasurementResult()
+            mask = det['mask']
+            bbox = det.get('bbox', [0, 0, 0, 0])
+
+            # bbox 安全裁剪到图像边界
+            x1 = max(0, int(bbox[0]))
+            y1 = max(0, int(bbox[1]))
+            x2 = min(W, int(bbox[2]))
+            y2 = min(H, int(bbox[3]))
+
+            # bbox 退化检查
+            if x2 <= x1 or y2 <= y1:
+                result.error_msg = f"Degenerate bbox: [{x1},{y1},{x2},{y2}]"
+                results.append(result)
+                continue
+
+            # ROI 裁剪
+            mask_roi = mask[y1:y2, x1:x2]
+            depth_roi = depth[y1:y2, x1:x2]
+
+            # 腐蚀（复用 kernel）
+            eroded_roi = cv2.erode(mask_roi, kernel, iterations=1)
+
+            if eroded_roi.sum() < self.MIN_DEPTH_POINTS:
+                result.error_msg = f"Eroded mask too small: {eroded_roi.sum()}"
+                results.append(result)
+                continue
+
+            # ROI 内 np.where（远小于全图扫描）
+            ys_local, xs_local = np.where(eroded_roi > 0)
+
+            # 提取深度值
+            ds = depth_roi[ys_local, xs_local]
+
+            # 剔除无效值
+            valid = (ds > self.DEPTH_MIN) & (ds < self.DEPTH_MAX)
+            if valid.sum() < self.MIN_DEPTH_POINTS:
+                result.error_msg = f"Too few valid depth points: {valid.sum()}"
+                results.append(result)
+                continue
+
+            depth_values = ds[valid]
+
+            # IQR 异常值剔除
+            q1, q3 = np.percentile(depth_values, [25, 75])
+            iqr = q3 - q1
+            lower_bound = q1 - self.IQR_FACTOR * iqr
+            upper_bound = q3 + self.IQR_FACTOR * iqr
+            depth_values = depth_values[(depth_values >= lower_bound) & (depth_values <= upper_bound)]
+
+            if len(depth_values) < self.MIN_DEPTH_POINTS:
+                result.error_msg = f"Too few points after IQR: {len(depth_values)}"
+                results.append(result)
+                continue
+
+            # 向量化过滤：深度范围 + IQR
+            valid2 = valid & (ds >= lower_bound) & (ds <= upper_bound)
+            if valid2.sum() < self.MIN_DEPTH_POINTS:
+                result.error_msg = f"Too few 3D points: {valid2.sum()}"
+                results.append(result)
+                continue
+
+            # 偏移到全图坐标 + 反投影
+            xs_img = xs_local[valid2].astype(np.float64) + x1
+            ys_img = ys_local[valid2].astype(np.float64) + y1
+            ds_valid = ds[valid2]
+
+            X = (xs_img - cx) * ds_valid / fx
+            Y = (ys_img - cy) * ds_valid / fy
+            Z = ds_valid
+            points = np.column_stack([X, Y, Z])
+
+            # 中值质心
+            centroid_optical = np.median(points, axis=0)
+
+            # 坐标变换
+            if skip_transform:
+                centroid_target = centroid_optical
+                distance = np.linalg.norm(centroid_optical)
+            else:
+                centroid_target = self.transformer.optical_to_target(
+                    centroid_optical.reshape(1, 3), self.target_frame
+                )[0]
+                distance = np.linalg.norm(centroid_target)
+
+            # 置信度
+            depth_std = np.std(depth_values)
+            confidence = self._compute_confidence(len(points), depth_std)
+
+            result.valid = True
+            result.confidence = confidence
+            result.centroid = centroid_target
+            result.centroid_optical = centroid_optical
+            result.distance = distance
+            result.stats = {
+                'depth_median': float(np.median(depth_values)),
+                'depth_std': float(depth_std),
+                'num_points': len(points),
+                'valid_ratio': len(depth_values) / max(mask_roi.sum(), 1),
+            }
+            results.append(result)
+
+        return results
+
     def lidar_3d_percept(self, lidar_points: np.ndarray, bbox: List[float],
                          camera_depth: float = None) -> MeasurementResult:
         """
@@ -214,7 +350,7 @@ class ScenePerceptionCore:
         result = MeasurementResult()
 
         if lidar_points is None or len(lidar_points) == 0:
-            result.error_msg = "无 LiDAR 点云"
+            result.error_msg = "No LiDAR points"
             return result
 
         # 1. 变换到 optical frame
@@ -268,7 +404,7 @@ class ScenePerceptionCore:
             expand_ratio += expand_step_ratio
 
         if len(filtered_indices) < self.MIN_LIDAR_POINTS:
-            result.error_msg = f"筛选后 LiDAR 点太少: {len(filtered_indices)}"
+            result.error_msg = f"Too few LiDAR points after filter: {len(filtered_indices)}"
             return result
 
         # 获取筛选后的点 (rslidar 坐标系)
@@ -283,7 +419,7 @@ class ScenePerceptionCore:
         filtered_points = filtered_points[valid_mask]
 
         if len(filtered_points) < self.MIN_LIDAR_POINTS:
-            result.error_msg = f"IQR 后 LiDAR 点太少: {len(filtered_points)}"
+            result.error_msg = f"Too few LiDAR points after IQR: {len(filtered_points)}"
             return result
 
         # 5. 计算质心 (rslidar 坐标系)
@@ -323,26 +459,14 @@ class ScenePerceptionCore:
         return 0.7 * point_score + 0.3 * std_score
 
 
-# 简单配置类 (用于初始化 DepthOptimizerOnline)
-class SimpleConfig:
-    """简单的配置类"""
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-
 def test_perception_core():
     """测试核心算法"""
     print("=" * 60)
-    print("ScenePerceptionCore 测试")
+    print("ScenePerceptionCore Test")
     print("=" * 60)
 
-    # 初始化组件
+    # 初始化组件 (不加载外参)
     transformer = CoordinateTransformer()
-    transformer.load_all_extrinsics()
 
     intrinsics = {
         'fx': 386.82, 'fy': 386.27,
@@ -350,32 +474,31 @@ def test_perception_core():
         'width': 640, 'height': 480,
     }
 
-    # 测试两种目标坐标系
-    for target_frame in ['base_link', 'arm_base_link']:
-        print(f"\n--- 目标坐标系: {target_frame} ---")
+    # 添加单位变换用于测试
+    transformer.add_transform('optical_to_base', np.eye(4))
 
-        core = ScenePerceptionCore(
-            transformer=transformer,
-            intrinsics=intrinsics,
-            target_frame=target_frame,
-        )
+    core = ScenePerceptionCore(
+        transformer=transformer,
+        intrinsics=intrinsics,
+        target_frame='base_link',
+    )
 
-        # 创建测试数据
-        depth = np.ones((480, 640), dtype=np.float32) * 1.5  # 1.5m 深度
-        mask = np.zeros((480, 640), dtype=np.uint8)
-        mask[200:280, 280:360] = 1  # 中心区域 mask
+    # 创建测试数据
+    depth = np.ones((480, 640), dtype=np.float32) * 1.5  # 1.5m 深度
+    mask = np.zeros((480, 640), dtype=np.uint8)
+    mask[200:280, 280:360] = 1  # 中心区域 mask
 
-        # 测试相机 3D 感知
-        result = core.camera_3d_percept(depth, mask)
-        if result.valid:
-            print(f"  camera_3d_percept 成功:")
-            print(f"    位置: {result.centroid}")
-            print(f"    距离: {result.distance:.3f}m")
-            print(f"    置信度: {result.confidence:.2f}")
-        else:
-            print(f"  camera_3d_percept 失败: {result.error_msg}")
+    # 测试相机 3D 感知
+    result = core.camera_3d_percept(depth, mask)
+    if result.valid:
+        print(f"camera_3d_percept success:")
+        print(f"  Position: {result.centroid}")
+        print(f"  Distance: {result.distance:.3f}m")
+        print(f"  Confidence: {result.confidence:.2f}")
+    else:
+        print(f"camera_3d_percept failed: {result.error_msg}")
 
-    print("\n测试完成")
+    print("\nTest completed")
 
 
 if __name__ == '__main__':

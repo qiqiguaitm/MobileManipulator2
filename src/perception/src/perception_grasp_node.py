@@ -28,28 +28,21 @@ from datetime import datetime
 
 import numpy as np
 import cv2
-import rospy
-import rospkg
+import rclpy
+from rclpy.node import Node
 import message_filters
-from common.logger import get_logger
+from ament_index_python.packages import get_package_share_directory
+from perception.utils import CvBridgeNumPy2 as CvBridge, ThrottledLogger, LATCHED_QOS, SENSOR_QOS
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String
 from geometry_msgs.msg import Point
-from cv_bridge import CvBridge
 
 # 导入自定义消息和服务
 from perception.msg import GraspResult, GraspObject, GraspObjectArray
-from perception.srv import GraspDetect, GraspDetectResponse
-
-# 将 src 目录添加到 Python 路径以便导入 percept 模块
-rospack = rospkg.RosPack()
-_pkg_path = rospack.get_path('perception')
-_src_path = os.path.join(_pkg_path, 'src')
-if _src_path not in sys.path:
-    sys.path.insert(0, _src_path)
+from perception.srv import GraspDetect
 
 # 导入检测服务类
-from percept import GraspAnythingOnline, DinoXDetectorOnline, DepthOptimizerOnline
+from perception.percept import GraspAnythingOnline, DinoXDetectorOnline, SAM3Online, DepthOptimizerOnline
 
 # pycocotools for mask RLE encoding
 try:
@@ -57,7 +50,7 @@ try:
     HAS_COCO = True
 except ImportError:
     HAS_COCO = False
-    rospy.logwarn("[PerceptGrasp] pycocotools not installed, mask RLE encoding unavailable")
+    print("[PerceptGrasp] pycocotools not installed, mask RLE encoding unavailable")
 
 
 class SimpleConfig:
@@ -70,22 +63,27 @@ class SimpleConfig:
         return getattr(self, key, default)
 
 
-class PerceptionGraspNode:
+class PerceptionGraspNode(Node):
     """抓取感知 ROS 节点"""
 
     def __init__(self):
-        rospy.init_node('perception_grasp_node')
-        self.log = get_logger("PerceptGrasp")
+        super().__init__('perception_grasp_node',
+                         allow_undeclared_parameters=True,
+                         automatically_declare_parameters_from_overrides=True)
+        self.log = ThrottledLogger(self.get_logger())
         self.log.info("Initializing...")
 
-        # 加载配置 (参数路径: ~perception_grasp/...)
-        self.config = rospy.get_param('~perception_grasp', {})
-        if not self.config:
-            # 尝试直接从私有命名空间获取
-            self.config = rospy.get_param('~', {})
+        # 加载配置 (从 ROS2 参数系统重建嵌套 dict)
+        self.config = self._build_config_from_params()
         if not self.config:
             self.log.error("Config is empty, check launch file")
             raise RuntimeError("Config empty")
+
+        # 声明动态参数（可能不在 YAML 中）
+        if not self.has_parameter('debug_filter'):
+            self.declare_parameter('debug_filter', False)
+        if not self.has_parameter('log_level'):
+            self.declare_parameter('log_level', 'INFO')
 
         # === 并发控制 ===
         self._detect_lock = threading.Lock()
@@ -104,15 +102,15 @@ class PerceptionGraspNode:
         # === 订阅 CameraInfo (一次性获取内参) ===
         camera_cfg = self.config.get('camera', {})
         info_topic = camera_cfg.get('camera_info_topic', '/camera/hand/color/camera_info')
-        rospy.Subscriber(info_topic, CameraInfo, self._camera_info_callback, queue_size=1)
+        self.create_subscription(CameraInfo, info_topic, self._camera_info_callback, SENSOR_QOS)
         self.log.info(f"Subscribed CameraInfo: {info_topic}")
 
         # === 使用 message_filters 同步订阅 RGB + Depth ===
         rgb_topic = camera_cfg.get('rgb_topic', '/camera/hand/color/image_raw')
         depth_topic = camera_cfg.get('depth_topic', '/camera/hand/aligned_depth_to_color/image_raw')
 
-        self._rgb_sub = message_filters.Subscriber(rgb_topic, Image)
-        self._depth_sub = message_filters.Subscriber(depth_topic, Image)
+        self._rgb_sub = message_filters.Subscriber(self, Image, rgb_topic, qos_profile=SENSOR_QOS)
+        self._depth_sub = message_filters.Subscriber(self, Image, depth_topic, qos_profile=SENSOR_QOS)
 
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self._rgb_sub, self._depth_sub],
@@ -126,9 +124,9 @@ class PerceptionGraspNode:
         self._init_detectors()
 
         # === ROS Service ===
-        service_name = self.config.get('trigger', {}).get('service_name', '~detect')
-        self._detect_srv = rospy.Service(service_name, GraspDetect, self._detect_service_callback)
-        self.log.info(f"Service: {rospy.resolve_name(service_name)}")
+        service_name = self.config.get('trigger', {}).get('service_name', '~/detect')
+        self._detect_srv = self.create_service(GraspDetect, service_name, self._detect_service_callback)
+        self.log.info(f"Service: {service_name}")
 
         # === 实时模式配置 ===
         realtime_cfg = self.config.get('trigger', {}).get('realtime_mode', {})
@@ -138,17 +136,17 @@ class PerceptionGraspNode:
         self._realtime_enable_cdm = self.config.get('services', {}).get('cdm', {}).get('enabled', True)
 
         # === 结果发布器 ===
-        result_topic = realtime_cfg.get('result_topic', '~result')
-        self._result_pub = rospy.Publisher(result_topic, GraspObjectArray, queue_size=1, latch=True)
-        self.log.info(f"Publish result: {rospy.resolve_name(result_topic)}")
+        result_topic = realtime_cfg.get('result_topic', '~/result')
+        self._result_pub = self.create_publisher(GraspObjectArray, result_topic, LATCHED_QOS)
+        self.log.info(f"Publish result: {result_topic}")
 
         # === 深度图发布器 (CDM优化后) ===
-        depth_pub_topic = '~depth'
-        self._depth_pub = rospy.Publisher(depth_pub_topic, Image, queue_size=1, latch=True)
-        self.log.info(f"Publish depth: {rospy.resolve_name(depth_pub_topic)}")
+        depth_pub_topic = '~/depth'
+        self._depth_pub = self.create_publisher(Image, depth_pub_topic, LATCHED_QOS)
+        self.log.info(f"Publish depth: {depth_pub_topic}")
 
         # === 坐标系 ===
-        self._frame_id = self.config.get('rviz', {}).get('frame_id', 'hand_camera_color_optical_frame')
+        self._frame_id = self.config.get('frame_id', 'hand_camera_color_optical_frame')
 
         # === Chosen Object 选择策略 ===
         self._chosen_policy = self.config.get('chosen_policy', {
@@ -164,7 +162,7 @@ class PerceptionGraspNode:
 
         # === 可选: 订阅外部 prompt 覆盖默认值 ===
         prompt_topic = realtime_cfg.get('prompt_topic', '/usr/prompt/grasp')
-        self._prompt_sub = rospy.Subscriber(prompt_topic, String, self._prompt_update_callback, queue_size=1)
+        self._prompt_sub = self.create_subscription(String, prompt_topic, self._prompt_update_callback, 1)
 
         self.log.info(f"Realtime mode: enabled={self._realtime_enabled}, rate={self._realtime_rate}Hz")
 
@@ -175,16 +173,29 @@ class PerceptionGraspNode:
         # === 启动实时检测定时器 ===
         if self._realtime_enabled:
             period = 1.0 / self._realtime_rate
-            self._realtime_timer = rospy.Timer(rospy.Duration(period), self._realtime_timer_callback)
+            self._realtime_timer = self.create_timer(period, self._realtime_timer_callback)
             self.log.info(f"Realtime timer started: {self._realtime_rate}Hz")
 
         self.log.info("Initialization complete")
 
+    def _build_config_from_params(self):
+        """将 ROS2 扁平参数 (a.b.c=v) 重建为嵌套 dict {a: {b: {c: v}}}"""
+        config = {}
+        for param_name in list(self._parameters.keys()):
+            if param_name == 'use_sim_time':
+                continue
+            value = self._parameters[param_name].value
+            keys = param_name.split('.')
+            d = config
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+            d[keys[-1]] = value
+        return config
+
     def _init_detectors(self):
         """初始化检测服务"""
         services_cfg = self.config.get('services', {})
-        rospack = rospkg.RosPack()
-        pkg_path = rospack.get_path('perception')
+        pkg_path = get_package_share_directory('perception')
 
         # 1. GraspAnythingOnline
         grasp_cfg = services_cfg.get('grasp', {})
@@ -198,14 +209,26 @@ class PerceptionGraspNode:
         self.grasp_detector = GraspAnythingOnline(grasp_config)
         self.log.info(f"GraspAnything initialized: {server_list_path}")
 
-        # 2. DinoXDetectorOnline
-        dinox_cfg = services_cfg.get('dinox', {})
-        dinox_config = SimpleConfig(
-            url=dinox_cfg.get('url', 'http://192.168.112.14:10086'),
-            min_score=self.config.get('filter', {}).get('min_object_score', 0.25)
-        )
-        self.object_detector = DinoXDetectorOnline(dinox_config)
-        self.log.info(f"DinoX initialized: {dinox_cfg.get('url')}")
+        # 2. Object detector (SAM3 or DinoX)
+        detector_type = services_cfg.get('detector_type', 'sam3')
+        min_score = self.config.get('filter', {}).get('min_object_score', 0.25)
+
+        if detector_type == 'sam3':
+            sam3_cfg = services_cfg.get('sam3', {})
+            det_config = SimpleConfig(
+                url=sam3_cfg.get('url', 'http://192.168.112.14:8080'),
+                min_score=min_score
+            )
+            self.object_detector = SAM3Online(det_config)
+            self.log.info(f"SAM3 initialized: {sam3_cfg.get('url')}")
+        else:
+            dinox_cfg = services_cfg.get('dinox', {})
+            det_config = SimpleConfig(
+                url=dinox_cfg.get('url', 'http://192.168.112.14:10086'),
+                min_score=min_score
+            )
+            self.object_detector = DinoXDetectorOnline(det_config)
+            self.log.info(f"DinoX initialized: {dinox_cfg.get('url')}")
 
         # 3. DepthOptimizerOnline (CDM)
         cdm_cfg = services_cfg.get('cdm', {})
@@ -233,10 +256,10 @@ class PerceptionGraspNode:
             self.intrinsics = {
                 'width': msg.width,
                 'height': msg.height,
-                'fx': msg.K[0],
-                'fy': msg.K[4],
-                'cx': msg.K[2],
-                'cy': msg.K[5],
+                'fx': msg.k[0],
+                'fy': msg.k[4],
+                'cx': msg.k[2],
+                'cy': msg.k[5],
             }
             self.log.info(f"Camera intrinsics loaded: {msg.width}x{msg.height}")
 
@@ -268,7 +291,7 @@ class PerceptionGraspNode:
             self.log.info(f"Prompt updated: '{self._realtime_prompt}' -> '{new_prompt}'")
             self._realtime_prompt = new_prompt
 
-    def _realtime_timer_callback(self, event):
+    def _realtime_timer_callback(self):
         """实时模式: 定时检测回调"""
         # 检查是否有图像数据
         if self.rgb is None or self.depth is None:
@@ -277,24 +300,23 @@ class PerceptionGraspNode:
         # 调用检测 (不等待锁，如果正在检测则跳过)
         self.detect(self._realtime_prompt, enable_cdm=self._realtime_enable_cdm, wait_for_lock=False)
 
-    def _detect_service_callback(self, req):
+    def _detect_service_callback(self, request, response):
         """Service 回调 (等待锁，确保服务调用能完成)"""
-        result = self.detect(req.prompt, req.enable_cdm, wait_for_lock=True)
+        result = self.detect(request.prompt, request.enable_cdm, wait_for_lock=True)
 
-        resp = GraspDetectResponse()
-        resp.success = result['success']
+        response.success = result['success']
         if result['success']:
-            resp.point3d = result['point3d']
-            resp.width3d = result['width3d']
-            resp.angle = result['angle']
-            resp.category = result['category']
-            resp.score = result.get('score', 0.0)
-            resp.center_uv = result.get('center_uv', [0, 0])
-            resp.depth = result.get('depth_value', 0.0)
+            response.point3d = result['point3d']
+            response.width3d = result['width3d']
+            response.angle = result['angle']
+            response.category = result['category']
+            response.score = result.get('score', 0.0)
+            response.center_uv = result.get('center_uv', [0.0, 0.0])
+            response.depth = result.get('depth_value', 0.0)
         else:
-            resp.error_message = result.get('error_message', 'Detection failed')
-        resp.detection_time_ms = result.get('detection_time_ms', 0)
-        return resp
+            response.error_message = result.get('error_message', 'Detection failed')
+        response.detection_time_ms = result.get('detection_time_ms', 0.0)
+        return response
 
     def detect(self, prompt, enable_cdm=True, wait_for_lock=True):
         """
@@ -446,7 +468,7 @@ class PerceptionGraspNode:
 
             # 构建 GraspObjectArray 消息
             result_msg = GraspObjectArray()
-            result_msg.header.stamp = rospy.Time.now()
+            result_msg.header.stamp = self.get_clock().now().to_msg()
             result_msg.frame_id = self._frame_id
             result_msg.prompt = prompt
             result_msg.objects = grasp_objects
@@ -672,7 +694,7 @@ class PerceptionGraspNode:
             cached_mask = mask_cache.get(target_idx)
             if self._should_filter_by_bbox_size(cached_mask, target_bbox, depth, img_w, img_h):
                 bbox_filtered_count += 1
-                if rospy.get_param('/perception_grasp_node/debug_filter', False):
+                if self.get_parameter('debug_filter').value:
                     self.log.debug(f"BUILD: Target {target_idx} ({target_category}): "
                                   f"Filtered by bbox size (too large for gripper)")
                 continue  # 跳过此 target，不构建 GraspObject
@@ -765,6 +787,10 @@ class PerceptionGraspNode:
                         if 0 <= cy_int < depth.shape[0] and 0 <= cx_int < depth.shape[1]:
                             depth_at_point = depth[cy_int, cx_int]
                             if not (min_depth < depth_at_point < max_depth):
+                                if depth_filtered_count == 0:
+                                    self.log.info(f"DEPTH_REJECT T{target_idx}({target_category}): "
+                                                  f"pixel=({cx_int},{cy_int}), depth={depth_at_point:.4f}m, "
+                                                  f"range=[{min_depth},{max_depth}]")
                                 depth_filtered_count += 1
                                 continue  # 深度不在有效范围，跳过此 affordance
 
@@ -776,7 +802,7 @@ class PerceptionGraspNode:
                         if overlap_result:
                             mask_overlap_filtered_count += 1
                             # 可选：详细日志（调试用）
-                            if rospy.get_param('/perception_grasp_node/debug_filter', False):
+                            if self.get_parameter('debug_filter').value:
                                 self.log.debug(f"BUILD: Target {target_idx} ({target_category}): Affordance filtered - "
                                               f"center=({cx:.0f},{cy:.0f}), width={aff[2]:.0f}px, score={score:.2f}")
                             continue  # mask 重叠过高，跳过此 affordance
@@ -878,7 +904,7 @@ class PerceptionGraspNode:
                 depth_val = self._get_robust_depth(depth, cached_mask, target_bbox, min_depth, max_depth)
                 if min_depth < depth_val < max_depth:
                     point3d = self._deproject_pixel_to_point([cx, cy], depth_val)
-                    obj_msg.position = Point(*point3d)
+                    obj_msg.position = Point(x=point3d[0], y=point3d[1], z=point3d[2])
                     obj_msg.depth = float(depth_val)
 
                     # 计算 3D 夹爪宽度（优化：批量反投影）
@@ -895,7 +921,7 @@ class PerceptionGraspNode:
 
                     if not width_valid:
                         # 优化：使用 debug 级别减少日志开销
-                        if rospy.get_param('/perception_grasp_node/log_level', 'INFO') == 'DEBUG':
+                        if self.get_parameter('log_level').value == 'DEBUG':
                             self.log.debug(f"BUILD: Target {target_idx} ({target_category}): Grasp too wide "
                                           f"({obj_msg.grasp_width3d*1000:.1f}mm > {max_gripper_width*1000:.1f}mm), skipped for chosen")
 
@@ -917,7 +943,7 @@ class PerceptionGraspNode:
                                              f"grasp_score={best_grasp['score']:.3f}, depth={obj_msg.depth:.3f}m, "
                                              f"combined={combined_score:.3f}")
                 else:
-                    obj_msg.position = Point(0, 0, 0)
+                    obj_msg.position = Point(x=0.0, y=0.0, z=0.0)
                     obj_msg.depth = 0.0
                     obj_msg.grasp_width3d = 0.0
             else:
@@ -935,10 +961,10 @@ class PerceptionGraspNode:
                 depth_val = self._get_robust_depth(depth, cached_mask, target_bbox, min_depth, max_depth)
                 if min_depth < depth_val < max_depth:
                     point3d = self._deproject_pixel_to_point([cx, cy], depth_val)
-                    obj_msg.position = Point(*point3d)
+                    obj_msg.position = Point(x=point3d[0], y=point3d[1], z=point3d[2])
                     obj_msg.depth = float(depth_val)
                 else:
-                    obj_msg.position = Point(0, 0, 0)
+                    obj_msg.position = Point(x=0.0, y=0.0, z=0.0)
                     obj_msg.depth = 0.0
 
             grasp_objects.append(obj_msg)
@@ -1095,7 +1121,7 @@ class PerceptionGraspNode:
         should_filter = overlap_ratio > threshold
 
         # 调试输出：显示重叠率详情
-        if rospy.get_param('/perception_grasp_node/debug_filter', False):
+        if self.get_parameter('debug_filter').value:
             self.log.info(f"OVERLAP_CHECK: cx={cx:.0f}, cy={cy:.0f}, "
                          f"rect={width_expanded:.0f}x{height_expanded:.0f}, "
                          f"overlap={overlap_pixels}/{rotated_rect_pixels}={overlap_ratio:.1%}, "
@@ -1184,7 +1210,7 @@ class PerceptionGraspNode:
         should_filter = short_edge_m > threshold_m
 
         # === 5. 调试日志 ===
-        if rospy.get_param('/perception_grasp_node/debug_filter', False):
+        if self.get_parameter('debug_filter').value:
             self.log.info(f"BBOX_FILTER: method={method}, "
                          f"short_edge_px={short_edge_px:.1f}, "
                          f"depth={depth_val:.3f}m, "
@@ -1241,21 +1267,18 @@ class PerceptionGraspNode:
 
         return np.stack([x, y, z], axis=-1)  # shape: (N, 3)
 
-    def spin(self):
-        """主循环"""
-        rospy.spin()
-
-
 def main():
+    rclpy.init()
     try:
         node = PerceptionGraspNode()
-        node.spin()
-    except rospy.ROSInterruptException:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
         pass
     except Exception as e:
-        rospy.logerr(f"[PerceptGrasp] Exception exit: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

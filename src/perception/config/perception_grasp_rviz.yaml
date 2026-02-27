@@ -1,29 +1,29 @@
-# perception_grasp_rviz.yaml - 抓取感知 RViz 可视化节点配置
+# perception_grasp_rviz.yaml - 抓取感知 RViz 可视化节点配置 (ROS2)
 
 perception_grasp_rviz:
-  # 订阅的 perception_grasp_node topics
-  result_topic: "perception_grasp_node/result"
-  depth_topic: "perception_grasp_node/depth"
-  rgb_topic: "/camera/hand/color/image_raw"
-  camera_info_topic: "/camera/hand/color/camera_info"
+  ros__parameters:
+    # 订阅的 perception_grasp_node topics
+    result_topic: "perception_grasp_node/result"
+    depth_topic: "perception_grasp_node/depth"
+    rgb_topic: "/camera/hand/color/image_raw"
+    camera_info_topic: "/camera/hand/color/camera_info"
 
-  # NOTE: Phase 1 - Visualization shows original perception results
-  # Blacklist filtering happens in piper_grasp_node Observe service
-  # Phase 2 TODO: Subscribe to /piper/grasp/filtered_result for consistent visualization
+    # 坐标系
+    frame_id: "camera/hand_color_optical_frame"
 
-  # 坐标系
-  frame_id: "camera/hand_color_optical_frame"
+    # 点云参数
+    pointcloud_scale: 0.5        # 图像降采样 (0.5 = 640x360)
+    depth_min: 0.25              # 最小深度 (m) - 过滤掉夹爪
+    depth_max: 2.0               # 最大深度 (m)
 
-  # 点云参数
-  pointcloud_scale: 0.5        # 图像降采样 (0.5 = 640x360)
-  depth_min: 0.25              # 最小深度 (m) - 过滤掉夹爪
-  depth_max: 2.0               # 最大深度 (m)
+    # Marker 参数
+    marker_lifetime: 3.0         # Marker 显示时长 (秒)
 
-  # Marker 参数
-  marker_lifetime: 3.0         # Marker 显示时长 (秒)
+    # 时间滤波参数
+    temporal_filter_size: 2      # 时间滤波窗口大小
 
-  # 发布的 Topics (相对于节点命名空间)
-  pointcloud_topic: "~vis/pointcloud"
-  panel_topic: "~vis/panel"
-  markers_topic: "~markers"
-  grasp_pose_topic: "~grasp_pose"
+    # 发布的 Topics (相对于节点命名空间)
+    pointcloud_topic: "~/vis/pointcloud"
+    panel_topic: "~/vis/panel"
+    markers_topic: "~/markers"
+    grasp_pose_topic: "~/grasp_pose"

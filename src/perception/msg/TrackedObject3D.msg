@@ -1,7 +1,7 @@
 # 跟踪物体3D信息
 # 由 ObjectTrackerNode 发布
 
-Header header
+std_msgs/Header header
 
 # 身份
 int32 track_id                     # 跟踪ID (唯一, 不变)

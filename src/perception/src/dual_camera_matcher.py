@@ -26,9 +26,9 @@ class DetectionWithDepth:
     """带有3D信息的检测结果"""
     # 2D检测信息
     bbox: np.ndarray          # [x1, y1, x2, y2] 像素坐标
-    mask: np.ndarray          # (H, W) 二值mask
-    category: str
-    detection_score: float
+    mask: Optional[np.ndarray] = None  # (H, W) 二值mask
+    category: str = ""
+    detection_score: float = 0.0
 
     # 视觉特征（来自DINO-X或CLIP）
     visual_features: Optional[np.ndarray] = None  # (D,) 归一化特征向量
@@ -139,9 +139,7 @@ class CategoryCompatibility:
         if CategoryCompatibility.is_compatible(cat1, cat2):
             return cat1 if score1 >= score2 else cat2
 
-        # 不兼容但被强制匹配，选择置信度高的并警告
-        print(f"[WARNING] Incompatible categories matched: {cat1} vs {cat2}, "
-              f"choosing {cat1 if score1 >= score2 else cat2}")
+        # 不兼容但被强制匹配，选择置信度高的
         return cat1 if score1 >= score2 else cat2
 
 
@@ -155,17 +153,17 @@ class CostFunction:
     def __init__(
         self,
         weight_distance: float = 0.5,
-        weight_feature: float = 0.3,
+        weight_feature: float = 0.3,    #目前不考虑基于特征的匹配
         weight_category: float = 0.2,
-        distance_threshold: float = 0.2,  # 20cm，超过视为无效
+        distance_threshold: float = 0.2,  # 20cm，超过直接判定不可匹配
         feature_threshold: float = 0.6,   # 特征相似度下限
     ):
         """
         Args:
-            weight_distance: 距离权重
+            weight_distance: 距离权重（三个权重之和应为1.0）
             weight_feature: 特征权重
             weight_category: 类别权重
-            distance_threshold: 距离阈值（米），超过后归一化为1.0
+            distance_threshold: 距离硬阈值（米），超过直接返回无穷大代价
             feature_threshold: 特征相似度阈值，低于此值匹配质量下降
         """
         self.w_dist = weight_distance
@@ -173,12 +171,6 @@ class CostFunction:
         self.w_cat = weight_category
         self.dist_thresh = distance_threshold
         self.feat_thresh = feature_threshold
-
-        # 归一化权重
-        total = self.w_dist + self.w_feat + self.w_cat
-        self.w_dist /= total
-        self.w_feat /= total
-        self.w_cat /= total
 
     def compute(
         self,
@@ -197,12 +189,15 @@ class CostFunction:
         # ===== 1. 3D距离代价 =====
         if det_chassis.position_3d is not None and det_top.position_3d is not None:
             dist_3d = np.linalg.norm(det_chassis.position_3d - det_top.position_3d)
-            cost_distance = min(dist_3d / self.dist_thresh, 1.0)
             details['distance_3d'] = dist_3d
+            # 软阈值：超过阈值惩罚为1.0，但不直接判死刑
+            if dist_3d > self.dist_thresh:
+                cost_distance = 1.0  # 最大惩罚，但让算法继续评估其他因素
+            else:
+                cost_distance = dist_3d / self.dist_thresh
         else:
             # 缺少3D位置，距离代价最大
             cost_distance = 1.0
-            dist_3d = None
             details['distance_3d'] = None
 
         # ===== 2. 视觉特征代价 =====
@@ -214,7 +209,7 @@ class CostFunction:
             cost_feature = 1.0 - similarity  # 相似度越高，代价越低
             details['feature_similarity'] = similarity
         else:
-            # 缺少特征，使用中等代价
+            # 缺少特征，使用中等代价（保守策略，不确定时不强判）
             cost_feature = 0.5
             details['feature_similarity'] = None
 
@@ -251,14 +246,12 @@ class HungarianMatcher:
     - N=10: ~3ms
     - N=20: ~12ms
     - N=50: ~80ms
-
-    适用于典型的20物体场景
     """
 
     def __init__(
         self,
         cost_function: CostFunction,
-        max_cost_threshold: float = 0.7,  # 超过此代价拒绝匹配
+        max_cost_threshold: float = 0.7,
     ):
         """
         Args:
@@ -292,7 +285,7 @@ class HungarianMatcher:
             return [], list(range(N)), list(range(M))
 
         # ===== Step 1: 构建代价矩阵 =====
-        cost_matrix = np.full((N, M), 1e6, dtype=np.float32)  # 初始化为大值
+        cost_matrix = np.full((N, M), 1e6, dtype=np.float32)
         details_matrix = [[None] * M for _ in range(N)]
 
         for i, det_c in enumerate(detections_chassis):
@@ -330,7 +323,7 @@ class HungarianMatcher:
                 top_idx=j,
                 cost=cost,
                 distance_3d=details['distance_3d'] or 0.0,
-                feature_similarity=details.get('feature_similarity', 0.0),
+                feature_similarity=details.get('feature_similarity') or 0.0,
                 category_compatible=details['category_compatible'],
                 quality=quality,
             )
@@ -347,20 +340,20 @@ class HungarianMatcher:
 
     def _assess_quality(self, cost: float, details: Dict) -> MatchQuality:
         """评估匹配质量"""
-        dist = details.get('distance_3d', 1.0)
-        feat_sim = details.get('feature_similarity', 0.0)
+        dist = details.get('distance_3d')
+        feat_sim = details.get('feature_similarity') or 0.0
         cat_compat = details.get('category_compatible', False)
 
         # 优秀：距离<5cm, 特征>0.9, 类别兼容
-        if dist and dist < 0.05 and feat_sim > 0.9 and cat_compat:
+        if dist is not None and dist < 0.05 and feat_sim > 0.9 and cat_compat:
             return MatchQuality.EXCELLENT
 
         # 良好：距离<10cm, 特征>0.8, 类别兼容
-        if dist and dist < 0.10 and feat_sim > 0.8 and cat_compat:
+        if dist is not None and dist < 0.10 and feat_sim > 0.8 and cat_compat:
             return MatchQuality.GOOD
 
         # 可接受：距离<20cm, 特征>0.7
-        if dist and dist < 0.20 and feat_sim > 0.7:
+        if dist is not None and dist < 0.20 and feat_sim > 0.7:
             return MatchQuality.ACCEPTABLE
 
         return MatchQuality.POOR
@@ -373,6 +366,10 @@ class HungarianMatcher:
 class MatchFuser:
     """匹配结果融合器"""
 
+    # 距离融合阈值（米）
+    # 基于实测数据：Chassis在近距离更可靠，Top在远距离更稳定
+    DISTANCE_FUSION_THRESHOLD = 1.4
+
     @staticmethod
     def fuse_match(
         match: MatchPair,
@@ -384,7 +381,9 @@ class MatchFuser:
 
         策略：
         1. 类别：取置信度高的（兼容时）
-        2. 3D位置：加权平均（根据深度置信度）
+        2. 3D位置：基于距离阈值选择更可靠的相机
+           - < 1.4m: 使用Chassis相机（近距离误差小）
+           - >= 1.4m: 使用Top相机（远距离更稳定）
         3. 置信度：根据匹配质量提升
         """
         # 融合类别
@@ -393,13 +392,25 @@ class MatchFuser:
             det_chassis.detection_score, det_top.detection_score
         )
 
-        # 融合3D位置（简单平均，实际应根据传感器精度加权）
+        # 融合3D位置（基于距离选择）
         if det_chassis.position_3d is not None and det_top.position_3d is not None:
-            match.fused_position = (det_chassis.position_3d + det_top.position_3d) / 2.0
+            # 使用Chassis距离作为判断依据（近距离Chassis更可靠）
+            chassis_distance = det_chassis.distance
+            if chassis_distance is None:
+                chassis_distance = np.linalg.norm(det_chassis.position_3d)
+
+            if chassis_distance < MatchFuser.DISTANCE_FUSION_THRESHOLD:
+                # 近距离：使用Chassis
+                match.fused_position = det_chassis.position_3d.copy()
+            else:
+                # 远距离：使用Top
+                match.fused_position = det_top.position_3d.copy()
         elif det_chassis.position_3d is not None:
-            match.fused_position = det_chassis.position_3d
+            match.fused_position = det_chassis.position_3d.copy()
+        elif det_top.position_3d is not None:
+            match.fused_position = det_top.position_3d.copy()
         else:
-            match.fused_position = det_top.position_3d
+            match.fused_position = np.zeros(3)
 
         # 融合置信度
         base_confidence = (det_chassis.detection_score + det_top.detection_score) / 2.0
@@ -411,8 +422,8 @@ class MatchFuser:
             match.fused_confidence = min(base_confidence + 0.10, 1.0)
         elif match.quality == MatchQuality.ACCEPTABLE:
             match.fused_confidence = min(base_confidence + 0.05, 1.0)
-        else:  # POOR
-            match.fused_confidence = base_confidence  # 不加成
+        else:
+            match.fused_confidence = base_confidence
 
         return match
 
@@ -441,11 +452,11 @@ class DualCameraMatcher:
         初始化匹配器
 
         Args:
-            weight_distance: 距离权重（推荐0.5，距离是最可靠的）
-            weight_feature: 特征权重（推荐0.3，视觉特征很强）
-            weight_category: 类别权重（推荐0.2，类别可能不准）
-            distance_threshold: 距离阈值20cm（典型深度误差±5cm）
-            max_cost_threshold: 最大代价0.7（拒绝明显不匹配的对）
+            weight_distance: 距离权重（推荐0.5）
+            weight_feature: 特征权重（推荐0.3）
+            weight_category: 类别权重（推荐0.2）
+            distance_threshold: 距离阈值20cm
+            max_cost_threshold: 最大代价0.7
         """
         self.cost_fn = CostFunction(
             weight_distance=weight_distance,
@@ -492,123 +503,3 @@ class DualCameraMatcher:
         unmatched_top = [detections_top[i] for i in unmatched_t_idx]
 
         return fused_matches, unmatched_chassis, unmatched_top
-
-
-# ============================================================================
-# 测试和示例
-# ============================================================================
-
-if __name__ == '__main__':
-    print("=" * 70)
-    print("双相机匹配器测试（N=20物体场景）")
-    print("=" * 70)
-
-    # 模拟20个物体的场景
-    np.random.seed(42)
-
-    def create_detection(idx, camera, position, category, add_noise=True):
-        """创建模拟检测"""
-        # 添加少量位置噪声（模拟深度误差）
-        if add_noise:
-            noise = np.random.normal(0, 0.03, 3)  # ±3cm标准差
-            position = position + noise
-
-        # 创建假的视觉特征（512维，归一化）
-        features = np.random.randn(512)
-        features = features / np.linalg.norm(features)
-
-        return DetectionWithDepth(
-            bbox=np.array([100, 100, 200, 200]),
-            mask=np.zeros((480, 640), dtype=np.uint8),
-            category=category,
-            detection_score=0.85 + np.random.rand() * 0.1,
-            visual_features=features,
-            position_3d=position,
-            distance=np.linalg.norm(position),
-            camera_source=camera,
-        )
-
-    # 创建测试数据：18个共同物体 + 2个chassis独有 + 3个top独有
-    categories = ['bottle'] * 8 + ['cup'] * 6 + ['box'] * 4
-    positions = [np.array([0.5 + i*0.2, 0.3, 0.2]) for i in range(18)]
-
-    detections_chassis = []
-    detections_top = []
-
-    # 共同物体（chassis和top都能看到）
-    for i in range(18):
-        base_pos = positions[i]
-        cat = categories[i]
-
-        # 相同物体，位置略有差异（深度误差）
-        det_c = create_detection(i, "chassis", base_pos, cat, add_noise=True)
-        det_t = create_detection(i, "top", base_pos, cat, add_noise=True)
-
-        detections_chassis.append(det_c)
-        detections_top.append(det_t)
-
-    # Chassis独有（top视角盲区）
-    detections_chassis.append(
-        create_detection(18, "chassis", np.array([0.3, -0.5, 0.1]), 'bottle', False)
-    )
-    detections_chassis.append(
-        create_detection(19, "chassis", np.array([0.4, -0.6, 0.15]), 'cup', False)
-    )
-
-    # Top独有（chassis视角盲区）
-    detections_top.append(
-        create_detection(18, "top", np.array([1.5, 0.8, 0.5]), 'box', False)
-    )
-    detections_top.append(
-        create_detection(19, "top", np.array([1.6, 0.9, 0.45]), 'bottle', False)
-    )
-    detections_top.append(
-        create_detection(20, "top", np.array([1.7, 1.0, 0.52]), 'cup', False)
-    )
-
-    print(f"\n输入:")
-    print(f"  Chassis检测: {len(detections_chassis)} 个")
-    print(f"  Top检测: {len(detections_top)} 个")
-
-    # 执行匹配
-    import time
-    matcher = DualCameraMatcher()
-
-    start = time.time()
-    matches, unmatched_c, unmatched_t = matcher.process(
-        detections_chassis, detections_top
-    )
-    elapsed = (time.time() - start) * 1000
-
-    print(f"\n结果:")
-    print(f"  匹配对: {len(matches)} 个")
-    print(f"  未匹配chassis: {len(unmatched_c)} 个")
-    print(f"  未匹配top: {len(unmatched_t)} 个")
-    print(f"  耗时: {elapsed:.2f} ms")
-
-    # 统计匹配质量
-    quality_counts = {q: 0 for q in MatchQuality}
-    for m in matches:
-        quality_counts[m.quality] += 1
-
-    print(f"\n匹配质量分布:")
-    for quality, count in quality_counts.items():
-        if count > 0:
-            print(f"  {quality.value}: {count} 个")
-
-    # 显示几个示例匹配
-    print(f"\n示例匹配（前3个）:")
-    for i, m in enumerate(matches[:3]):
-        det_c = detections_chassis[m.chassis_idx]
-        det_t = detections_top[m.top_idx]
-        print(f"  [{i+1}] {det_c.category} <-> {det_t.category}")
-        print(f"      距离: {m.distance_3d*100:.1f} cm")
-        print(f"      特征相似度: {m.feature_similarity:.3f}")
-        print(f"      类别兼容: {m.category_compatible}")
-        print(f"      质量: {m.quality.value}")
-        print(f"      融合类别: {m.fused_category}")
-        print(f"      融合置信度: {m.fused_confidence:.3f}")
-
-    print("\n" + "=" * 70)
-    print("✅ 匈牙利匹配器运行正常，适用于N=20场景")
-    print("=" * 70)

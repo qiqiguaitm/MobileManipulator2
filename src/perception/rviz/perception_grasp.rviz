@@ -1,7 +1,7 @@
 Panels:
-  - Class: rviz/Displays
+  - Class: rviz_common/Displays
     Name: Displays
-  - Class: rviz/Views
+  - Class: rviz_common/Views
     Name: Views
 Visualization Manager:
   Class: ""
@@ -9,7 +9,7 @@ Visualization Manager:
     # 网格
     - Alpha: 0.5
       Cell Size: 0.1
-      Class: rviz/Grid
+      Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
       Enabled: true
       Line Style:
@@ -27,7 +27,7 @@ Visualization Manager:
       Value: true
 
     # TF 坐标系 (只显示关键 frames)
-    - Class: rviz/TF
+    - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15
       Frames:
@@ -104,7 +104,7 @@ Visualization Manager:
 
     # 机器人模型
     - Alpha: 0.8
-      Class: rviz/RobotModel
+      Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
       Enabled: true
       Links:
@@ -208,7 +208,7 @@ Visualization Manager:
     # RGBD 点云 (CDM 优化后)
     - Alpha: 1
       Autocompute Intensity Bounds: true
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: RGB8
       Decay Time: 0
@@ -230,7 +230,7 @@ Visualization Manager:
       Value: true
 
     # 抓取 Markers (point, arrow, gripper, bbox_3d, label)
-    - Class: rviz/MarkerArray
+    - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Marker Topic: /perception_grasp_rviz_node/markers
       Name: GraspMarkers
@@ -243,7 +243,7 @@ Visualization Manager:
     - Alpha: 1
       Axes Length: 0.1
       Axes Radius: 0.01
-      Class: rviz/Pose
+      Class: rviz_default_plugins/Pose
       Color: 255; 25; 0
       Enabled: true
       Head Length: 0.03
@@ -257,31 +257,35 @@ Visualization Manager:
       Value: true
 
     # 2x2 可视化面板 (Detection, Mask, Grasp, Depth)
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: true
-      Image Topic: /perception_grasp_rviz_node/vis/panel
       Max Value: 1
       Median window: 5
       Min Value: 0
       Name: Panel
       Normalize Range: true
-      Queue Size: 2
-      Transport Hint: raw
-      Unreliable: false
+      Topic:
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /perception_grasp_rviz_node/vis/panel
       Value: true
 
     # 原始相机图像 (可选)
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: false
-      Image Topic: /camera/hand/color/image_raw
       Max Value: 1
       Median window: 5
       Min Value: 0
       Name: RawImage
       Normalize Range: true
-      Queue Size: 2
-      Transport Hint: raw
-      Unreliable: false
+      Topic:
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /camera/hand/color/image_raw
       Value: false
 
   Enabled: true
@@ -292,12 +296,12 @@ Visualization Manager:
     Frame Rate: 30
   Name: root
   Tools:
-    - Class: rviz/Interact
+    - Class: rviz_default_plugins/Interact
       Hide Inactive Objects: true
-    - Class: rviz/MoveCamera
-    - Class: rviz/Select
-    - Class: rviz/FocusCamera
-    - Class: rviz/Measure
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
   Value: true
   Views:
     Current:

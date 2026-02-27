@@ -56,7 +56,7 @@ approach_navigator:
     # ============================================================
     # 外参标定文件
     # ============================================================
-    extrinsics_file: "/home/didi/workspace/MobileManipulator2/src/perception2/perception_bringup/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
+    extrinsics_file: "/home/didi/workspace/MobileManipulator2/src/perception/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
 
     # ============================================================
     # 机器人几何参数

@@ -3,7 +3,8 @@
 
 string prompt                      # 检测提示词 (如 "bottle.cup.box")
 bool enable_lidar                  # 是否启用 LiDAR 测量
+string camera_id                   # 指定相机: "top", "chassis", "all" (默认all)
 ---
 bool success                       # 是否成功
 string error_message               # 错误信息 (失败时)
-perception/Object3DArray result    # 检测结果
+Object3DArray result               # 检测结果

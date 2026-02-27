@@ -215,12 +215,12 @@ if [ -n "$EXTRINSICS_SUFFIX" ]; then
     echo -e "${YELLOW}   使用新外参: $EXTRINSICS_SUFFIX${NC}"
 fi
 
-echo "   启动: ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG"
+echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG"
 echo ""
 
 # 如果需要测试，后台启动
 if [ "$RUN_TEST" = "true" ]; then
-    ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG > /tmp/perception_launch.log 2>&1 &
+    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG > /tmp/perception_launch.log 2>&1 &
     LAUNCH_PID=$!
 
     # 等待节点启动
@@ -247,7 +247,7 @@ if [ "$RUN_TEST" = "true" ]; then
     echo ""
 
     # ROS2 服务调用
-    RESULT=$(ros2 service call /scene_perception_3d/detect perception_interfaces/srv/DetectObjects "{prompt: '$TEST_PROMPT'}" 2>&1 || echo "服务调用失败")
+    RESULT=$(ros2 service call /scene_perception_3d/detect perception/srv/DetectObjects "{prompt: '$TEST_PROMPT'}" 2>&1 || echo "服务调用失败")
 
     echo "$RESULT" | head -50
     echo ""
@@ -267,5 +267,5 @@ if [ "$RUN_TEST" = "true" ]; then
     wait $LAUNCH_PID
 else
     # 前台启动
-    exec ros2 launch perception_bringup $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG
+    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG
 fi

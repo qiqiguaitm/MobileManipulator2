@@ -92,6 +92,9 @@ class DemoClient(Node):
             rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
             status = future.result()
 
+            if not status.success:
+                self.get_logger().error("  Failed to get status")
+                return False
             if not status.connected:
                 self.get_logger().error("  Arm not connected")
                 return False
@@ -101,7 +104,7 @@ class DemoClient(Node):
             if status.error_state != "NORMAL":
                 self.get_logger().error(f"  Arm in error state: {status.error_state}")
                 return False
-            self.get_logger().info(f"  Position: [{status.position[0]:.1f}, {status.position[1]:.1f}, {status.position[2]:.1f}] mm")
+            self.get_logger().info(f"  Position: [{status.gripper_center[0]:.1f}, {status.gripper_center[1]:.1f}, {status.gripper_center[2]:.1f}] mm")
             self.get_logger().info("  Status OK")
         except Exception as e:
             self.get_logger().error(f"  Service exception: {e}")
@@ -118,7 +121,7 @@ class DemoClient(Node):
             resp = future.result()
 
             if not resp.success:
-                self.get_logger().error(f"  Failed: {resp.error_message}")
+                self.get_logger().error(f"  Failed: {resp.message}")
                 return False
             self.get_logger().info("  Done")
         except Exception as e:
@@ -160,6 +163,7 @@ class DemoClient(Node):
         goal = PiperPick.Goal()
         goal.use_last_observe = True
         goal.speed = self.speed
+        goal.return_to_ready = not place_after
 
         send_goal_future = self.pick_client.send_goal_async(
             goal, feedback_callback=self._pick_feedback)

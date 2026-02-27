@@ -1,48 +1,47 @@
-# Scene Perception 3D 配置文件
+# Scene Perception 3D 配置文件 (ROS2)
 
-# 相机配置 (top | chassis | hand)
-camera_name: top
+/**:
+  ros__parameters:
+    # 相机配置 (top | chassis | hand)
+    camera_name: top
 
-# LiDAR 配置
-lidar_topic: /lidar/chassis/point_cloud
-enable_lidar: false             # 默认禁用 LiDAR（纯视觉模式）
+    # LiDAR 配置
+    lidar_topic: /lidar/chassis/point_cloud
+    enable_lidar: false             # 默认禁用 LiDAR (纯视觉模式)
 
-# Prompt 配置
-prompt_source: default         # service | topic | default (default=实时模式)
-prompt_topic: /user/prompt     # prompt_source=topic 时使用
-default_prompt: "box.bottle.cup.bag.bread.tissue.toy.barrel.chair.cabinet.picture.blackboard.package.carton"
+    # Prompt 配置
+    prompt_source: default         # service | topic | default
+    prompt_topic: /user/prompt
+    default_prompt: "box.bottle.cup.bag.bread.tissue.toy.barrel.chair.cabinet.picture.blackboard.package.carton"
 
-# 检测服务 (DINO-X)
-detector_url: http://192.168.112.14:10086
-detector_timeout: 3.0
-min_score: 0.25
-detector_warmup: 2              # DINO-X 预热次数，0=禁用
+    # 检测服务 (DINO-X)
+    detector_url: http://192.168.112.14:10086
+    detector_timeout: 3.0
+    min_score: 0.25
+    iou_threshold: 0.5
+    detector_warmup: 2              # DINO-X 预热次数，0=禁用
 
-# 深度优化服务 (CDM)
-depth_optimizer_url: http://192.168.112.14:8086
-enable_depth_optimizer: true
-depth_optimizer_warmup: 2       # CDM 预热次数，0=禁用
+    # 深度优化服务 (CDM)
+    depth_optimizer_url: http://192.168.112.14:8081
+    enable_depth_optimizer: true
+    depth_optimizer_warmup: 2       # CDM 预热次数，0=禁用
 
-# 坐标系配置
-target_frame: base_link        # base_link | arm_base_link
+    # 坐标系配置
+    target_frame: base_link        # base_link | arm_base_link
 
-# 功能开关
-enable_accuracy_log: false
-enable_visualization: false
-results_dir: /home/agilex/MobileManipulator/src/perception/results
+    # 距离补偿参数 (相机测距系统性偏差修正)
+    distance_offset: 0.30           # 默认 +30cm
 
-# 自动检测配置
-auto_detect_rate: 1.0           # 自动检测频率 (Hz), 0=禁用，仅 service 模式 (默认1Hz以降低计算负载)
-                                # 性能模式配置: 0=禁用, 1Hz=节能模式, 3Hz=高性能模式
-                                # 性能数据参考:
-                                #   - CDM+纯视觉 (默认): 424ms (2.36 Hz 理论最大)
-                                #   - 禁用CDM+纯视觉: 390ms (2.56 Hz 理论最大)
-                                #   - CDM+LiDAR: 1217ms (0.82 Hz 理论最大)
+    # 功能开关
+    enable_accuracy_log: false
 
-# 时间同步参数
-sync_slop: 0.2                 # 同步容差 200ms (RGB+Depth+LiDAR 三路同步)
-data_max_age: 1.0              # 数据新鲜度阈值 1s
+    # 自动检测配置
+    auto_detect_rate: 10.0          # 自动检测频率 (Hz), 0=禁用
+                                    # 性能模式配置:
+                                    #   0 = 禁用，仅 service 模式
+                                    #   5.0 = 标准模式
+                                    #   10.0 = 高性能模式 (默认)
 
-# 算法参数
-depth_min: 0.3
-depth_max: 10.0
+    # 时间同步参数
+    sync_slop: 0.2                 # 同步容差 200ms
+    data_max_age: 1.0              # 数据新鲜度阈值 1s

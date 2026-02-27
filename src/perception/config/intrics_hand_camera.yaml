@@ -1,4 +1,4 @@
-      
+
 %YAML:1.0
 ---
 model_type: PINHOLE
@@ -99,4 +99,4 @@ projection_parameters:
    cx: 9.7755406531759002e+02
    cy: 5.6524736594658668e+02
 
-    
+

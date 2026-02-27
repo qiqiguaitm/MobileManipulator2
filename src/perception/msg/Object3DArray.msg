@@ -2,4 +2,4 @@
 
 std_msgs/Header header
 string frame_id                    # 坐标系 (base_link 或 arm_base_link)
-perception/Object3D[] objects
+Object3D[] objects

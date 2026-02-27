@@ -24,7 +24,7 @@ from enum import Enum
 from scipy.optimize import linear_sum_assignment
 
 # 复用类别兼容性检查
-from dual_camera_matcher import CategoryCompatibility
+from perception.dual_camera_matcher import CategoryCompatibility
 
 
 # ============================================================================
@@ -164,7 +164,8 @@ class STrack3D:
     _count = 0  # 类变量，用于生成唯一ID
 
     def __init__(self, position: np.ndarray, category: str,
-                 confidence: float, cfg: TrackerConfig):
+                 confidence: float, cfg: TrackerConfig,
+                 detection: dict = None):
         # 分配唯一ID
         STrack3D._count += 1
         self.track_id = STrack3D._count
@@ -178,6 +179,9 @@ class STrack3D:
         self.frame_id = 0           # 最后更新的帧号
         self.start_frame = 0        # 开始帧号
         self.tracklet_len = 0       # 连续跟踪长度
+
+        # 保存最后匹配的检测数据（包含 _original 等字段）
+        self.last_detection = detection
 
         # Kalman滤波器
         self.kalman = KalmanFilter3D(cfg)
@@ -205,9 +209,8 @@ class STrack3D:
         self.frame_id = frame_id
         self.tracklet_len += 1
 
-        # 类别更新（如果置信度更高）
-        # 保持原类别，除非检测置信度明显更高
-        # （避免类别频繁切换）
+        # 保存最后匹配的检测数据（包含 _original 等字段）
+        self.last_detection = detection
 
     def mark_lost(self):
         """标记为Lost"""
@@ -388,6 +391,7 @@ class ByteTracker3D:
                 category=det['category'],
                 confidence=det['confidence'],
                 cfg=self.cfg,
+                detection=det,  # 保存原始检测数据
             )
             new_track.frame_id = self.frame_id
             new_track.start_frame = self.frame_id
@@ -493,26 +497,62 @@ class ByteTracker3D:
         """
         构建输出结果
 
-        返回所有活跃轨迹（Tracked + 已确认的New）
+        策略：返回所有输入检测，为已确认轨迹添加 track_id
+        - 已确认轨迹：添加 track_id + Kalman 滤波位置
+        - 未确认检测：保持原样（track_id=None）
+
+        这样保证融合结果不丢失任何检测，同时为稳定跟踪的物体提供持久 ID。
         """
         output = []
 
+        # 1. 收集所有已确认轨迹，建立检测ID到轨迹的映射
+        # 使用 id(detection) 作为 key，因为每个检测是独立的 dict 对象
+        confirmed_tracks = {}
         for track in self.tracked_stracks:
-            # 只输出已确认的轨迹
-            if track.state == TrackState.Tracked or \
-               (track.state == TrackState.New and
-                track.tracklet_len >= self.cfg.confirm_frames):
+            is_confirmed = (
+                track.state == TrackState.Tracked or
+                (track.state == TrackState.New and
+                 track.tracklet_len >= self.cfg.confirm_frames)
+            )
+            if is_confirmed and track.last_detection:
+                det_id = id(track.last_detection)
+                confirmed_tracks[det_id] = track
 
+        # 2. 遍历所有输入检测，构建输出
+        for det in fused_objects:
+            det_id = id(det)
+
+            if det_id in confirmed_tracks:
+                # 已确认轨迹：使用 track_id + Kalman 滤波位置
+                track = confirmed_tracks[det_id]
                 obj = {
                     'track_id': track.track_id,
                     'category': track.category,
-                    'position': track.position,
+                    'position': track.position,  # Kalman 滤波后的位置
                     'confidence': track.confidence,
-                    'source': 'tracked',
+                    'source': det.get('source', 'tracked'),
                     'quality': 'tracked',
                     'tracklet_len': track.tracklet_len,
+                    '_original': det.get('_original'),
+                    'bbox': det.get('bbox'),
+                    'score': det.get('score'),
                 }
-                output.append(obj)
+            else:
+                # 未确认检测：保持原样，track_id=None
+                obj = {
+                    'track_id': None,  # 无持久 ID
+                    'category': det['category'],
+                    'position': det['position'],  # 原始位置
+                    'confidence': det['confidence'],
+                    'source': det.get('source', 'unknown'),
+                    'quality': det.get('quality', 'untracked'),
+                    'tracklet_len': 0,
+                    '_original': det.get('_original'),
+                    'bbox': det.get('bbox'),
+                    'score': det.get('score'),
+                }
+
+            output.append(obj)
 
         return output
 

@@ -51,8 +51,8 @@ from piper_msgs.srv import (
 )
 from piper_msgs.action import PiperPick, PiperPlace
 
-# Import perception service (must use perception_interfaces, not piper_msgs)
-from perception_interfaces.srv import GraspDetect
+# Import perception service
+from perception.srv import GraspDetect
 
 # Unit conversion constants
 M_TO_MM = 1000.0
@@ -582,9 +582,9 @@ class PiperGraspNode(Node):
         target_yaw = current_yaw - angle
         if target_yaw < 90:
             target_yaw += 180
-        target_yaw = max(120, target_yaw)
-        target_yaw = min(240, target_yaw)
-        return target_yaw
+        target_yaw = max(120.0, target_yaw)
+        target_yaw = min(240.0, target_yaw)
+        return float(target_yaw)
 
     def _calculate_gripper_width(self, width3d_mm):
         """Calculate gripper open width with margin"""
@@ -719,49 +719,66 @@ class PiperGraspNode(Node):
         except Exception as e:
             response.success = False
             response.message = str(e)
-            response.connection_state = 0  # CONN_ERROR
+            response.connection_state = 255  # CONN_ERROR
 
         return response
 
     def _handle_set_position(self, request, response):
         """Set position service handler"""
-        try:
-            with self._arm_lock:
-                result = self.arm.set_position(
-                    x=request.x if request.x != 0 else None,
-                    y=request.y if request.y != 0 else None,
-                    z=request.z if request.z != 0 else None,
-                    roll=request.roll if request.roll != 0 else None,
-                    pitch=request.pitch if request.pitch != 0 else None,
-                    yaw=request.yaw if request.yaw != 0 else None,
-                    speed=request.speed if request.speed > 0 else 30,
-                    wait=request.wait,
-                    use_gripper_center=request.use_gripper_center
-                )
+        # Check if action in progress (mutual exclusion with pick/place)
+        with self._action_lock:
+            if self._action_busy:
+                response.success = False
+                response.message = "Action in progress, cannot move"
+                return response
 
-            _, pos = self.arm.get_position(return_gripper_center=request.use_gripper_center)
-            response.success = result
-            response.final_position = [float(p) for p in pos]
+        try:
+            # Build position dict (NaN means keep current)
+            kwargs = {'wait': request.wait, 'speed': request.speed if request.speed > 0 else 30}
+            kwargs['use_gripper_center'] = request.use_gripper_center
+
+            if not math.isnan(request.x):
+                kwargs['x'] = request.x
+            if not math.isnan(request.y):
+                kwargs['y'] = request.y
+            if not math.isnan(request.z):
+                kwargs['z'] = request.z
+            if not math.isnan(request.roll):
+                kwargs['roll'] = request.roll
+            if not math.isnan(request.pitch):
+                kwargs['pitch'] = request.pitch
+            if not math.isnan(request.yaw):
+                kwargs['yaw'] = request.yaw
+
+            with self._arm_lock:
+                reached = self.arm.set_position(**kwargs)
+                # Get actual position
+                _, pos = self.arm.get_position(return_gripper_center=request.use_gripper_center)
+
+            response.actual_position = [float(p) for p in pos]
+            response.success = reached
+            response.message = "Position reached" if reached else f"Position not reached (timeout), current={pos}"
 
         except Exception as e:
             response.success = False
-            response.error_message = str(e)
+            response.message = str(e)
 
         return response
 
     def _handle_set_gripper(self, request, response):
         """Set gripper service handler"""
         try:
+            speed = request.speed if request.speed > 0 else 500
             with self._arm_lock:
-                self._set_gripper_mm(request.position, speed=request.speed, wait=request.wait)
+                self._set_gripper_mm(request.position, speed=speed, wait=request.wait)
+                response.actual_position = self._get_gripper_mm()
 
-            _, pos_mm = self.arm.get_gripper_position()
             response.success = True
-            response.final_position = pos_mm
+            response.message = "Gripper set"
 
         except Exception as e:
             response.success = False
-            response.error_message = str(e)
+            response.message = str(e)
 
         return response
 
@@ -773,51 +790,83 @@ class PiperGraspNode(Node):
             response.error_state = self.error_state
             response.error_description = self.error_description
 
-            _, pos = self.arm.get_position(return_gripper_center=True)
+            _, pos = self.arm.get_position(return_gripper_center=False)
             response.position = [float(p) for p in pos]
+
+            _, gc_pos = self.arm.get_position(return_gripper_center=True)
+            response.gripper_center = [float(p) for p in gc_pos]
 
             joints_deg = self.arm.get_joint_degrees()
             response.joints = [float(j) for j in joints_deg]
 
-            _, gripper_mm = self.arm.get_gripper_position()
-            response.gripper_position = gripper_mm
+            response.gripper_position = self._get_gripper_mm()
+            response.success = True
 
         except Exception as e:
-            response.connected = False
-            response.error_state = "ERROR"
-            response.error_description = str(e)
+            self.get_logger().error(f"Get status failed: {e}")
+            response.success = False
 
         return response
 
     def _handle_get_position(self, request, response):
         """Get position service handler"""
         try:
-            _, pos = self.arm.get_position(return_gripper_center=request.use_gripper_center)
+            _, pos = self.arm.get_position(return_gripper_center=request.gripper_center)
             response.position = [float(p) for p in pos]
+            response.gripper_position = self._get_gripper_mm()
+            response.success = True
+
         except Exception as e:
-            response.position = []
+            response.success = False
+
         return response
 
     def _handle_go_ready(self, request, response):
-        """Go ready service handler"""
+        """Go ready service handler (matching ROS1 behavior)"""
+        # Check if action in progress (mutual exclusion with pick/place)
+        with self._action_lock:
+            if self._action_busy:
+                response.success = False
+                response.message = "Action in progress, cannot move"
+                return response
+
         try:
+            ready_cfg = self.config.get('positions', {}).get('ready', {})
+            speed = request.speed if request.speed > 0 else 30
+
+            # Build ready position from config (gripper_center coordinates)
+            ready_pos = {
+                'x': ready_cfg.get('x', 400),
+                'y': ready_cfg.get('y', 0),
+                'z': ready_cfg.get('z', 150),
+                'roll': ready_cfg.get('roll', 180),
+                'pitch': ready_cfg.get('pitch', 30),
+                'yaw': ready_cfg.get('yaw', 180),
+            }
+
             with self._arm_lock:
-                ready_cfg = self.config.get('positions', {}).get('ready', {})
+                result = self.arm.go_ready(
+                    ready_pos=ready_pos,
+                    open_gripper=request.open_gripper,
+                    speed=speed
+                )
 
-                if request.open_gripper:
-                    gripper_max = self.config.get('gripper', {}).get('max_mm', 70)
-                    self._set_gripper_mm(gripper_max, wait=True)
+                if not result:
+                    raise RuntimeError("Failed to reach ready position")
 
-                speed = request.speed if request.speed > 0 else 30
-                self.arm.go_ready(ready_cfg, speed=speed)
+                _, pos = self.arm.get_position(return_gripper_center=True)
 
-            _, pos = self.arm.get_position(return_gripper_center=True)
             response.success = True
-            response.message = "Ready"
+            response.message = "Ready position reached"
             response.position = [float(p) for p in pos]
 
         except Exception as e:
             response.success = False
+            try:
+                _, pos = self.arm.get_position(return_gripper_center=True)
+                response.position = [float(p) for p in pos]
+            except Exception:
+                response.position = []
             response.message = str(e)
 
         return response
@@ -834,112 +883,152 @@ class PiperGraspNode(Node):
         point_in_base_m = np.dot(R_end2base, point_end_m) + end_pos_m
         offset_m = point_in_base_m - end_pos_m
 
+        # Apply Z adjustment from calibration config (default: 5mm = 0.005m)
+        z_correction_m = self.config.get('calibration', {}).get('z_correction_m', 0.005)
+        offset_m[2] -= z_correction_m
+
         point_in_base_mm = (point_in_base_m * M_TO_MM).tolist()
         offset_mm = (offset_m * M_TO_MM).tolist()
+        eef_in_base_mm = (end_pos_m * M_TO_MM).tolist()
 
         return {
             'point_in_base': point_in_base_mm,
-            'offset': offset_mm
+            'offset': offset_mm,
+            'eef_in_base': eef_in_base_mm
         }
 
     def _handle_observe(self, request, response):
-        """Handle observe request"""
+        """Handle observe request (with retry, matching ROS1 behavior)"""
         if not self.perception_client:
             response.success = False
             response.error_message = "Perception service not available"
             return response
 
         grasp_cfg = self.config.get('grasp', {})
+        observe_cfg = grasp_cfg.get('observe', {})
+        retry_count = observe_cfg.get('retry_count', 3)
+        retry_delay = observe_cfg.get('retry_delay', 0.5)
+        min_score = observe_cfg.get('min_score', 0.5)
+
+        if not self.transformer:
+            response.success = False
+            response.error_message = "Coordinate transformer not initialized"
+            return response
+
+        start_time = time.time()
 
         try:
-            # Move to ready position if requested (optional field, default False)
-            go_ready_first = getattr(request, 'go_ready_first', False)
-            if go_ready_first:
-                ready_cfg = self.config.get('positions', {}).get('ready', {})
-                speed = getattr(request, 'speed', 0)
-                speed = speed if speed > 0 else 30
-                self.arm.go_ready(ready_cfg, speed=speed)
-
-            # Get current end pose
-            _, end_pose = self.arm.get_position(return_gripper_center=True)
-
-            # Call perception service
+            # Check perception service availability
             if not self.perception_client.wait_for_service(timeout_sec=5.0):
                 response.success = False
                 response.error_message = "Perception service timeout"
                 return response
 
-            detect_req = GraspDetect.Request()
-            detect_req.prompt = request.prompt if request.prompt else grasp_cfg.get('default_prompt', '')
-            detect_req.enable_cdm = True
+            # Retry loop (matching ROS1 observe behavior)
+            last_error = None
 
-            future = self.perception_client.call_async(detect_req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+            for attempt in range(retry_count):
+                try:
+                    detect_req = GraspDetect.Request()
+                    detect_req.prompt = request.prompt if request.prompt else grasp_cfg.get('default_prompt', '')
+                    detect_req.enable_cdm = request.enable_cdm
 
-            if not future.done():
-                response.success = False
-                response.error_message = "Perception call timeout"
-                return response
+                    future = self.perception_client.call_async(detect_req)
+                    # Wait without rclpy.spin_until_future_complete
+                    # (that function conflicts with MultiThreadedExecutor)
+                    deadline = time.time() + 10.0
+                    while not future.done() and time.time() < deadline:
+                        time.sleep(0.05)
 
-            detect_resp = future.result()
+                    if not future.done():
+                        last_error = "Perception call timeout"
+                        self.get_logger().warn(
+                            f'Observe attempt {attempt+1}/{retry_count}: {last_error}')
+                        continue
 
-            if not detect_resp.success:
-                response.success = False
-                response.error_message = detect_resp.error_message
-                return response
+                    percept_resp = future.result()
 
-            # Get 3D point in camera frame (mm)
-            point3d_cam = list(detect_resp.point3d)
-            point3d_cam_mm = [p * M_TO_MM for p in point3d_cam]
+                    if not percept_resp.success:
+                        last_error = f"Perception failed: {percept_resp.error_message}"
+                        self.get_logger().warn(
+                            f'Observe attempt {attempt+1}/{retry_count}: {last_error}')
+                        time.sleep(retry_delay)
+                        continue
 
-            # Compute offset and transform to base frame
-            transform_result = self._compute_grasp_offset(point3d_cam_mm, end_pose)
-            point3d_base = transform_result['point_in_base']
-            offset = transform_result['offset']
+                    if percept_resp.score < min_score:
+                        last_error = f"Score too low: {percept_resp.score:.2f} < {min_score}"
+                        self.get_logger().warn(
+                            f'Observe attempt {attempt+1}/{retry_count}: {last_error}')
+                        time.sleep(retry_delay)
+                        continue
 
-            # Check blacklist
-            category = detect_resp.category
-            is_black, reason = self._check_blacklist(category, point3d_base)
-            if is_black:
-                response.success = False
-                response.error_message = f"Blacklisted: {reason}"
-                return response
+                    # Get current pose (may have shifted during retries)
+                    with self._arm_lock:
+                        _, end_pose = self.arm.get_position(return_gripper_center=True)
 
-            # Check working area
-            if not self.in_working_area(offset=offset, yaw=detect_resp.angle):
-                response.success = False
-                response.error_message = "Target not in working area"
-                return response
+                    # Perception outputs in meters, convert to mm at boundary
+                    point3d_cam_mm = [p * M_TO_MM for p in percept_resp.point3d]
+                    width3d_mm = percept_resp.width3d * M_TO_MM
 
-            # Calculate base yaw
-            angle_base = self._calculate_target_yaw(end_pose[5], detect_resp.angle)
+                    # Coordinate transform (all in mm)
+                    transform_result = self._compute_grasp_offset(point3d_cam_mm, end_pose)
+                    point3d_base = transform_result['point_in_base']
+                    offset = transform_result['offset']
 
-            # Update observe cache
-            with self._observe_lock:
-                self.last_observe_result = {
-                    'valid': True,
-                    'timestamp': time.time(),
-                    'category': category,
-                    'point3d_camera': point3d_cam_mm,
-                    'point3d_base': point3d_base,
-                    'offset': offset,
-                    'angle_camera': detect_resp.angle,
-                    'angle_base': angle_base,
-                    'gripper_width': detect_resp.width3d * M_TO_MM,
-                    'end_pose_at_observe': list(end_pose)
-                }
+                    # Check blacklist (retry on hit, matching ROS1)
+                    is_black, reason = self._check_blacklist(
+                        category=percept_resp.category,
+                        point3d_base_mm=point3d_base
+                    )
+                    if is_black:
+                        last_error = f"Object blacklisted: {reason}"
+                        self.get_logger().warn(
+                            f'Observe attempt {attempt+1}/{retry_count}: {last_error}')
+                        time.sleep(retry_delay)
+                        continue
 
-            # Fill response
-            response.success = True
-            response.category = category
-            response.point3d_camera = point3d_cam_mm
-            response.point3d_base = point3d_base
-            response.offset = offset
-            response.angle_camera = detect_resp.angle
-            response.angle_base = angle_base
-            response.gripper_width = detect_resp.width3d * M_TO_MM
-            response.score = detect_resp.score
-            response.detection_time_ms = detect_resp.detection_time_ms
+                    # Cache result (thread-safe)
+                    with self._observe_lock:
+                        self.last_observe_result = {
+                            'valid': True,
+                            'timestamp': time.time(),
+                            'category': percept_resp.category,
+                            'score': percept_resp.score,
+                            'point3d_camera': point3d_cam_mm,
+                            'point3d_base': point3d_base,
+                            'offset': offset,
+                            'angle_camera': percept_resp.angle,
+                            'angle_base': percept_resp.angle,  # Same for now (camera mounted on gripper, aligned)
+                            'gripper_width': width3d_mm,
+                            'end_pose_at_observe': list(end_pose)
+                        }
+
+                    # Fill response
+                    response.success = True
+                    response.category = percept_resp.category
+                    response.score = percept_resp.score
+                    response.point3d_camera = point3d_cam_mm
+                    response.angle_camera = percept_resp.angle
+                    response.point3d_base = point3d_base
+                    response.offset = offset
+                    response.angle_base = percept_resp.angle
+                    response.gripper_width = width3d_mm
+                    response.detection_time_ms = (time.time() - start_time) * 1000
+
+                    self.get_logger().info(
+                        f'Observe success: {percept_resp.category}, '
+                        f'offset=[{offset[0]:.1f}, {offset[1]:.1f}, {offset[2]:.1f}] mm')
+                    return response
+
+                except Exception as e:
+                    last_error = f"Error: {e}"
+                    self.get_logger().warn(
+                        f'Observe attempt {attempt+1}/{retry_count}: {last_error}')
+                    time.sleep(retry_delay)
+
+            # All retries failed
+            response.success = False
+            response.error_message = f"Observe failed after {retry_count} attempts: {last_error}"
 
         except Exception as e:
             response.success = False
@@ -1105,13 +1194,14 @@ class PiperGraspNode(Node):
 
             # === APPROACHING ===
             approach_pitch = grasp_cfg.get('approach_pitch', 10)
-            self.get_logger().info("=== PICK: APPROACHING ===")
+            self.get_logger().info(f"=== PICK: APPROACHING === target=[{target_x:.1f}, {target_y:.1f}, {target_z + 100:.1f}]mm pitch={approach_pitch}")
             send_feedback(2, "Approaching", 0.2, "Moving XY")
             tmp = self.arm.set_position(x=target_x, y=target_y, z=target_z + 100,
                                         pitch=approach_pitch, wait=True, speed=speed,
                                         use_gripper_center=True)
             if not tmp:
-                raise RuntimeError("Failed to move to approach position")
+                err_info = self.arm._get_error_info() if hasattr(self.arm, '_get_error_info') else "unknown"
+                raise RuntimeError(f"Failed to move to approach position ({err_info})")
 
             if goal_handle.is_cancel_requested:
                 self._handle_pick_cancel(result, start_time, category)
@@ -1126,10 +1216,16 @@ class PiperGraspNode(Node):
             send_feedback(3, "Opening gripper", 0.3)
             self._set_gripper_mm(gripper_open, speed=500, wait=True)
 
+            if goal_handle.is_cancel_requested:
+                self._handle_pick_cancel(result, start_time, category)
+                goal_handle.canceled()
+                return result
+
             # === DESCENDING ===
             ik_cfg = self.config.get('ik_planning', {})
             use_ik = ik_cfg.get('enabled', False) and self.ik_solver is not None
             use_segmented = grasp_cfg.get('use_segmented_descent', True)
+            use_movel = grasp_cfg.get('use_movel_descent', False)
             descent_speed = grasp_cfg.get('approach_speed', 20)
 
             self.get_logger().info("=== PICK: DESCENDING ===")
@@ -1140,6 +1236,7 @@ class PiperGraspNode(Node):
                     target_z, ik_solver=self.ik_solver,
                     speed=ik_cfg.get('descent_speed', 15),
                     num_waypoints=ik_cfg.get('num_waypoints', 10),
+                    xy_tolerance_mm=ik_cfg.get('xy_tolerance_mm', 5.0),
                     use_gripper_center=True
                 )
                 tmp = success
@@ -1153,7 +1250,7 @@ class PiperGraspNode(Node):
                                                 speed=descent_speed, use_gripper_center=True)
             else:
                 tmp = self.arm.set_position(z=target_z, wait=True, speed=descent_speed,
-                                            use_gripper_center=True)
+                                            use_gripper_center=True, linear=use_movel)
 
             if not tmp:
                 raise RuntimeError("Failed to descend to target")
@@ -1188,15 +1285,23 @@ class PiperGraspNode(Node):
             self.get_logger().info("=== PICK: LIFTING ===")
             send_feedback(7, "Lifting", 0.8)
 
+            use_movel_lift = grasp_cfg.get('use_movel_lift', False)
+
             if use_ik and hasattr(self.arm, 'move_z_with_ik'):
-                success, _ = self.arm.move_z_with_ik(lift_z, ik_solver=self.ik_solver,
-                                                    speed=ik_cfg.get('lift_speed', 20),
-                                                    use_gripper_center=True)
+                success, msg = self.arm.move_z_with_ik(lift_z, ik_solver=self.ik_solver,
+                                                       speed=ik_cfg.get('lift_speed', 20),
+                                                       num_waypoints=ik_cfg.get('num_waypoints', 10),
+                                                       xy_tolerance_mm=ik_cfg.get('xy_tolerance_mm', 5.0),
+                                                       use_gripper_center=True)
                 tmp = success
-                if not success:
-                    tmp = self.arm.set_position(z=lift_z, wait=True, speed=speed, use_gripper_center=True)
+                if not success and ik_cfg.get('fallback_to_segmented', True):
+                    self.get_logger().warn(f"IK lift failed ({msg}), fallback to segmented MoveJ")
+                    segment_size = grasp_cfg.get('descent_segment_size', 60)
+                    tmp = self.arm.move_z_segmented(lift_z, max_step=segment_size,
+                                                    speed=speed, use_gripper_center=True)
             else:
-                tmp = self.arm.set_position(z=lift_z, wait=True, speed=speed, use_gripper_center=True)
+                tmp = self.arm.set_position(z=lift_z, wait=True, speed=speed,
+                                            use_gripper_center=True, linear=use_movel_lift)
 
             if not tmp:
                 raise RuntimeError("Failed to lift after pick")
@@ -1230,24 +1335,50 @@ class PiperGraspNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"Pick failed: {e}")
-            send_feedback(10, "Error", 0.0, str(e))
+            send_feedback(255, "Error", 0.0, str(e))
 
-            # Smart recovery
+            # Smart recovery based on error type (restored from ROS1)
             try:
                 if hasattr(self.arm, '_get_error_type'):
                     has_error, error_type = self.arm._get_error_type()
                     if has_error:
+                        self.get_logger().warn(f"Detected error type: {error_type}")
+
                         if error_type == "TARGET_LIMIT":
+                            self.get_logger().warn("Target position exceeded - attempting soft recovery...")
+                            # Add to blacklist to prevent retrying this object
+                            if self.blacklist:
+                                with self._observe_lock:
+                                    if self.last_observe_result.get('valid'):
+                                        bl_cat = self.last_observe_result.get('category', 'unknown')
+                                        bl_pt = self.last_observe_result.get('point3d_base', [])
+                                        if bl_pt:
+                                            self.blacklist.add(
+                                                center=bl_pt,
+                                                reason="TARGET_LIMIT",
+                                                object_id=None,
+                                                category=bl_cat
+                                            )
+                                            self.get_logger().info(f"Added {bl_cat} to blacklist (TARGET_LIMIT)")
                             self.arm.clean_error(go_zero=False, allow_disable=False)
                             time.sleep(0.5)
+                            self.get_logger().warn("Returning to ready position...")
                             try:
                                 self.arm.go_ready(speed=20)
-                            except Exception:
-                                pass
-                        elif "JOINT_LIMIT" not in error_type:
+                                self.get_logger().info("Soft recovery successful")
+                            except Exception as ready_err:
+                                self.get_logger().error(f"Cannot reach ready: {ready_err}")
+
+                        elif "JOINT_LIMIT" in error_type:
+                            self.get_logger().error(f"Physical joint limit: {error_type}")
+                            self.get_logger().error("Manual intervention required!")
+                            self.get_logger().error("DO NOT restart - move arm manually first")
+
+                        else:
+                            self.get_logger().warn(f"Attempting soft reset for: {error_type}")
                             self.arm.clean_error(go_zero=False, allow_disable=False)
-            except Exception:
-                pass
+            except Exception as recovery_err:
+                self.get_logger().error(f"Recovery failed: {recovery_err}")
 
             result.success = False
             result.error_message = str(e)
@@ -1323,69 +1454,91 @@ class PiperGraspNode(Node):
             place_y = flange_y + offset_base[1]
             place_z = flange_z + offset_base[2]
 
-            # === SAFE LIFT ===
+            # === SAFE LIFT ===  (state: MOVING=1)
             safe_z = max(place_z, grasp_cfg.get('safe_z', 200))
             self.get_logger().info("=== PLACE: SAFE LIFT ===")
             send_feedback(1, "Lifting to safe height", 0.1)
-            self.arm.set_position(z=safe_z, wait=True, speed=speed, use_gripper_center=True)
+            tmp = self.arm.set_position(z=safe_z, wait=True, speed=speed, use_gripper_center=True)
+            if grasp_cfg.get('strict_position_check', False) and not tmp:
+                raise RuntimeError("Failed to set position: lifting to safe height")
 
             if goal_handle.is_cancel_requested:
                 self._handle_place_cancel(result, start_time)
                 goal_handle.canceled()
                 return result
 
-            # === MOVE XY + ORIENTATION ===
+            # === MOVE XY + ORIENTATION ===  (state: MOVING=1)
             self.get_logger().info("=== PLACE: MOVING XY ===")
-            send_feedback(2, "Moving to place XY", 0.2)
-            self.arm.set_position(
+            send_feedback(1, "Moving to place XY", 0.2)
+            tmp = self.arm.set_position(
                 x=place_x, y=place_y,
                 roll=place_roll, pitch=place_pitch, yaw=place_yaw,
                 wait=True, speed=speed, use_gripper_center=True
             )
+            if grasp_cfg.get('strict_position_check', False) and not tmp:
+                raise RuntimeError("Failed to set position: moving to place XY")
 
-            # === DESCEND ===
+            if goal_handle.is_cancel_requested:
+                self._handle_place_cancel(result, start_time)
+                goal_handle.canceled()
+                return result
+
+            # === DESCEND ===  (state: MOVING=1, matching ROS1)
             self.get_logger().info("=== PLACE: DESCENDING ===")
-            send_feedback(3, "Descending to place", 0.3)
+            send_feedback(1, "Descending to place", 0.3)
             use_movel = grasp_cfg.get('use_movel_descent', True)
-            self.arm.set_position(z=place_z, wait=True, speed=speed,
+            tmp = self.arm.set_position(z=place_z, wait=True, speed=speed,
                                   use_gripper_center=True, linear=use_movel)
+            if grasp_cfg.get('strict_position_check', False) and not tmp:
+                raise RuntimeError("Failed to set position: descending to place Z")
 
-            # === OPENING ===
+            if goal_handle.is_cancel_requested:
+                self._handle_place_cancel(result, start_time)
+                goal_handle.canceled()
+                return result
+
+            # === OPENING ===  (state: OPENING=3)
             self.get_logger().info("=== PLACE: OPENING ===")
             gripper_max = self.config.get('gripper', {}).get('max_mm', 70)
-            send_feedback(4, "Opening gripper", 0.5)
+            send_feedback(3, "Opening gripper", 0.5)
             self._set_gripper_mm(gripper_max, speed=500, wait=True)
 
-            # === LIFTING ===
+            # === LIFTING ===  (state: LIFTING=4)
             self.get_logger().info("=== PLACE: LIFTING ===")
+            use_movel_lift = grasp_cfg.get('use_movel_lift', True)
             _, current = self.arm.get_position(return_gripper_center=True)
             lift_z = current[2] + 100
-            send_feedback(5, "Lifting", 0.7)
-            self.arm.set_position(z=lift_z, wait=True, speed=speed, use_gripper_center=True)
+            send_feedback(4, "Lifting", 0.7)
+            tmp = self.arm.set_position(z=lift_z, wait=True, speed=speed,
+                                  use_gripper_center=True, linear=use_movel_lift)
+            if grasp_cfg.get('strict_position_check', False) and not tmp:
+                raise RuntimeError("Failed to set position: lifting after place")
 
-            # === RETURNING ===
+            # === RETURNING ===  (state: RETURNING=5)
             self.get_logger().info("=== PLACE: RETURNING ===")
-            send_feedback(6, "Returning to ready", 0.8)
+            send_feedback(5, "Returning to ready", 0.8)
 
             # Close gripper
             self._set_gripper_mm(0, speed=500, wait=True)
 
-            if goal.return_to_ready:
-                ready_cfg = self.config.get('positions', {}).get('ready', {})
-                self.arm.set_position(
-                    x=ready_cfg.get('x', 250),
-                    y=ready_cfg.get('y', 37),
-                    z=ready_cfg.get('z', 386),
-                    roll=ready_cfg.get('roll', -171),
-                    pitch=ready_cfg.get('pitch', 28),
-                    yaw=ready_cfg.get('yaw', -166),
-                    wait=True, speed=speed,
-                    use_gripper_center=True
-                )
+            # Always return to ready (matching ROS1 behavior)
+            ready_cfg = self.config.get('positions', {}).get('ready', {})
+            tmp = self.arm.set_position(
+                x=ready_cfg.get('x', 250),
+                y=ready_cfg.get('y', 37),
+                z=ready_cfg.get('z', 386),
+                roll=ready_cfg.get('roll', -171),
+                pitch=ready_cfg.get('pitch', 28),
+                yaw=ready_cfg.get('yaw', -166),
+                wait=True, speed=speed,
+                use_gripper_center=True
+            )
+            if grasp_cfg.get('strict_position_check', False) and not tmp:
+                raise RuntimeError("Failed to set position: returning to ready position")
 
-            # === DONE ===
+            # === DONE ===  (state: DONE=6)
             self.get_logger().info("=== PLACE: DONE ===")
-            send_feedback(7, "Done", 1.0)
+            send_feedback(6, "Done", 1.0)
 
             _, final_pos = self.arm.get_position(return_gripper_center=True)
             result.success = True
@@ -1396,24 +1549,50 @@ class PiperGraspNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"Place failed: {e}")
-            send_feedback(10, "Error", 0.0, str(e))
+            send_feedback(255, "Error", 0.0, str(e))
 
-            # Smart recovery
+            # Smart recovery based on error type (restored from ROS1)
             try:
                 if hasattr(self.arm, '_get_error_type'):
                     has_error, error_type = self.arm._get_error_type()
                     if has_error:
+                        self.get_logger().warn(f"Detected error type: {error_type}")
+
                         if error_type == "TARGET_LIMIT":
+                            self.get_logger().warn("Target position exceeded - attempting soft recovery...")
+                            # Add to blacklist to prevent retrying this object
+                            if self.blacklist:
+                                with self._observe_lock:
+                                    if self.last_observe_result.get('valid'):
+                                        bl_cat = self.last_observe_result.get('category', 'unknown')
+                                        bl_pt = self.last_observe_result.get('point3d_base', [])
+                                        if bl_pt:
+                                            self.blacklist.add(
+                                                center=bl_pt,
+                                                reason="TARGET_LIMIT",
+                                                object_id=None,
+                                                category=bl_cat
+                                            )
+                                            self.get_logger().info(f"Added {bl_cat} to blacklist (TARGET_LIMIT)")
                             self.arm.clean_error(go_zero=False, allow_disable=False)
                             time.sleep(0.5)
+                            self.get_logger().warn("Returning to ready position...")
                             try:
                                 self.arm.go_ready(speed=20)
-                            except Exception:
-                                pass
-                        elif "JOINT_LIMIT" not in error_type:
+                                self.get_logger().info("Soft recovery successful")
+                            except Exception as ready_err:
+                                self.get_logger().error(f"Cannot reach ready: {ready_err}")
+
+                        elif "JOINT_LIMIT" in error_type:
+                            self.get_logger().error(f"Physical joint limit: {error_type}")
+                            self.get_logger().error("Manual intervention required!")
+                            self.get_logger().error("DO NOT restart - move arm manually first")
+
+                        else:
+                            self.get_logger().warn(f"Attempting soft reset for: {error_type}")
                             self.arm.clean_error(go_zero=False, allow_disable=False)
-            except Exception:
-                pass
+            except Exception as recovery_err:
+                self.get_logger().error(f"Recovery failed: {recovery_err}")
 
             result.success = False
             result.error_message = str(e)
@@ -1542,15 +1721,32 @@ class PiperGraspNode(Node):
             self.get_logger().error(f"Publish error: {e}")
 
     def destroy_node(self):
-        """Clean shutdown"""
+        """Clean shutdown with timeout guard to prevent hang on SIGINT"""
         self.get_logger().info("Shutting down...")
+        import signal
+
+        def _shutdown_timeout(signum, frame):
+            # Second signal → give up on safe shutdown, just exit
+            self.get_logger().warn("Shutdown timeout or second signal — skipping arm disable")
+            raise SystemExit(0)
+
+        # Install a short timeout: if shutdown takes > 8s, abort safely
+        old_handler = signal.signal(signal.SIGALRM, _shutdown_timeout)
+        signal.alarm(8)
+
         try:
             if self.config.get('safety', {}).get('disconnect_go_zero', True):
                 self.arm.go_zero()
             safe_disconnect = self.config.get('safety', {}).get('disconnect_damped_stop', True)
             self.arm.disconnect(safe=safe_disconnect)
+        except (SystemExit, KeyboardInterrupt):
+            self.get_logger().warn("Shutdown interrupted — arm stays enabled (safe)")
         except Exception as e:
             self.get_logger().error(f"Shutdown error: {e}")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
         super().destroy_node()
 
 

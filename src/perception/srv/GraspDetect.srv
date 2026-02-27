@@ -12,14 +12,14 @@ bool success                     # 检测是否成功
 string error_message             # 错误信息 (失败时)
 
 # 核心 3D 输出 (相机光学坐标系: Z向前, X右, Y下)
-float64[] point3d                # [x, y, z] 米 (长度=3)
+float64[3] point3d               # [x, y, z] 米
 float64 width3d                  # 夹爪宽度 米
 float64 angle                    # 抓取角度 度 (非弧度)
 string category                  # 物体类别
 float64 score                    # 抓取置信度
 
 # 2D 信息 (辅助)
-float64[] center_uv              # [u, v] 像素坐标 (长度=2)
+float64[2] center_uv             # [u, v] 像素坐标
 float64 depth                    # 中心点深度值 米
 
 # 统计

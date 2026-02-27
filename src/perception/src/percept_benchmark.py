@@ -1,22 +1,362 @@
 #!/usr/bin/env python3
 """
-percept.py 服务性能评测脚本
-测试 DinoX, GraspAnything, CDM 三个服务的串行执行时间分布
+percept_benchmark.py - 感知服务性能评测脚本 (ROS2 版本)
+
+测试 DinoX, SAM3, GraspAnything, CDM 四个服务的串行执行时间分布
+支持可视化结果输出到 result 目录
+
+Usage:
+    ros2 run perception percept_benchmark --vis           # 可视化测试
+    ros2 run perception percept_benchmark --benchmark     # 性能测试
+    ros2 run perception percept_benchmark --benchmark --num-runs 20
 """
 
 import sys
 import os
 import time
 import statistics
-
-# 添加路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, '/home/agilex/MobileManipulator/src/perception/src')
+from datetime import datetime
+from typing import Optional, Dict, List, Any
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from mmengine.config import Config as MMConfig
-from percept import DinoXDetectorOnline, GraspAnythingOnline, DepthOptimizerOnline, SAM3Online
+
+from perception.percept import DinoXDetectorOnline, SAM3Online, GraspAnythingOnline, DepthOptimizerOnline
+from perception.scene_perception_core import SimpleConfig
+
+
+# ========== 可视化函数 ==========
+
+def ensure_result_dir():
+    """确保 result 目录存在，返回带时间戳的子目录路径"""
+    # 使用 /tmp 作为输出目录
+    result_dir = '/tmp/perception_benchmark'
+    os.makedirs(result_dir, exist_ok=True)
+
+    # 创建带时间戳的子目录
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(result_dir, f'benchmark_{timestamp}')
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def vis_detection(rgb, result, service_name, categories=None):
+    """可视化检测结果 (DinoX/SAM3)
+
+    Args:
+        rgb: 原始 BGR 图像
+        result: LocalTaskResult.result，格式 {'objects': [...]}
+        service_name: 服务名称，用于标注
+        categories: 类别列表（可选）
+
+    Returns:
+        vis_img: 可视化后的图像
+    """
+    vis_img = rgb.copy()
+
+    if not result or 'objects' not in result:
+        return vis_img
+
+    objects = result['objects']
+
+    for i, obj in enumerate(objects):
+        bbox = obj.get('bbox')
+        score = obj.get('score', 0)
+        category = obj.get('category', f'obj{i}')
+
+        if not bbox:
+            continue
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+
+        # 根据索引生成颜色
+        color = ((i * 67 + 50) % 255, (i * 97 + 100) % 255, (i * 137 + 80) % 255)
+
+        # 绘制边界框
+        cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
+
+        # 绘制标签背景
+        label = f'{category}: {score:.2f}'
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.rectangle(vis_img, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+
+        # 绘制标签文字
+        cv2.putText(vis_img, label, (x1 + 2, y1 - 4),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    # 添加服务名称标注
+    cv2.putText(vis_img, f'[{service_name}] {len(objects)} objects', (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    return vis_img
+
+
+def vis_grasp(rgb, objs, padded_img=None):
+    """可视化抓取检测结果 (GraspAnything)
+
+    Args:
+        rgb: 原始 BGR 图像
+        objs: GraspAnything 返回的 objs 列表
+        padded_img: padding 后的图像（可选）
+
+    Returns:
+        vis_img: 可视化后的图像
+    """
+    vis_img = rgb.copy()
+    h, w = rgb.shape[:2]
+
+    if not objs or len(objs) == 0 or len(objs[0]) == 0:
+        cv2.putText(vis_img, '[GraspAnything] No objects', (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        return vis_img
+
+    obj_list = objs[0]
+
+    # 创建 mask 叠加层
+    overlay = vis_img.copy()
+
+    for i, obj in enumerate(obj_list):
+        # 生成颜色
+        color = ((i * 67 + 50) % 255, (i * 97 + 100) % 255, (i * 137 + 80) % 255)
+
+        # 绘制 mask
+        if 'dt_mask' in obj and obj['dt_mask'] is not None:
+            mask = obj['dt_mask']
+            if mask.shape[:2] == (h, w):
+                overlay[mask] = color
+
+        # 绘制边界框
+        if 'dt_bbox' in obj:
+            bbox = obj['dt_bbox']
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
+
+        # 绘制抓取点/抓取线
+        if 'touching_points' in obj:
+            for pts in obj['touching_points']:
+                if len(pts) >= 2:
+                    pt1, pt2 = pts[0], pts[1]
+                    pt1 = (int(pt1[0]), int(pt1[1]))
+                    pt2 = (int(pt2[0]), int(pt2[1]))
+                    # 绘制抓取线
+                    cv2.line(vis_img, pt1, pt2, (0, 0, 255), 3)
+                    # 绘制端点
+                    cv2.circle(vis_img, pt1, 5, (255, 0, 0), -1)
+                    cv2.circle(vis_img, pt2, 5, (255, 0, 0), -1)
+
+        # 绘制 affordance 中心点
+        if 'affs' in obj:
+            for aff in obj['affs']:
+                cx, cy = int(aff[0]), int(aff[1])
+                cv2.circle(vis_img, (cx, cy), 4, (0, 255, 255), -1)
+
+    # 混合 mask 叠加层
+    vis_img = cv2.addWeighted(overlay, 0.3, vis_img, 0.7, 0)
+
+    # 添加服务名称标注
+    cv2.putText(vis_img, f'[GraspAnything] {len(obj_list)} objects', (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    return vis_img
+
+
+def vis_depth(depth_mm, depth_denoised=None):
+    """可视化深度图 (CDM)
+
+    Args:
+        depth_mm: 原始深度图 (uint16, 单位 mm)
+        depth_denoised: 去噪后的深度图 (uint16, 单位 mm)
+
+    Returns:
+        vis_img: 拼接的可视化图像 (原始 | 去噪)
+    """
+    def depth_to_colormap(depth):
+        """深度图转伪彩色"""
+        # 归一化到 0-255
+        valid_mask = depth > 0
+        if not np.any(valid_mask):
+            return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+        d_min = np.min(depth[valid_mask])
+        d_max = np.max(depth[valid_mask])
+
+        if d_max == d_min:
+            normalized = np.zeros_like(depth, dtype=np.uint8)
+        else:
+            normalized = ((depth.astype(np.float32) - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+
+        # 无效区域设为 0
+        normalized[~valid_mask] = 0
+
+        # 应用 colormap
+        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+
+        # 无效区域设为黑色
+        colored[~valid_mask] = [0, 0, 0]
+
+        return colored
+
+    vis_orig = depth_to_colormap(depth_mm)
+    cv2.putText(vis_orig, 'Original Depth', (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    if depth_denoised is not None:
+        vis_denoised = depth_to_colormap(depth_denoised)
+        cv2.putText(vis_denoised, 'CDM Denoised', (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # 水平拼接
+        vis_img = np.hstack([vis_orig, vis_denoised])
+    else:
+        vis_img = vis_orig
+
+    return vis_img
+
+
+def save_visualization_results(run_dir, data_name, results_dict):
+    """保存单个数据集的所有可视化结果
+
+    Args:
+        run_dir: 输出目录
+        data_name: 数据集名称 (e.g., '001')
+        results_dict: 各服务的可视化结果 {'DinoX': vis_img, ...}
+    """
+    for service_name, vis_img in results_dict.items():
+        if vis_img is not None:
+            fp = os.path.join(run_dir, f'{data_name}_{service_name}.jpg')
+            cv2.imwrite(fp, vis_img)
+
+
+def run_visualization_test(all_data, run_dir, text_prompt_dinox, text_prompt_sam3, grasp_server_config):
+    """运行可视化测试，为每个数据集生成各服务的可视化结果
+
+    Args:
+        all_data: 数据集列表 [{'name': '001', 'rgb': ..., 'depth': ...}, ...]
+        run_dir: 输出目录
+        text_prompt_dinox: DinoX 的 text prompt
+        text_prompt_sam3: SAM3 的 text prompt
+        grasp_server_config: GraspAnything 服务器配置文件路径
+    """
+    print(f"\n{'='*70}")
+    print(f"开始可视化测试 (输出目录: {run_dir})")
+    print(f"{'='*70}")
+
+    # 初始化服务
+    services = {}
+
+    # DinoX
+    try:
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:10086',
+            min_score=0.25,
+            iou_threshold=0.5,
+            warmup=0
+        )
+        services['DinoX'] = DinoXDetectorOnline(cfg)
+        print("[DinoX] 服务初始化成功")
+    except Exception as e:
+        print(f"[DinoX] 服务初始化失败: {e}")
+
+    # SAM3
+    try:
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:8080',
+            min_score=0.30,
+            return_mask=False,
+            warmup=0
+        )
+        services['SAM3'] = SAM3Online(cfg)
+        print("[SAM3] 服务初始化成功")
+    except Exception as e:
+        print(f"[SAM3] 服务初始化失败: {e}")
+
+    # GraspAnything
+    if grasp_server_config and os.path.exists(grasp_server_config):
+        try:
+            cfg = SimpleConfig(
+                server_list=grasp_server_config,
+                model_name='full',
+                warmup=0
+            )
+            services['Grasp'] = GraspAnythingOnline(cfg)
+            print("[GraspAnything] 服务初始化成功")
+        except Exception as e:
+            print(f"[GraspAnything] 服务初始化失败: {e}")
+    else:
+        print(f"[GraspAnything] 跳过 - 配置文件不存在: {grasp_server_config}")
+
+    # CDM
+    try:
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:8081',
+            chosen_policy='dn',
+            warmup=0
+        )
+        services['CDM'] = DepthOptimizerOnline(cfg)
+        print("[CDM] 服务初始化成功")
+    except Exception as e:
+        print(f"[CDM] 服务初始化失败: {e}")
+
+    # 对每个数据集运行可视化
+    for data in all_data:
+        name = data['name']
+        rgb = data['rgb']
+        depth = data['depth']
+
+        print(f"\n处理数据集: {name}")
+        vis_results = {}
+
+        # DinoX
+        if 'DinoX' in services:
+            try:
+                result = services['DinoX'].forward(text_prompt_dinox, rgb)
+                vis_results['DinoX'] = vis_detection(rgb, result.result, 'DinoX')
+                print(f"  [DinoX] 检测到 {len(result.result.get('objects', []))} 个目标")
+            except Exception as e:
+                print(f"  [DinoX] 失败: {e}")
+
+        # SAM3
+        if 'SAM3' in services:
+            try:
+                result = services['SAM3'].forward(text_prompt_sam3, rgb)
+                vis_results['SAM3'] = vis_detection(rgb, result.result, 'SAM3')
+                print(f"  [SAM3] 检测到 {len(result.result.get('objects', []))} 个目标")
+            except Exception as e:
+                print(f"  [SAM3] 失败: {e}")
+
+        # GraspAnything
+        if 'Grasp' in services:
+            try:
+                objs, padded_img = services['Grasp'].forward(rgb, depth=None)
+                vis_results['Grasp'] = vis_grasp(rgb, objs, padded_img)
+                obj_count = len(objs[0]) if objs and len(objs) > 0 else 0
+                print(f"  [GraspAnything] 检测到 {obj_count} 个目标")
+            except Exception as e:
+                print(f"  [GraspAnything] 失败: {e}")
+
+        # CDM
+        if 'CDM' in services:
+            try:
+                result = services['CDM'].forward(rgb, depth, chosen_policy='dn')
+                if result.get('success') and 'depth' in result:
+                    vis_results['CDM'] = vis_depth(depth, result['depth'])
+                    print(f"  [CDM] 去噪成功")
+                else:
+                    vis_results['CDM'] = vis_depth(depth, None)
+                    print(f"  [CDM] 去噪失败: {result.get('error', 'unknown')}")
+            except Exception as e:
+                print(f"  [CDM] 失败: {e}")
+
+        # 保存原始 RGB 图像
+        rgb_fp = os.path.join(run_dir, f'{name}_RGB.jpg')
+        cv2.imwrite(rgb_fp, rgb)
+
+        # 保存各服务可视化结果
+        save_visualization_results(run_dir, name, vis_results)
+
+    print(f"\n可视化结果已保存到: {run_dir}")
+    return run_dir
 
 
 def benchmark_with_timing(func, args_list, kwargs, name, num_runs=10, warmup_runs=3):
@@ -107,13 +447,135 @@ def benchmark_with_timing(func, args_list, kwargs, name, num_runs=10, warmup_run
     }
 
 
-def main():
-    num_runs = 10
-    warmup_runs = 3  # 预热次数（不计入统计）
+def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
+                              num_runs=10, warmup_runs=3):
+    """4路并发 benchmark: 模拟双相机 (2x SAM3 + 2x CDM) 同时调用
 
-    # 测试图片路径 - 使用真实深度数据
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    samples_dir = '/home/didi/workspace/MobileManipulator2/src/perception/samples'
+    参考 scene_perception_3d_node.py 的 ThreadPoolExecutor 并行模式，
+    模拟双相机场景下 4 个 API 同时打满的情况。
+
+    Args:
+        sam3_service: SAM3Online 实例
+        cdm_service: DepthOptimizerOnline 实例
+        all_data: 数据集列表
+        text_prompt: SAM3 text prompt
+        num_runs: 测试次数
+        warmup_runs: 预热次数
+    """
+    n = len(all_data)
+    times = []
+    detail_times = {k: [] for k in ['SAM3-cam1', 'SAM3-cam2', 'CDM-cam1', 'CDM-cam2']}
+
+    print(f"\n{'='*70}")
+    print(f"[并发4路] 2x SAM3 + 2x CDM 同时调用 ({num_runs} 次, 预热 {warmup_runs} 次)")
+    print(f"{'='*70}")
+
+    def call_sam3(rgb):
+        t0 = time.perf_counter()
+        sam3_service.forward(text_prompt, rgb)
+        return time.perf_counter() - t0
+
+    def call_cdm(rgb, depth):
+        t0 = time.perf_counter()
+        cdm_service.forward(rgb, depth, chosen_policy='dn')
+        return time.perf_counter() - t0
+
+    def run_once(d1, d2):
+        """一次 4 路并发：cam1(SAM3+CDM) + cam2(SAM3+CDM)"""
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            f_sam1 = executor.submit(call_sam3, d1['rgb'])
+            f_sam2 = executor.submit(call_sam3, d2['rgb'])
+            f_cdm1 = executor.submit(call_cdm, d1['rgb'], d1['depth'])
+            f_cdm2 = executor.submit(call_cdm, d2['rgb'], d2['depth'])
+
+            r_sam1 = f_sam1.result(timeout=60)
+            r_sam2 = f_sam2.result(timeout=60)
+            r_cdm1 = f_cdm1.result(timeout=60)
+            r_cdm2 = f_cdm2.result(timeout=60)
+
+        wall = time.perf_counter() - t0
+        return wall, r_sam1, r_sam2, r_cdm1, r_cdm2
+
+    # 预热
+    for i in range(warmup_runs):
+        d1 = all_data[i % n]
+        d2 = all_data[(i + 1) % n]
+        wall, s1, s2, c1, c2 = run_once(d1, d2)
+        print(f"  [预热] 第 {i+1} 次 [{d1['name']}+{d2['name']}]: "
+              f"{wall*1000:.1f}ms | SAM3:{s1*1000:.0f}/{s2*1000:.0f} CDM:{c1*1000:.0f}/{c2*1000:.0f}")
+
+    # 正式测试
+    for i in range(num_runs):
+        d1 = all_data[i % n]
+        d2 = all_data[(i + 1) % n]
+        wall, s1, s2, c1, c2 = run_once(d1, d2)
+
+        times.append(wall)
+        detail_times['SAM3-cam1'].append(s1)
+        detail_times['SAM3-cam2'].append(s2)
+        detail_times['CDM-cam1'].append(c1)
+        detail_times['CDM-cam2'].append(c2)
+
+        print(f"  第 {i+1:2d} 次 [{d1['name']}+{d2['name']}]: "
+              f"{wall*1000:.1f}ms | SAM3:{s1*1000:.0f}/{s2*1000:.0f} CDM:{c1*1000:.0f}/{c2*1000:.0f}")
+
+    # 统计
+    avg_time = statistics.mean(times)
+    min_time = min(times)
+    max_time = max(times)
+    std_time = statistics.stdev(times) if len(times) > 1 else 0
+
+    print(f"\n[并发4路] 统计结果:")
+    print(f"  总耗时: 平均={avg_time*1000:.1f}ms  最小={min_time*1000:.1f}ms  "
+          f"最大={max_time*1000:.1f}ms  标准差={std_time*1000:.1f}ms")
+    print(f"  理论最大频率: {1/(avg_time):.1f} Hz")
+
+    print(f"\n  各服务耗时 (平均):")
+    for label in ['SAM3-cam1', 'SAM3-cam2', 'CDM-cam1', 'CDM-cam2']:
+        avg = statistics.mean(detail_times[label]) * 1000
+        print(f"    {label:<12}: {avg:6.1f} ms")
+
+    serial_sum = sum(statistics.mean(v) for v in detail_times.values()) * 1000
+    print(f"    {'─'*28}")
+    print(f"    {'串行理论':<12}: {serial_sum:6.1f} ms")
+    print(f"    {'并行实际':<12}: {avg_time*1000:6.1f} ms")
+    print(f"    {'加速比':<12}: {serial_sum / (avg_time * 1000):.2f}x")
+
+    return {
+        'name': '并发4路 (2xSAM3+2xCDM)',
+        'avg': avg_time,
+        'min': min_time,
+        'max': max_time,
+        'std': std_time,
+        'detail_times': detail_times,
+    }
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Perception 服务 Benchmark 脚本 (ROS2)')
+    parser.add_argument('--vis', action='store_true', help='运行可视化测试并输出到 result 目录')
+    parser.add_argument('--benchmark', action='store_true', help='运行耗时 benchmark 测试')
+    parser.add_argument('--num-runs', type=int, default=10, help='每组数据测试次数 (default: 10)')
+    parser.add_argument('--warmup', type=int, default=3, help='预热次数 (default: 3)')
+    parser.add_argument('--samples-dir', type=str,
+                       default='/data/workspace/MobileManipulator2/src/perception/samples',
+                       help='样本数据目录')
+    parser.add_argument('--grasp-config', type=str,
+                       default='/data/workspace/MobileManipulator2/src/perception/config/server_grasp.json',
+                       help='GraspAnything 服务器配置文件路径')
+    args = parser.parse_args()
+
+    # 如果没有指定任何模式，默认运行 benchmark
+    if not args.vis and not args.benchmark:
+        args.benchmark = True
+
+    num_runs = args.num_runs
+    warmup_runs = args.warmup
+    samples_dir = args.samples_dir
+    grasp_server_config = args.grasp_config
 
     # 可用数据集
     datasets = ['001', '002', '666', '770']
@@ -143,19 +605,30 @@ def main():
         sys.exit(1)
 
     print(f"\n共加载 {len(all_data)} 组数据")
-    print(f"每组测试 {num_runs} 次, 预热 {warmup_runs} 次")
 
-    all_results = []
     text_prompt_dinox = 'pen.box.phone.bottle.toy'
     text_prompt_sam3 = 'pen,box,phone,bottle,toy'
 
+    # ========== 可视化测试 ==========
+    if args.vis:
+        run_dir = ensure_result_dir()
+        run_visualization_test(all_data, run_dir, text_prompt_dinox, text_prompt_sam3, grasp_server_config)
+
+    # ========== Benchmark 测试 ==========
+    if not args.benchmark:
+        return
+
+    print(f"\n每组测试 {num_runs} 次, 预热 {warmup_runs} 次")
+    all_results = []
+
     # ========== 1. DinoX 测试 ==========
     try:
-        cfg = MMConfig()
-        cfg.url = 'http://192.168.112.14:10086'
-        cfg.min_score = 0.25
-        cfg.iou_threshold = 0.5
-        cfg.warmup = 0
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:10086',
+            min_score=0.25,
+            iou_threshold=0.5,
+            warmup=0
+        )
         dinox_service = DinoXDetectorOnline(cfg)
 
         args_list = [(d['name'], (text_prompt_dinox, d['rgb'])) for d in all_data]
@@ -176,11 +649,12 @@ def main():
 
     # ========== 2. SAM3 测试 ==========
     try:
-        cfg = MMConfig()
-        cfg.url = 'http://192.168.112.14:8080'
-        cfg.confidence = 0.30
-        cfg.return_mask = False
-        cfg.warmup = 0
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:8080',
+            min_score=0.30,
+            return_mask=False,
+            warmup=0
+        )
         sam3_service = SAM3Online(cfg)
 
         args_list = [(d['name'], (text_prompt_sam3, d['rgb'])) for d in all_data]
@@ -200,35 +674,40 @@ def main():
         traceback.print_exc()
 
     # ========== 3. GraspAnything 测试 ==========
-    try:
-        cfg = MMConfig()
-        cfg.server_list = os.path.join(script_dir, '..', 'config', 'server_grasp.json')
-        cfg.model_name = 'full'
-        cfg.warmup = 0
-        grasp_service = GraspAnythingOnline(cfg)
+    if grasp_server_config and os.path.exists(grasp_server_config):
+        try:
+            cfg = SimpleConfig(
+                server_list=grasp_server_config,
+                model_name='full',
+                warmup=0
+            )
+            grasp_service = GraspAnythingOnline(cfg)
 
-        args_list = [(d['name'], (d['rgb'],)) for d in all_data]
+            args_list = [(d['name'], (d['rgb'],)) for d in all_data]
 
-        result = benchmark_with_timing(
-            func=grasp_service.forward,
-            args_list=args_list,
-            kwargs={'depth': None},
-            name='GraspAnything',
-            num_runs=num_runs,
-            warmup_runs=warmup_runs
-        )
-        all_results.append(result)
-    except Exception as e:
-        print(f"\n[GraspAnything] 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+            result = benchmark_with_timing(
+                func=grasp_service.forward,
+                args_list=args_list,
+                kwargs={'depth': None},
+                name='GraspAnything',
+                num_runs=num_runs,
+                warmup_runs=warmup_runs
+            )
+            all_results.append(result)
+        except Exception as e:
+            print(f"\n[GraspAnything] 测试失败: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"\n[GraspAnything] 跳过 - 配置文件不存在: {grasp_server_config}")
 
     # ========== 4. CDM 测试 ==========
     try:
-        cfg = MMConfig()
-        cfg.url = 'http://192.168.112.14:8081'
-        cfg.chosen_policy = 'dn'
-        cfg.warmup = 0
+        cfg = SimpleConfig(
+            url='http://192.168.112.14:8081',
+            chosen_policy='dn',
+            warmup=0
+        )
         cdm_service = DepthOptimizerOnline(cfg)
 
         args_list = [(d['name'], (d['rgb'], d['depth'])) for d in all_data]
@@ -244,6 +723,40 @@ def main():
         all_results.append(result)
     except Exception as e:
         print(f"\n[CDM] 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ========== 5. 并发 4 路测试 (2x SAM3 + 2x CDM) ==========
+    concurrent_result = None
+    try:
+        # 复用已有的 SAM3 和 CDM 服务实例
+        if 'sam3_service' not in dir():
+            cfg = SimpleConfig(
+                url='http://192.168.112.14:8080',
+                min_score=0.30,
+                return_mask=False,
+                warmup=0
+            )
+            sam3_service = SAM3Online(cfg)
+
+        if 'cdm_service' not in dir():
+            cfg = SimpleConfig(
+                url='http://192.168.112.14:8081',
+                chosen_policy='dn',
+                warmup=0
+            )
+            cdm_service = DepthOptimizerOnline(cfg)
+
+        concurrent_result = benchmark_concurrent_4way(
+            sam3_service=sam3_service,
+            cdm_service=cdm_service,
+            all_data=all_data,
+            text_prompt=text_prompt_sam3,
+            num_runs=num_runs,
+            warmup_runs=warmup_runs,
+        )
+    except Exception as e:
+        print(f"\n[并发4路] 测试失败: {e}")
         import traceback
         traceback.print_exc()
 
@@ -283,6 +796,33 @@ def main():
         max_service_time = max(r['avg'] * 1000 for r in all_results)
         print(f"\n理论并行时间 (取最慢服务): {max_service_time:.1f} ms")
         print(f"串行 vs 并行加速比: {total_time / max_service_time:.2f}x")
+
+    # 并发 vs 串行总结
+    if concurrent_result:
+        sam3_serial = next((r for r in all_results if r['name'] == 'SAM3'), None)
+        cdm_serial = next((r for r in all_results if r['name'] == 'CDM'), None)
+
+        print(f"\n{'='*70}")
+        print(f"并发 4 路 vs 串行 对比")
+        print(f"{'='*70}")
+
+        if sam3_serial and cdm_serial:
+            serial_2sam3_2cdm = (sam3_serial['avg'] * 2 + cdm_serial['avg'] * 2) * 1000
+            print(f"  串行 2xSAM3+2xCDM: {serial_2sam3_2cdm:.1f} ms")
+
+        print(f"  并发 4路实际:      {concurrent_result['avg']*1000:.1f} ms")
+        print(f"  并发最小:          {concurrent_result['min']*1000:.1f} ms")
+        print(f"  并发最大:          {concurrent_result['max']*1000:.1f} ms")
+
+        if sam3_serial and cdm_serial:
+            print(f"  加速比:            {serial_2sam3_2cdm / (concurrent_result['avg']*1000):.2f}x")
+
+        print(f"\n  双相机融合频率:    {1/concurrent_result['avg']:.1f} Hz")
+        target_hz = 10.0
+        target_ms = 1000.0 / target_hz
+        ok = concurrent_result['avg'] * 1000 < target_ms
+        print(f"  {target_hz:.0f}Hz 可达性:        {'可达' if ok else '不可达'} "
+              f"(需 <{target_ms:.0f}ms, 实际 {concurrent_result['avg']*1000:.1f}ms)")
 
 
 if __name__ == '__main__':

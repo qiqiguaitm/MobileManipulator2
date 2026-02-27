@@ -106,7 +106,7 @@ PiperGraspNode ─────┘
 
 ### 4.1 ObjectTrackerNode（感知-跟踪）
 
-**位置**: `src/perception2/perception_nodes/`
+**位置**: `src/perception/perception_nodes/`
 
 **发布话题**:
 ```yaml
@@ -129,7 +129,7 @@ PiperGraspNode ─────┘
 
 ### 4.2 PerceptionGraspNode（感知-抓取检测）
 
-**位置**: `src/perception2/perception_nodes/`
+**位置**: `src/perception/perception_nodes/`
 
 **服务**:
 ```yaml
@@ -790,7 +790,7 @@ Piper 内置黑名单系统，抓取失败的位置会被记录：
 
 ```
 src/
-├── perception2/
+├── perception/
 │   ├── perception_interfaces/      # ✅ 消息定义
 │   │   ├── msg/
 │   │   │   ├── TrackedObject3D.msg

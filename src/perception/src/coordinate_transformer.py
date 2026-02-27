@@ -3,10 +3,14 @@
 坐标变换工具
 
 加载外参文件，执行坐标系间的变换。
-支持: rslidar, top_camera_optical_frame, arm_base_link
+支持: rslidar, top_camera_optical_frame, arm_base_link, base_link
+
+这是一个纯 Python 模块，不依赖 ROS。
 """
 
 import os
+from typing import Optional, Dict
+
 import yaml
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -15,18 +19,17 @@ from scipy.spatial.transform import Rotation
 class CoordinateTransformer:
     """坐标变换器，管理多个坐标系间的变换关系"""
 
-    def __init__(self, config_dir=None):
+    def __init__(self, config_dir: Optional[str] = None):
         """
         Args:
-            config_dir: 外参配置文件目录，默认 perception/config/
+            config_dir: 外参配置文件目录
         """
-        if config_dir is None:
-            # 默认: src/coordinate_transformer.py → ../config/
-            config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
-        self.config_dir = os.path.abspath(config_dir)
+        self.config_dir = config_dir
+        self._transforms: Dict[str, np.ndarray] = {}
 
-        # 存储变换矩阵
-        self._transforms = {}
+    def set_config_dir(self, config_dir: str):
+        """设置配置文件目录"""
+        self.config_dir = os.path.abspath(config_dir)
 
     def load_extrinsics(self, yaml_path: str, as_point_transform: bool = True) -> np.ndarray:
         """
@@ -51,7 +54,7 @@ class CoordinateTransformer:
             - t_point = -R_tf^T @ t_tf
         """
         # 处理路径
-        if not os.path.isabs(yaml_path):
+        if not os.path.isabs(yaml_path) and self.config_dir:
             yaml_path = os.path.join(self.config_dir, yaml_path)
 
         with open(yaml_path, 'r') as f:
@@ -84,7 +87,7 @@ class CoordinateTransformer:
 
         return T
 
-    def load_all_extrinsics(self):
+    def load_all_extrinsics(self, camera_name: str = 'top', suffix: str = ''):
         """加载所有需要的外参文件
 
         外参使用链式变换，支持多个目标坐标系:
@@ -96,14 +99,26 @@ class CoordinateTransformer:
         - optical → base_link
         - rslidar → arm_base_link
         - rslidar → base_link
+
+        Args:
+            camera_name: 相机名称 ('top' 或 'chassis')
+            suffix: 外参文件后缀 (如 '_new'，用于测试新标定)
         """
+        if self.config_dir is None:
+            print("[WARN] config_dir not set, skip loading extrinsics")
+            return
+
+        # 根据 camera_name 动态选择外参文件名
+        optical_frame = f'{camera_name}_camera_optical_frame'
+        optical_to_base_file = f'extrinsics_{optical_frame}_to_base_link{suffix}.yaml'
+
         extrinsics_files = {
             # 原有变换
-            'rslidar_to_optical': 'extrinsics_rslidar_to_top_camera_optical_frame.yaml',
+            'rslidar_to_optical': f'extrinsics_rslidar_to_{optical_frame}.yaml',
             'arm_to_rslidar': 'extrinsics_arm_base_link_to_rslidar.yaml',
-            'arm_to_optical': 'extrinsics_arm_base_link_to_top_camera_optical_frame.yaml',
-            # 新增 base_link 变换
-            'optical_to_base': 'extrinsics_top_camera_optical_frame_to_base_link.yaml',
+            'arm_to_optical': f'extrinsics_arm_base_link_to_{optical_frame}.yaml',
+            # base_link 变换 (应用后缀)
+            'optical_to_base': optical_to_base_file,
             'rslidar_to_base': 'extrinsics_rslidar_to_base_link.yaml',
         }
 
@@ -111,9 +126,9 @@ class CoordinateTransformer:
             try:
                 T = self.load_extrinsics(filename)
                 self._transforms[name] = T
-                print(f"[CoordinateTransformer] 已加载 {filename}")
+                print(f"[CoordinateTransformer] Loaded {filename}")
             except Exception as e:
-                print(f"[WARN] 加载 {filename} 失败: {e}")
+                print(f"[WARN] Failed to load {filename}: {e}")
 
         # 计算派生变换
         if 'arm_to_optical' in self._transforms:
@@ -128,8 +143,12 @@ class CoordinateTransformer:
     def get_transform(self, name: str) -> np.ndarray:
         """获取指定的变换矩阵"""
         if name not in self._transforms:
-            raise KeyError(f"未找到变换 '{name}'，可用: {list(self._transforms.keys())}")
+            raise KeyError(f"Transform '{name}' not found. Available: {list(self._transforms.keys())}")
         return self._transforms[name]
+
+    def add_transform(self, name: str, T: np.ndarray):
+        """手动添加变换矩阵"""
+        self._transforms[name] = T
 
     def transform_points(self, points: np.ndarray, T: np.ndarray) -> np.ndarray:
         """
@@ -201,7 +220,7 @@ class CoordinateTransformer:
         elif target_frame == 'arm_base_link':
             return self.optical_to_arm(points)
         else:
-            raise ValueError(f"不支持的目标坐标系: {target_frame}, 可用: base_link, arm_base_link")
+            raise ValueError(f"Unsupported target frame: {target_frame}. Use: base_link, arm_base_link")
 
     def rslidar_to_target(self, points: np.ndarray, target_frame: str) -> np.ndarray:
         """将 rslidar 坐标系的点变换到目标坐标系
@@ -218,7 +237,7 @@ class CoordinateTransformer:
         elif target_frame == 'arm_base_link':
             return self.rslidar_to_arm(points)
         else:
-            raise ValueError(f"不支持的目标坐标系: {target_frame}, 可用: base_link, arm_base_link")
+            raise ValueError(f"Unsupported target frame: {target_frame}. Use: base_link, arm_base_link")
 
     def project_to_image(self, points_optical: np.ndarray, intrinsics: dict) -> np.ndarray:
         """
@@ -253,59 +272,22 @@ class CoordinateTransformer:
 def test_transformer():
     """测试坐标变换器"""
     print("=" * 60)
-    print("CoordinateTransformer 测试")
+    print("CoordinateTransformer Test")
     print("=" * 60)
 
     transformer = CoordinateTransformer()
 
-    # 加载所有外参
-    transformer.load_all_extrinsics()
+    # 测试手动添加变换
+    T_identity = np.eye(4)
+    transformer.add_transform('test', T_identity)
+    print(f"Added identity transform: {transformer.get_transform('test')}")
 
-    # 显示变换矩阵
-    print("\n可用的变换:")
-    for name in transformer._transforms.keys():
-        T = transformer.get_transform(name)
-        t = T[:3, 3]
-        R = Rotation.from_matrix(T[:3, :3])
-        euler = R.as_euler('xyz', degrees=True)
-        print(f"  {name}:")
-        print(f"    平移: [{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}] m")
-        print(f"    旋转: [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}]° (xyz)")
+    # 测试点变换
+    test_points = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    transformed = transformer.transform_points(test_points, T_identity)
+    print(f"Transformed points:\n{transformed}")
 
-    # 测试点云变换
-    print("\n测试点云变换:")
-
-    # 假设一个在 rslidar 坐标系前方 1.2m 的点
-    test_point = np.array([[1.2, 0.0, 0.0, 100]])  # [x, y, z, intensity]
-    print(f"原始点 (rslidar): {test_point[0, :3]}")
-
-    # rslidar → optical
-    point_optical = transformer.rslidar_to_optical(test_point)
-    print(f"变换后 (optical): {point_optical[0, :3]}")
-
-    # rslidar → arm_base
-    point_arm = transformer.rslidar_to_arm(test_point)
-    print(f"变换后 (arm_base): {point_arm[0, :3]}")
-
-    # rslidar → base_link (新增)
-    if 'rslidar_to_base' in transformer._transforms:
-        point_base = transformer.rslidar_to_base(test_point)
-        print(f"变换后 (base_link): {point_base[0, :3]}")
-
-    # 测试统一接口
-    print("\n测试 *_to_target 统一接口:")
-    for target in ['base_link', 'arm_base_link']:
-        try:
-            result = transformer.rslidar_to_target(test_point, target)
-            print(f"  rslidar → {target}: {result[0, :3]}")
-        except (KeyError, ValueError) as e:
-            print(f"  rslidar → {target}: 失败 ({e})")
-
-    # 测试投影
-    print("\n测试投影到图像平面:")
-    intrinsics = {'fx': 383.5, 'fy': 383.5, 'cx': 640.0, 'cy': 360.0}  # 假设 1280x720
-    uv = transformer.project_to_image(point_optical, intrinsics)
-    print(f"图像坐标: u={uv[0, 0]:.1f}, v={uv[0, 1]:.1f}")
+    print("\nTest completed")
 
 
 if __name__ == '__main__':

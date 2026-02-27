@@ -1,165 +1,81 @@
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.8)
 project(perception)
 
-# C++14 for RViz panel
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
-# Qt5 for RViz panel
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTORCC ON)
+# ========== Dependencies ==========
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-find_package(catkin REQUIRED COMPONENTS
-  rospy
-  roscpp
-  std_msgs
-  sensor_msgs
-  geometry_msgs
-  visualization_msgs
-  message_generation
-  rviz
-)
-
-find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
-
-# Python setup
-catkin_python_setup()
-
-################################################
-## Declare ROS messages, services and actions ##
-################################################
-
-add_message_files(
-  FILES
-  Object3D.msg
-  Object3DArray.msg
-  TrackedObject3D.msg
-  TrackedObject3DArray.msg
-  GraspResult.msg
-  GraspObject.msg
-  GraspObjectArray.msg
-  PerceptionConfig.msg
-  PerceptionStatus.msg
-)
-
-add_service_files(
-  FILES
-  DetectObjects.srv
-  GraspDetect.srv
-)
-
-generate_messages(
+# ========== Messages / Services ==========
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/Object3D.msg"
+  "msg/Object3DArray.msg"
+  "msg/TrackedObject3D.msg"
+  "msg/TrackedObject3DArray.msg"
+  "msg/GraspObject.msg"
+  "msg/GraspObjectArray.msg"
+  "msg/GraspResult.msg"
+  "msg/PerceptionConfig.msg"
+  "msg/PerceptionStatus.msg"
+  "srv/DetectObjects.srv"
+  "srv/GraspDetect.srv"
   DEPENDENCIES
-  std_msgs
-  geometry_msgs
-)
-
-###################################
-## catkin specific configuration ##
-###################################
-
-catkin_package(
-  INCLUDE_DIRS include
-  LIBRARIES percept_3d_panel percept_grasp_panel
-  CATKIN_DEPENDS
-    rospy
-    roscpp
     std_msgs
-    sensor_msgs
     geometry_msgs
-    visualization_msgs
-    message_runtime
-    rviz
+    builtin_interfaces
 )
 
-###########
-## Build ##
-###########
+# ========== Python ==========
+# Install Python modules alongside rosidl-generated code (local/ prefix is on PYTHONPATH)
+set(_py_dir "local/lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/dist-packages")
 
-include_directories(
-  include
-  ${catkin_INCLUDE_DIRS}
-  ${Qt5Core_INCLUDE_DIRS}
-  ${Qt5Widgets_INCLUDE_DIRS}
-)
-
-# Qt5 MOC for headers with Q_OBJECT
-qt5_wrap_cpp(MOC_FILES_3D
-  include/perception/percept_3d_panel.h
-)
-
-qt5_wrap_cpp(MOC_FILES_GRASP
-  include/perception/percept_grasp_panel.h
-)
-
-# RViz Panel libraries
-add_library(percept_3d_panel
-  src/percept_3d_panel.cpp
-  ${MOC_FILES_3D}
-)
-
-add_dependencies(percept_3d_panel
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-  ${catkin_EXPORTED_TARGETS}
-)
-
-target_link_libraries(percept_3d_panel
-  ${catkin_LIBRARIES}
-  Qt5::Core
-  Qt5::Widgets
-)
-
-add_library(percept_grasp_panel
-  src/percept_grasp_panel.cpp
-  ${MOC_FILES_GRASP}
-)
-
-add_dependencies(percept_grasp_panel
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-  ${catkin_EXPORTED_TARGETS}
-)
-
-target_link_libraries(percept_grasp_panel
-  ${catkin_LIBRARIES}
-  Qt5::Core
-  Qt5::Widgets
-)
-
-#############
-## Install ##
-#############
-
-catkin_install_python(PROGRAMS
-  src/scene_perception_3d_node.py
-  src/scene_perception_core.py
-  src/synced_sensor_subscriber.py
-  src/coordinate_transformer.py
+install(FILES
   src/percept.py
-  src/ros_lidar.py
-  src/perception_visualizer.py
-  src/perception_grasp_node.py
-  src/perception_grasp_rviz_node.py
-  src/perception_rviz_node.py
-  src/object_tracker_node.py
-  src/perception_viz_node.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+  src/coordinate_transformer.py
+  src/scene_perception_core.py
+  src/dual_camera_matcher.py
+  src/intelligent_fusion.py
+  src/camera_confidence_model.py
+  src/byte_tracker_3d.py
+  src/synced_sensor_subscriber.py
+  src/utils.py
+  src/percept_benchmark.py
+  DESTINATION "${_py_dir}/perception"
 )
 
-install(TARGETS percept_3d_panel percept_grasp_panel
-  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-  RUNTIME DESTINATION ${CATKIN_GLOBAL_BIN_DESTINATION}
+# Install Python nodes as executables (strip .py suffix for ROS2 convention)
+set(_node_scripts
+  scene_perception_3d_node
+  object_tracker_node
+  perception_viz_node
+  perception_grasp_node
+  perception_grasp_rviz_node
+  multi_camera_perception_node
+  perception_rviz_node
+  multi_camera_rviz_node
+  dual_camera_baselink_validation
+  percept_benchmark
+)
+foreach(_script ${_node_scripts})
+  install(PROGRAMS "src/${_script}.py"
+    DESTINATION lib/${PROJECT_NAME}
+    RENAME ${_script}
+  )
+endforeach()
+
+# ========== Config / Launch / RViz ==========
+install(DIRECTORY config launch rviz
+  DESTINATION share/${PROJECT_NAME}
 )
 
-install(FILES plugin_description.xml
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-)
+# ========== Export ==========
+ament_export_dependencies(rosidl_default_runtime)
 
-install(DIRECTORY include/${PROJECT_NAME}/
-  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
-)
-
-install(DIRECTORY launch config
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-)
+ament_package()

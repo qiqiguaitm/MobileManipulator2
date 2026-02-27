@@ -218,23 +218,27 @@ def generate_launch_description():
 
     # ==================== Perception Nodes ====================
     perception_nodes = []
-    if _is_package_available('perception_nodes'):
-        bringup_share = get_package_share_directory('perception_bringup')
-        perception_config_dir = os.path.join(bringup_share, 'config')
+    if _is_package_available('perception'):
+        perception_share = get_package_share_directory('perception')
+        perception_config_dir = os.path.join(perception_share, 'config')
 
         # Perception Grasp detection node
+        perception_grasp_config = os.path.join(perception_config_dir, 'perception_grasp.yaml')
         perception_grasp_node = Node(
             condition=IfCondition(LaunchConfiguration('perception')),
-            package='perception_nodes',
+            package='perception',
             executable='perception_grasp_node',
             name='perception_grasp_node',
             output='screen',
             respawn=True,
             respawn_delay=3.0,
-            parameters=[{
-                'trigger.realtime_mode.enabled': False,  # 手动触发模式，不自动检测
-                'trigger.realtime_mode.rate': 1.0,
-            }],
+            parameters=[
+                perception_grasp_config if os.path.exists(perception_grasp_config) else {},
+                {
+                    'trigger.realtime_mode.enabled': True,  # 自动检测模式
+                    'trigger.realtime_mode.rate': 1.0,      # 检测频率 1Hz
+                },
+            ],
         )
         perception_nodes.append(perception_grasp_node)
 
@@ -242,7 +246,7 @@ def generate_launch_description():
         perception_rviz_config = os.path.join(perception_config_dir, 'perception_grasp_rviz.yaml')
         perception_grasp_rviz_node = Node(
             condition=IfCondition(LaunchConfiguration('perception')),
-            package='perception_nodes',
+            package='perception',
             executable='perception_grasp_rviz_node',
             name='perception_grasp_rviz_node',
             output='screen',

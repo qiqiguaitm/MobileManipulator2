@@ -11,10 +11,7 @@ source "$SCRIPT_DIR/_ros2_env.sh"
 
 # 感知包列表
 PERCEPTION_PACKAGES=(
-    "perception_interfaces"
-    "perception_core"
-    "perception_nodes"
-    "perception_bringup"
+    "perception"
 )
 
 # 相机驱动包
@@ -125,7 +122,7 @@ verify_build() {
     # 检查 launch 文件
     echo ""
     echo "  检查 launch 文件..."
-    local LAUNCH_DIR="$WS_DIR/install/perception_bringup/share/perception_bringup/launch"
+    local LAUNCH_DIR="$WS_DIR/install/perception/share/perception/launch"
 
     for launch in perception_3d_rviz.launch.py multi_camera_3d_rviz.launch.py; do
         if [ -f "$LAUNCH_DIR/$launch" ]; then

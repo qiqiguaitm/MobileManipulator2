@@ -26,8 +26,8 @@ import tf2_ros
 from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PointStamped
 
-from perception_interfaces.srv import DetectObjects
-from perception_interfaces.msg import Object3D
+from perception.srv import DetectObjects
+from perception.msg import Object3D
 
 from approach_navigator.navigator import ApproachNavigator
 from approach_navigator.nav_types import NavStage

@@ -456,7 +456,6 @@ void PiperGraspPanel::setupUi()
 
     // Set reasonable size policy for RViz2 dock
     setMinimumWidth(280);
-    setMaximumWidth(400);
 }
 
 void PiperGraspPanel::setupRos()

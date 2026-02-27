@@ -193,8 +193,8 @@ if [ "$SKIP_PERCEPTION" = "false" ]; then
     LAUNCH_FILE="multi_camera_perception.launch.py"
     PERCEPTION_ARGS="use_camera_driver:=false auto_detect_rate:=1.0"
 
-    echo "   启动: ros2 launch perception_bringup $LAUNCH_FILE $PERCEPTION_ARGS"
-    ros2 launch perception_bringup $LAUNCH_FILE $PERCEPTION_ARGS > /tmp/perception.log 2>&1 &
+    echo "   启动: ros2 launch perception $LAUNCH_FILE $PERCEPTION_ARGS"
+    ros2 launch perception $LAUNCH_FILE $PERCEPTION_ARGS > /tmp/perception.log 2>&1 &
     PERCEPTION_PID=$!
 
     # 等待感知节点启动
