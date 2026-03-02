@@ -44,3 +44,11 @@ _deprecated_*
 samples/*.png
 samples/*.jpg
 samples/*.npy
+
+# Calibration raw data (large bag files and image sets)
+calibration_data/
+src/cam_lidar_calibration/data/calib_bags_*/
+
+# Benchmark assets
+scripts/bench_client.tar.gz
+scripts/bench_images/

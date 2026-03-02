@@ -117,6 +117,12 @@ def generate_launch_description():
         description="Extrinsics file suffix for chassis camera (e.g., '_new' for testing)"
     )
 
+    # CDM 深度优化开关
+    enable_depth_optimizer_arg = DeclareLaunchArgument(
+        'enable_depth_optimizer', default_value='true',
+        description='Enable CDM depth optimization (set false to use raw RealSense depth)'
+    )
+
     # ==================== Included Launches ====================
     
     # 条件启动相机驱动
@@ -160,6 +166,7 @@ def generate_launch_description():
             {'target_frame': 'base_link'},
             {'extrinsics_dir': config_dir},
             {'extrinsics_suffix': LaunchConfiguration('extrinsics_suffix')},
+            {'enable_depth_optimizer': LaunchConfiguration('enable_depth_optimizer')},
             # 数据新鲜度配置
             {'data_max_age': 2.0},
             {'strict_data_freshness': False},
@@ -266,6 +273,7 @@ def generate_launch_description():
         rviz_arg,
         publish_rate_arg,
         extrinsics_suffix_arg,
+        enable_depth_optimizer_arg,
 
         # TF 基础
         base_tf_node,

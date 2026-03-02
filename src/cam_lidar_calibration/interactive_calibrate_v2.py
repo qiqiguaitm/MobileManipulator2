@@ -177,7 +177,7 @@ def auto_select_board_points(points_3d, cam_corners_3d, init_R, init_t, board_si
 
 
 def select_board_roi_3d(points_3d, image, corners_2d, frame_idx, cam_distance=None, ground_z=None, ground_z_std=None,
-                         data_dir=None, test_mode=False):
+                         data_dir=None, test_mode=False, R_l2c=None, t_l2c=None):
     """使用matplotlib 2D可视化选择LiDAR点云中的标定板区域"""
     # 测试模式：从缓存加载ROI
     if test_mode and data_dir:
@@ -786,6 +786,7 @@ def main():
         print(f"\n[警告] 初始外参不存在: {init_extrinsic_file}")
         init_R = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=float)
         init_t = np.array([0.0, 0.46, 0.43])
+        R_tf, t_tf = None, None
 
     print("\n" + "="*60)
     print("3D投影引导标定 - 自动定位 + 交互确认")

@@ -22,7 +22,7 @@
     detector_warmup: 2              # DINO-X 预热次数，0=禁用
 
     # 深度优化服务 (CDM)
-    depth_optimizer_url: http://192.168.112.14:8081
+    depth_optimizer_url: http://192.168.112.14:8082
     enable_depth_optimizer: true
     depth_optimizer_warmup: 2       # CDM 预热次数，0=禁用
 

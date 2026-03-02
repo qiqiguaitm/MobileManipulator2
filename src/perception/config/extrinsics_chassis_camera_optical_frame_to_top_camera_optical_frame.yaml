@@ -1,0 +1,22 @@
+# Extrinsics: chassis_camera_optical_frame -> top_camera_optical_frame
+# P_chassis = R * P_top + T
+# OpenCV stereoCalibrate, 58 image pairs, RMS=4.0553 px
+
+header:
+  calibration_date: '2026-03-02'
+  method: opencv_stereo_calibration
+  source: OpenCV stereoCalibrate (CALIB_FIX_INTRINSIC)
+
+frame_id: chassis_camera_optical_frame
+child_frame_id: top_camera_optical_frame
+
+transform:
+  translation:
+    x: 0.0658585388364570
+    y: -0.6269628240023285
+    z: -0.4481899522281133
+  rotation:
+    x: -0.1207096849663353
+    y: -0.0380868796598664
+    z: 0.0159563564408248
+    w: 0.9918285921681408

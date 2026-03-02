@@ -151,33 +151,33 @@ class RealtimeChecker:
 
         # 质量评估
         if rms > 3.0:
-            quality = "差"
+            quality = "POOR"
             quality_color = (0, 0, 255)  # 红色
-            recommendation = "建议重新调整，倾斜角度过大或内参不准"
+            recommendation = "Adjust board - tilt too large or intrinsics off"
         elif rms > 1.5:
-            quality = "中等"
+            quality = "OK"
             quality_color = (0, 165, 255)  # 橙色
-            recommendation = "可接受，但建议减小倾斜角度"
+            recommendation = "Acceptable - reduce tilt for better result"
         else:
-            quality = "良好"
+            quality = "GOOD"
             quality_color = (0, 255, 0)  # 绿色
-            recommendation = "质量良好，可以录制"
+            recommendation = "Ready to record"
 
-        # 绘制文本
+        # 绘制文本 (ASCII only - cv2.putText 不支持 Unicode)
         y = 30
-        cv2.putText(panel, "实时质量检测", (10, y),
+        cv2.putText(panel, "Quality Check", (10, y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         y += 40
-        cv2.putText(panel, f"重投影误差: RMS={rms:.2f}px  Mean={mean:.2f}px  Max={max_err:.2f}px",
+        cv2.putText(panel, "Reproj: RMS=%.2fpx  Mean=%.2fpx  Max=%.2fpx" % (rms, mean, max_err),
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         y += 35
-        cv2.putText(panel, f"标定板倾斜角度: {angle_deg:.1f} deg",
+        cv2.putText(panel, "Board tilt: %.1f deg" % angle_deg,
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         y += 35
-        cv2.putText(panel, f"质量: {quality}",
+        cv2.putText(panel, quality,
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, quality_color, 2)
 
         y += 35

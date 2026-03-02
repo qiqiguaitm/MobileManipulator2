@@ -19,7 +19,6 @@ import numpy as np
 
 try:
     import tkinter as tk
-    from tkinter import font as tkfont
     HAS_TK = True
 except ImportError:
     HAS_TK = False
@@ -55,6 +54,27 @@ CAMERA_CONFIG = {
         'node_prefix': 'camera/chassis',
     }
 }
+
+# ROS2 环境隔离：确保 subprocess 在干净环境中执行，不受 conda 污染
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WS_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..'))
+_ROS2_ENV_SCRIPT = os.path.join(_WS_DIR, 'scripts', '_ros2_env.sh')
+
+
+def _ros2_cmd(cmd):
+    """Wrap a command with ROS2 environment setup for subprocess calls."""
+    # unset opencv 注入的 Qt 路径，防止污染 RViz 等 Qt 应用
+    qt_cleanup = 'unset QT_QPA_PLATFORM_PLUGIN_PATH QT_PLUGIN_PATH; '
+    if os.path.exists(_ROS2_ENV_SCRIPT):
+        return qt_cleanup + 'source %s && setup_ros2_env && %s' % (_ROS2_ENV_SCRIPT, cmd)
+    return (
+        qt_cleanup +
+        'export PATH="/usr/bin:$PATH" && '
+        'source /opt/ros/humble/setup.bash && '
+        'source %s/install/setup.bash 2>/dev/null; '
+        '%s' % (_WS_DIR, cmd)
+    )
+
 
 # LiDAR 配置
 LIDAR_TOPIC = '/rslidar_points'
@@ -325,12 +345,11 @@ def save_camera_info(save_dir, camera_type, cam_cfg, K, D, pattern_size, square_
 
 
 class InfoWindow:
-    """提示信息窗口 - 显示在 RViz 旁边"""
+    """提示信息窗口 - 纯文本，不依赖特定字体或主题"""
 
     def __init__(self):
         self.root = None
-        self.pose_label = None
-        self.checklist_frame = None
+        self.text_widget = None
         self.thread = None
         self.running = False
 
@@ -344,125 +363,30 @@ class InfoWindow:
         self.thread = threading.Thread(target=self._run)
         self.thread.daemon = True
         self.thread.start()
-        time.sleep(0.5)  # 等待窗口创建
+        time.sleep(0.5)
 
     def _run(self):
         """窗口主循环"""
         self.root = tk.Tk()
-        self.root.title("标定采集助手")
-        self.root.geometry("420x650+50+50")
-        self.root.configure(bg='#2b2b2b')
+        self.root.title("Calibration Assistant")
+        self.root.geometry("450x500+50+50")
         self.root.attributes('-topmost', True)
 
-        # 标题
-        title = tk.Label(
-            self.root,
-            text="标定数据采集",
-            font=('Arial', 16, 'bold'),
-            fg='#61afef',
-            bg='#2b2b2b'
+        # 单个 Text widget，最简单最可靠
+        self.text_widget = tk.Text(self.root, wrap='word', state='disabled')
+        self.text_widget.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self._set_text(
+            "=== Calibration Data Collection ===\n\n"
+            "Waiting to start...\n\n"
+            "--- Checklist ---\n"
+            "[Image] Chessboard fully visible, no blur, even lighting\n"
+            "[LiDAR] >= 5 scan lines on board, clear separation\n\n"
+            "--- Controls (in terminal) ---\n"
+            "  y = record    n = retry\n"
+            "  s = skip      q = quit\n"
         )
-        title.pack(pady=(15, 10))
 
-        # 姿态信息框
-        pose_frame = tk.LabelFrame(
-            self.root,
-            text=" 当前目标姿态 ",
-            font=('Arial', 11, 'bold'),
-            fg='#98c379',
-            bg='#2b2b2b',
-            padx=10,
-            pady=10
-        )
-        pose_frame.pack(fill='x', padx=15, pady=10)
-
-        self.pose_label = tk.Label(
-            pose_frame,
-            text="等待开始...",
-            font=('Consolas', 10),
-            fg='#abb2bf',
-            bg='#2b2b2b',
-            justify='left',
-            anchor='w'
-        )
-        self.pose_label.pack(fill='x')
-
-        # 检查清单框
-        self.checklist_frame = tk.LabelFrame(
-            self.root,
-            text=" 数据质量检查清单 ",
-            font=('Arial', 11, 'bold'),
-            fg='#e5c07b',
-            bg='#2b2b2b',
-            padx=10,
-            pady=10
-        )
-        self.checklist_frame.pack(fill='x', padx=15, pady=10)
-
-        checklist_text = """【图像检查 - 左侧面板】
-  □ 棋盘格四周白边完整可见
-  □ 图像清晰，无运动模糊
-  □ 光线均匀，无强反光
-
-【点云检查 - 3D视图】
-  □ 在RViz中找到标定板位置的点云
-  □ 数一下有几条水平扫描线(需≥5条)
-  □ 点云清晰，与背景有分离
-
-提示: 用鼠标拖动旋转3D视角
-     从侧面看更容易数扫描线"""
-
-        checklist_label = tk.Label(
-            self.checklist_frame,
-            text=checklist_text,
-            font=('Consolas', 10),
-            fg='#abb2bf',
-            bg='#2b2b2b',
-            justify='left',
-            anchor='w'
-        )
-        checklist_label.pack(fill='x')
-
-        # 操作提示框
-        ops_frame = tk.LabelFrame(
-            self.root,
-            text=" 操作指南 ",
-            font=('Arial', 11, 'bold'),
-            fg='#c678dd',
-            bg='#2b2b2b',
-            padx=10,
-            pady=10
-        )
-        ops_frame.pack(fill='x', padx=15, pady=10)
-
-        ops_text = """在终端中输入:
-  y - 确认录制
-  n - 重新调整标定板
-  s - 跳过当前姿态
-  q - 退出采集"""
-
-        ops_label = tk.Label(
-            ops_frame,
-            text=ops_text,
-            font=('Consolas', 10),
-            fg='#abb2bf',
-            bg='#2b2b2b',
-            justify='left',
-            anchor='w'
-        )
-        ops_label.pack(fill='x')
-
-        # 状态栏
-        self.status_label = tk.Label(
-            self.root,
-            text="状态: 准备就绪",
-            font=('Arial', 10),
-            fg='#56b6c2',
-            bg='#2b2b2b'
-        )
-        self.status_label.pack(pady=(15, 10))
-
-        # 运行主循环
         while self.running:
             try:
                 self.root.update()
@@ -470,38 +394,45 @@ class InfoWindow:
             except:
                 break
 
+    def _set_text(self, text):
+        """Replace all text content."""
+        if not self.text_widget:
+            return
+        try:
+            self.text_widget.config(state='normal')
+            self.text_widget.delete('1.0', 'end')
+            self.text_widget.insert('1.0', text)
+            self.text_widget.config(state='disabled')
+        except:
+            pass
+
     def update_pose(self, pose):
         """更新姿态信息"""
-        if not self.root or not self.pose_label:
+        if not self.text_widget:
             return
-
-        pose_text = """姿态 #{id}: {name}
-
-  距离:     {distance}
-  水平位置: {position}
-  俯仰角:   {pitch}
-  偏航角:   {yaw}
-
-  目的: {purpose}""".format(**pose)
-
-        # 添加警告提示（如果有）
+        text = (
+            "=== Pose #{id}: {name} ===\n\n"
+            "  Distance : {distance}\n"
+            "  Position : {position}\n"
+            "  Pitch    : {pitch}\n"
+            "  Yaw      : {yaw}\n"
+            "  Purpose  : {purpose}\n"
+        ).format(**pose)
         if 'warning' in pose:
-            pose_text += "\n\n  ⚠️ 注意: %s" % pose['warning']
-
-        try:
-            self.pose_label.config(text=pose_text)
-            self.status_label.config(text="状态: 请检查预览窗口中的数据质量")
-        except:
-            pass
+            text += "\n  WARNING: %s\n" % pose['warning']
+        text += (
+            "\n--- Checklist ---\n"
+            "[Image] Chessboard fully visible, no blur, even lighting\n"
+            "[LiDAR] >= 5 scan lines on board, clear separation\n\n"
+            "--- Controls (in terminal) ---\n"
+            "  y = record    n = retry\n"
+            "  s = skip      q = quit\n"
+        )
+        self._set_text(text)
 
     def update_status(self, status):
-        """更新状态"""
-        if not self.root or not self.status_label:
-            return
-        try:
-            self.status_label.config(text="状态: %s" % status)
-        except:
-            pass
+        """更新状态 - append to end"""
+        pass  # Status already shown in terminal
 
     def stop(self):
         """停止窗口"""
@@ -556,7 +487,9 @@ def get_running_nodes():
     """获取当前运行的 ROS 节点列表"""
     try:
         result = subprocess.check_output(
-            ['ros2', 'node', 'list'], stderr=subprocess.DEVNULL, timeout=5
+            _ros2_cmd('ros2 node list'),
+            shell=True, executable='/bin/bash',
+            stderr=subprocess.DEVNULL, timeout=5
         )
         return result.decode('utf-8').strip().split('\n')
     except Exception:
@@ -622,18 +555,18 @@ def start_drivers(camera_type):
 
     # 启动 LiDAR 驱动
     print("  [启动] LiDAR 驱动 (rslidar_sdk)...")
-    lidar_cmd = "ros2 launch rslidar_sdk start.py"
+    lidar_cmd = _ros2_cmd("ros2 launch rslidar_sdk start.py")
     lidar_proc = subprocess.Popen(
-        lidar_cmd, shell=True,
+        lidar_cmd, shell=True, executable='/bin/bash',
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     _background_processes.append(lidar_proc)
 
     # 启动相机驱动
     print("  [启动] 相机驱动 (%s)..." % cam_cfg['name'])
-    camera_cmd = "ros2 launch camera_driver camera_driver.launch.py %s" % cam_cfg['launch_arg']
+    camera_cmd = _ros2_cmd("ros2 launch camera_driver camera_driver.launch.py %s" % cam_cfg['launch_arg'])
     camera_proc = subprocess.Popen(
-        camera_cmd, shell=True,
+        camera_cmd, shell=True, executable='/bin/bash',
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     _background_processes.append(camera_proc)
@@ -648,7 +581,9 @@ def check_topic_available(topic, timeout=5):
     """检查 ROS topic 是否可用"""
     try:
         result = subprocess.check_output(
-            ['ros2', 'topic', 'list'], stderr=subprocess.STDOUT, timeout=timeout
+            _ros2_cmd('ros2 topic list'),
+            shell=True, executable='/bin/bash',
+            stderr=subprocess.STDOUT, timeout=timeout
         )
         topics = result.decode('utf-8').strip().split('\n')
         return topic in topics
@@ -699,13 +634,7 @@ def start_combined_preview(image_topic):
     print("\n[预览] 启动可视化窗口 (RViz)...")
 
     # 创建 RViz 配置文件，同时显示图像和点云
-    rviz_config = """Panels:
-  - Class: rviz_default_plugins/Displays
-    Name: Displays
-  - Class: rviz_default_plugins/Views
-    Name: Views
-Visualization Manager:
-  Class: ""
+    rviz_config = """Visualization Manager:
   Displays:
     - Class: rviz_default_plugins/Grid
       Name: Grid
@@ -719,15 +648,13 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /lidar/chassis/point_cloud
+        Value: {lidar_topic}
       Size (m): 0.05
       Size (Pixels): 3
       Style: Points
       Color Transformer: AxisColor
       Axis: Z
       Enabled: true
-      Decay Time: 0
-      Value: true
     - Class: rviz_default_plugins/Image
       Name: Camera Image
       Topic:
@@ -737,11 +664,9 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: {image_topic}
       Enabled: true
-      Value: true
   Global Options:
     Fixed Frame: rslidar
     Frame Rate: 30
-  Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
@@ -755,29 +680,33 @@ Visualization Manager:
         X: 0
         Y: 0
         Z: 0
-Window Geometry:
-  Displays:
-    collapsed: false
-  Height: 800
-  Width: 1200
-  X: 100
-  Y: 100
-  Camera Image:
-    collapsed: false
-""".format(image_topic=image_topic)
+""".format(image_topic=image_topic, lidar_topic=LIDAR_TOPIC)
 
     config_path = "/tmp/calib_preview.rviz"
     with open(config_path, 'w') as f:
         f.write(rviz_config)
 
-    cmd = "ros2 run rviz2 rviz2 -d %s" % config_path
+    cmd = _ros2_cmd("ros2 run rviz2 rviz2 -d %s" % config_path)
     proc = subprocess.Popen(
-        cmd, shell=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        cmd, shell=True, executable='/bin/bash',
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     _preview_processes.append(proc)
 
     time.sleep(3)  # 等待窗口打开
+
+    if proc.poll() is not None:
+        # RViz 已退出，显示错误
+        stderr_output = proc.stderr.read().decode('utf-8', errors='replace')
+        print("  [错误] RViz 启动失败:")
+        for line in stderr_output.strip().split('\n')[-5:]:
+            print("    %s" % line)
+        display = os.environ.get('DISPLAY', '未设置')
+        print("  [提示] 当前 DISPLAY=%s" % display)
+        if not display or display == '未设置':
+            print("  [提示] 请设置 DISPLAY 环境变量，例如: export DISPLAY=:1")
+        return None
+
     print("  [OK] RViz 预览窗口已启动 (图像 + 点云)")
     print("  [提示] 请在 RViz 中调整视角，确保能同时看到图像和点云")
 
@@ -839,9 +768,15 @@ def quality_check_with_confirmation(checker, timeout=60):
 
     start_time = time.time()
     last_result = None
+    window_name = "Quality Check (q=ok r=retry s=skip ESC=quit)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 960, 720)
 
     while time.time() - start_time < timeout:
-        result = checker.show_live_preview("实时质量检测 - 按q确认/r重调/s跳过")
+        # 刷新 ROS 订阅，获取最新图像
+        if _node is not None:
+            rclpy.spin_once(_node, timeout_sec=0.01)
+        result = checker.show_live_preview(window_name)
 
         if result and result['success']:
             last_result = result
@@ -954,8 +889,8 @@ def main():
     parser.add_argument(
         '-d', '--duration',
         type=int,
-        default=2,
-        help='每个位置的录制时长(秒), 默认 2 秒'
+        default=3,
+        help='每个位置的录制时长(秒), 默认 3 秒'
     )
     parser.add_argument(
         '-o', '--output',
@@ -1208,10 +1143,38 @@ def main():
                     _info_window.update_status("正在录制...")
 
                 bag_name = os.path.join(save_dir, "%s_pose_%d" % (args.camera, pose['id']))
-                print("  [录制中] %s" % bag_name)
+                print("  [录制中] %s (%d秒)..." % (bag_name, args.duration))
 
-                cmd = "timeout %d ros2 bag record -o %s %s" % (args.duration, bag_name, topics)
-                subprocess.call(cmd, shell=True)
+                cmd = _ros2_cmd("ros2 bag record -o %s %s" % (bag_name, topics))
+                rec_proc = subprocess.Popen(
+                    cmd, shell=True, executable='/bin/bash',
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    preexec_fn=os.setsid
+                )
+                # 阶段1: 等 ros2 bag record 进程启动（db3 文件出现）
+                bag_db = os.path.join(bag_name, os.path.basename(bag_name) + '_0.db3')
+                for _wait in range(20):
+                    if os.path.exists(bag_db):
+                        break
+                    time.sleep(0.5)
+                else:
+                    print("  [警告] bag 文件未创建，ros2 bag record 可能启动失败")
+
+                # 阶段2: 等 DDS 完成 topic 发现（必须固定等，db3 文件大小不能判断）
+                # SQLite schema 初始化就 4096 字节，但 topic 发现需要 3-4 秒
+                print("  [等待] DDS topic 发现中...")
+                time.sleep(4)
+
+                # 阶段3: 实际录制时长
+                print("  [录制] 开始录制 %d 秒..." % args.duration)
+                time.sleep(args.duration)
+                # SIGINT = Ctrl+C，ros2 bag record 的标准停止方式
+                os.killpg(os.getpgid(rec_proc.pid), signal.SIGINT)
+                try:
+                    rec_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(rec_proc.pid), signal.SIGKILL)
+                    rec_proc.wait()
 
                 print("  [完成] 姿态 #%d 录制完成" % pose['id'])
                 recorded_count += 1

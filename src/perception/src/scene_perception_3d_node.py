@@ -145,7 +145,7 @@ class ScenePerception3DNode(Node):
         self.detector_warmup = self.get_parameter('detector_warmup').value
 
         # 深度优化服务
-        self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8081')
+        self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8082')
         self.declare_parameter('enable_depth_optimizer', True)
         self.declare_parameter('depth_optimizer_warmup', 0)
         self.depth_optimizer_url = self.get_parameter('depth_optimizer_url').value

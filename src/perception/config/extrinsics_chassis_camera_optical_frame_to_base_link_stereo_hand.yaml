@@ -1,36 +1,23 @@
 # Extrinsics: chassis_camera_optical_frame -> base_link
-# Computed via stereo hand-camera chain (2026-03-02)
-#
-# Chain:
-#   T_{chassis_cam <- base_link}
-#     = T_{chassis_cam <- hand_cam}        [MATLAB stereo calibration]
-#     @ T_{hand_cam <- flange}^{-1}        [inv of hand-eye: extrinsics_flan_to_hand_camera.yaml]
-#     @ T_{arm_base <- flange}^{-1}        [inv of flange pose at capture time]
-#     @ T_{arm_base <- base_link}          [extrinsics_arm_base_link_to_base_link.yaml]
-#
-# Flange pose at capture: x=60.49mm y=3.643mm z=550.536mm
-#                         roll=-166.498 pitch=83.085 yaw=-163.317 deg
-#
-# Compare with top-camera chain (extrinsics_chassis_camera_optical_frame_to_base_link_new.yaml):
-#   rotation diff: 8.3 deg
-#   translation diff: 83.6mm (dx=8.0 dy=-80.7 dz=20.2 mm)
+# Chain: chassis_camera_optical_frame → hand_camera_optical_frame → flange → arm_base → base_link
+# hand_eye: src/perception/config/extrinsics_flan_to_hand_camera.yaml
+# arm_pose: calibration_data/multi_eye_20260302_113545/arm_pose.yaml
 
 header:
   calibration_date: '2026-03-02'
-  source: 'stereo chain: chassis_cam -> hand_cam -> flange -> arm_base -> base_link'
-  method: matlab_stereo_calibration + hand_eye + flange_pose
-  stereo_data: calibration_data/multi_eye_20260302_113545
-  hand_eye_source: extrinsics_flan_to_hand_camera.yaml (2026-01-26)
-  frame_id: chassis_camera_optical_frame
-  child_frame_id: base_link
+  method: opencv_stereo_calibration
+  source: OpenCV stereoCalibrate (CALIB_FIX_INTRINSIC)
+
+frame_id: chassis_camera_optical_frame
+child_frame_id: base_link
 
 transform:
   translation:
-    x: 0.0510261196341916
-    y: -0.0655529430965116
-    z: -0.3733429307129112
+    x: 0.0509737948802520
+    y: -0.0651497198191526
+    z: -0.3745784113475262
   rotation:
-    x: 0.4671838488074396
-    y: -0.4706261621485101
-    z: 0.5108055378933504
-    w: 0.5471087363333880
+    x: 0.4673898451356447
+    y: -0.4695859326278088
+    z: 0.5104637932645492
+    w: 0.5481445979922783

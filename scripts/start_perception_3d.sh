@@ -36,6 +36,7 @@ SKIP_CAMERA="false"
 RUN_TEST="false"
 CUSTOM_PROMPT=""
 EXTRINSICS_SUFFIX=""
+ENABLE_CDM="true"
 
 # ============================================================================
 # 解析参数
@@ -65,6 +66,9 @@ for arg in "$@"; do
             ;;
         --extrinsics-suffix=*)
             EXTRINSICS_SUFFIX="${arg#*=}"
+            ;;
+        --no-cdm)
+            ENABLE_CDM="false"
             ;;
         -h|--help)
             head -25 "$0" | tail -23
@@ -218,12 +222,18 @@ if [ -n "$EXTRINSICS_SUFFIX" ]; then
     echo -e "${YELLOW}   使用新外参: $EXTRINSICS_SUFFIX${NC}"
 fi
 
-echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG"
+CDM_ARG=""
+if [ "$ENABLE_CDM" = "false" ]; then
+    CDM_ARG="enable_depth_optimizer:=false"
+    echo -e "${YELLOW}   CDM 深度优化: 已禁用 (使用原始深度)${NC}"
+fi
+
+echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG"
 echo ""
 
 # 如果需要测试，后台启动
 if [ "$RUN_TEST" = "true" ]; then
-    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG > /tmp/perception_launch.log 2>&1 &
+    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG > /tmp/perception_launch.log 2>&1 &
     LAUNCH_PID=$!
 
     # 等待节点启动
@@ -270,5 +280,5 @@ if [ "$RUN_TEST" = "true" ]; then
     wait $LAUNCH_PID
 else
     # 前台启动
-    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG
+    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG
 fi

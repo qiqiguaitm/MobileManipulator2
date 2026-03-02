@@ -302,6 +302,29 @@ class ScenePerceptionCore:
             # 中值质心
             centroid_optical = np.median(points, axis=0)
 
+            # === DEBUG: 详细 3D 测量诊断 ===
+            _obj_id = det.get('object_id', '?')
+            _v_median = float(np.median(ys_img))
+            _u_median = float(np.median(xs_img))
+            _v_min, _v_max = float(ys_img.min()), float(ys_img.max())
+            _u_min, _u_max = float(xs_img.min()), float(xs_img.max())
+            import logging
+            _dbg_log = logging.getLogger('perception_debug')
+            _dbg_log.warning(
+                f'[DEBUG-3D] {_obj_id} bbox=[{x1},{y1},{x2},{y2}] '
+                f'mask_raw={int(mask_roi.sum())}px eroded={int(eroded_roi.sum())}px '
+                f'valid_3d={int(valid2.sum())}px | '
+                f'depth: min={ds_valid.min():.4f} max={ds_valid.max():.4f} '
+                f'median={np.median(ds_valid):.4f} mean={np.mean(ds_valid):.4f} '
+                f'q1={q1:.4f} q3={q3:.4f} iqr={iqr:.4f} '
+                f'bounds=[{lower_bound:.4f},{upper_bound:.4f}] | '
+                f'pixel_u: [{_u_min:.0f},{_u_max:.0f}] median={_u_median:.0f} '
+                f'pixel_v: [{_v_min:.0f},{_v_max:.0f}] median={_v_median:.0f} | '
+                f'centroid_opt=({centroid_optical[0]:.4f}, {centroid_optical[1]:.4f}, {centroid_optical[2]:.4f}) '
+                f'intrinsics: fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}'
+            )
+            # === END DEBUG ===
+
             # 坐标变换
             if skip_transform:
                 centroid_target = centroid_optical

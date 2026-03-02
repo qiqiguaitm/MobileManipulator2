@@ -1,0 +1,17 @@
+child_frame_id: top_camera_optical_frame
+frame_id: chassis_camera_optical_frame
+header:
+  calibration_date: '2026-02-26'
+  method: matlab_stereo_calibration
+  source: MATLAB Stereo Camera Calibrator App
+  note: 'Camera1=Top, Camera2=Chassis in MATLAB. This transform: P_chassis = T * P_top'
+transform:
+  rotation:
+    w: 0.999285296505578
+    x: -0.034377785183154
+    y: -0.007949707925959
+    z: 0.013559727783092
+  translation:
+    x: 0.0487296
+    y: -0.5683723
+    z: -0.5246799

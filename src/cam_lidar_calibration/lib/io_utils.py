@@ -40,11 +40,31 @@ def load_intrinsics(yaml_path):
 
 
 def load_pcd(pcd_path):
-    """加载PCD点云"""
-    import open3d as o3d
-    pcd = o3d.io.read_point_cloud(pcd_path)
-    points = np.asarray(pcd.points)
-    # 移除NaN
+    """加载PCD点云 (纯numpy实现，无需open3d)"""
+    with open(pcd_path, 'rb') as f:
+        # 解析header
+        n_points = 0
+        fields = []
+        data_type = 'ascii'
+        while True:
+            line = f.readline().decode('ascii', errors='ignore').strip()
+            if line.startswith('FIELDS'):
+                fields = line.split()[1:]
+            elif line.startswith('POINTS'):
+                n_points = int(line.split()[1])
+            elif line.startswith('DATA'):
+                data_type = line.split()[1]
+                break
+
+        n_fields = len(fields)
+        if data_type == 'binary':
+            raw = f.read(n_points * n_fields * 4)
+            points = np.frombuffer(raw, dtype=np.float32).reshape(n_points, n_fields)
+        else:
+            points = np.loadtxt(f, dtype=np.float32).reshape(-1, n_fields)
+
+    # 只取xyz前三列
+    points = points[:, :3]
     valid = ~np.isnan(points).any(axis=1)
     return points[valid]
 

@@ -1,21 +1,20 @@
 # Extrinsics: rslidar -> chassis_camera_optical_frame
-# Source: Computed from rslidar->top @ inv(chassis->top)
-# Generated: 2026-02-28
-# Verified: T_rslidar_to_chassis @ T_chassis_to_top == T_rslidar_to_top (diff < 1e-16)
+# Source: direct chassis-lidar calibration (interactive_calibrate_v2, 6 frames)
+# Generated: 2026-03-02
 
 header:
-  calibration_date: '2026-02-28'
-  source: computed_from_rslidar_top_and_chassis_top_back
+  calibration_date: '2026-03-02'
+  source: direct_chassis_lidar_calibration
   frame_id: rslidar
   child_frame_id: chassis_camera_optical_frame
 
 transform:
   translation:
-    x: 0.1216282478
-    y: 0.0380938741
-    z: -0.0848012755
+    x: 0.1005468633961456
+    y: 0.02323394748806266
+    z: -0.0942426561537487
   rotation:
-    x: -0.4982707567
-    y: 0.5084749041
-    z: -0.4971332111
-    w: 0.4960222730
+    x: 0.48175187401526753
+    y: -0.47591381792065074
+    z: 0.5238898099568278
+    w: -0.5166823364683237

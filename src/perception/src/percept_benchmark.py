@@ -214,6 +214,189 @@ def vis_depth(depth_mm, depth_denoised=None):
     return vis_img
 
 
+# ========== CDM 深度偏差对比函数 ==========
+
+# 深度段配置 (mm)
+CDM_DEPTH_BINS = [(500, 1000), (1000, 2000), (2000, 3000)]
+
+
+def depth_to_turbo(depth_mm, vmin=200, vmax=4000):
+    """深度图 → TURBO colormap (固定范围, BGR)。"""
+    d = np.clip((depth_mm.astype(np.float32) - vmin) / (vmax - vmin), 0, 1)
+    colored = cv2.applyColorMap((d * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    colored[depth_mm == 0] = 0
+    return colored
+
+
+def make_diff_image(raw_mm, cdm_mm, max_delta=100):
+    """发散色标差异图: 白=0, 红=CDM更浅, 蓝=CDM更深。"""
+    diff = cdm_mm.astype(np.float64) - raw_mm.astype(np.float64)
+    valid = (raw_mm > 100) & (cdm_mm > 100)
+    norm = np.clip(diff / max_delta, -1.0, 1.0)
+
+    img = np.full((*raw_mm.shape, 3), 255, dtype=np.uint8)
+
+    # CDM 更浅 (diff < 0) → 红色
+    neg = norm < 0
+    intensity = (-norm * 255).astype(np.uint8)
+    img[neg, 0] = np.clip(255 - intensity[neg], 0, 255).astype(np.uint8)
+    img[neg, 1] = np.clip(255 - intensity[neg], 0, 255).astype(np.uint8)
+    img[neg, 2] = 255
+
+    # CDM 更深 (diff > 0) → 蓝色
+    pos = norm > 0
+    intensity_pos = (norm * 255).astype(np.uint8)
+    img[pos, 0] = 255
+    img[pos, 1] = np.clip(255 - intensity_pos[pos], 0, 255).astype(np.uint8)
+    img[pos, 2] = np.clip(255 - intensity_pos[pos], 0, 255).astype(np.uint8)
+
+    img[~valid] = 128
+    return img
+
+
+def draw_text_outlined(img, text, pos, scale=0.5, color=(255, 255, 255), thickness=1):
+    """带黑色描边的文字绘制。"""
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2)
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
+
+def make_histogram(diff_valid, width, height):
+    """差异直方图 (BGR)。"""
+    canvas = np.full((height, width, 3), 40, dtype=np.uint8)
+    if len(diff_valid) == 0:
+        draw_text_outlined(canvas, 'No valid pixels', (10, height // 2), 0.6)
+        return canvas
+
+    bins = np.linspace(-200, 200, 81)
+    hist, edges = np.histogram(diff_valid, bins=bins)
+    max_count = max(hist.max(), 1)
+
+    ml, mr, mt, mb = 60, 20, 20, 40
+    plot_w = width - ml - mr
+    plot_h = height - mt - mb
+    bar_w = max(plot_w // len(hist), 1)
+
+    for i, count in enumerate(hist):
+        bar_h = int(count / max_count * plot_h)
+        x = ml + i * bar_w
+        mid_val = (edges[i] + edges[i + 1]) / 2
+        if mid_val < -5:
+            color = (80, 80, 255)
+        elif mid_val > 5:
+            color = (255, 80, 80)
+        else:
+            color = (200, 200, 200)
+        cv2.rectangle(canvas, (x, mt + plot_h - bar_h), (x + bar_w - 1, mt + plot_h), color, -1)
+
+    for val in [-200, -100, 0, 100, 200]:
+        idx = int((val - edges[0]) / (edges[-1] - edges[0]) * len(hist))
+        x = ml + idx * bar_w
+        draw_text_outlined(canvas, f'{val}', (x - 15, mt + plot_h + 25), 0.4, (180, 180, 180))
+
+    draw_text_outlined(canvas, f'{max_count}', (5, mt + 15), 0.35, (180, 180, 180))
+    draw_text_outlined(canvas, '0', (5, mt + plot_h + 5), 0.35, (180, 180, 180))
+
+    zero_idx = int((0 - edges[0]) / (edges[-1] - edges[0]) * len(hist))
+    cv2.line(canvas, (ml + zero_idx * bar_w, mt), (ml + zero_idx * bar_w, mt + plot_h), (0, 255, 0), 1)
+    draw_text_outlined(canvas, 'CDM delta (mm)', (width // 2 - 60, height - 5), 0.4, (180, 180, 180))
+    return canvas
+
+
+def compute_cdm_stats(raw_mm, cdm_mm):
+    """全图 + 分深度段统计。"""
+    raw_f = raw_mm.astype(np.float64)
+    cdm_f = cdm_mm.astype(np.float64)
+    diff = cdm_f - raw_f
+
+    valid = (raw_mm > 100) & (cdm_mm > 100)
+    changed = valid & (raw_mm != cdm_mm)
+    diff_valid = diff[valid]
+
+    stats = {
+        'valid_pixels': int(valid.sum()),
+        'changed_pixels': int(changed.sum()),
+        'changed_pct': changed.sum() / max(valid.sum(), 1) * 100,
+        'mean': float(diff_valid.mean()) if len(diff_valid) else 0.0,
+        'std': float(diff_valid.std()) if len(diff_valid) else 0.0,
+        'bins': [],
+    }
+    for d_min, d_max in CDM_DEPTH_BINS:
+        mask = valid & (raw_mm >= d_min) & (raw_mm < d_max)
+        n = int(mask.sum())
+        if n > 0:
+            d = diff[mask]
+            stats['bins'].append({
+                'range': f'{d_min / 1000:.1f}-{d_max / 1000:.1f}m',
+                'n': n,
+                'mean': float(d.mean()),
+                'std': float(d.std()),
+            })
+    return stats
+
+
+def print_cdm_stats(stats):
+    """终端打印 CDM 偏差统计。"""
+    print(f'  全图 (有效像素 {stats["valid_pixels"]}):')
+    print(f'    改变比例: {stats["changed_pct"]:.1f}%')
+    direction = 'CDM偏浅' if stats['mean'] < 0 else 'CDM偏深'
+    print(f'    均值偏差: {stats["mean"]:.1f} mm ({direction})')
+    print(f'    标准差:   {stats["std"]:.1f} mm')
+    if stats['bins']:
+        print(f'    分段:')
+        for b in stats['bins']:
+            print(f'      {b["range"]}: mean={b["mean"]:+.1f}mm std={b["std"]:.1f}mm n={b["n"]}')
+
+
+def build_cdm_compare_panel(raw_mm, cdm_mm, stats):
+    """组装 CDM 对比可视化面板。"""
+    h, w = raw_mm.shape[:2]
+    panel_w = 400
+    panel_h = int(panel_w * h / w)
+
+    raw_vis = cv2.resize(depth_to_turbo(raw_mm), (panel_w, panel_h))
+    cdm_vis = cv2.resize(depth_to_turbo(cdm_mm), (panel_w, panel_h))
+    diff_vis = cv2.resize(make_diff_image(raw_mm, cdm_mm), (panel_w, panel_h))
+
+    raw_valid = raw_mm[raw_mm > 100]
+    cdm_valid = cdm_mm[cdm_mm > 100]
+    raw_median = int(np.median(raw_valid)) if len(raw_valid) else 0
+    cdm_median = int(np.median(cdm_valid)) if len(cdm_valid) else 0
+
+    draw_text_outlined(raw_vis, f'Raw depth (median={raw_median}mm)', (5, 20), 0.45)
+    draw_text_outlined(cdm_vis, f'CDM depth (median={cdm_median}mm)', (5, 20), 0.45)
+    draw_text_outlined(diff_vis, f'Diff (mean={stats["mean"]:.1f}mm)', (5, 20), 0.45)
+    draw_text_outlined(diff_vis, 'Red=CDM shallower  Blue=CDM deeper', (5, panel_h - 10), 0.35)
+
+    top_row = np.hstack([raw_vis, cdm_vis, diff_vis])
+
+    total_w = panel_w * 3
+    bottom_h = 200
+    valid = (raw_mm > 100) & (cdm_mm > 100)
+    diff = (cdm_mm.astype(np.float64) - raw_mm.astype(np.float64))[valid]
+
+    hist_w = total_w * 2 // 3
+    hist_img = make_histogram(diff, hist_w, bottom_h)
+
+    stats_w = total_w - hist_w
+    stats_img = np.full((bottom_h, stats_w, 3), 40, dtype=np.uint8)
+    y = 25
+    draw_text_outlined(stats_img, 'CDM Depth Bias Stats', (5, y), 0.5, (0, 255, 255))
+    y += 25
+    draw_text_outlined(stats_img, f'Changed: {stats["changed_pct"]:.1f}%', (5, y), 0.4)
+    y += 20
+    draw_text_outlined(stats_img, f'Mean: {stats["mean"]:.1f} mm', (5, y), 0.4)
+    y += 20
+    draw_text_outlined(stats_img, f'Std: {stats["std"]:.1f} mm', (5, y), 0.4)
+    y += 30
+    for b in stats['bins']:
+        draw_text_outlined(stats_img, f'{b["range"]}: {b["mean"]:+.1f} +/- {b["std"]:.1f} mm',
+                           (5, y), 0.35, (180, 220, 180))
+        y += 18
+
+    bottom_row = np.hstack([hist_img, stats_img])
+    return np.vstack([top_row, bottom_row])
+
+
 def save_visualization_results(run_dir, data_name, results_dict):
     """保存单个数据集的所有可视化结果
 
@@ -552,12 +735,57 @@ def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
     }
 
 
+def run_cdm_compare_test(all_data, output_dir, cdm_url='http://192.168.112.14:8082'):
+    """遍历样本数据，调用 CDM，输出统计 + 可视化面板。
+
+    Args:
+        all_data: [{'name': '001', 'rgb': ndarray, 'depth': ndarray}, ...]
+        output_dir: 输出目录
+        cdm_url: CDM 服务地址
+    """
+    print(f"\n{'='*70}")
+    print(f"CDM 深度偏差对比 (输出目录: {output_dir})")
+    print(f"{'='*70}")
+
+    cfg = SimpleConfig(url=cdm_url, chosen_policy='dn', warmup=0)
+    cdm_service = DepthOptimizerOnline(cfg)
+    print(f"[CDM] 服务初始化成功 ({cdm_url})")
+
+    for data in all_data:
+        name = data['name']
+        rgb = data['rgb']
+        raw_depth = data['depth']
+
+        print(f"\n--- {name} ---")
+        timing = {}
+        result = cdm_service.forward(rgb, raw_depth, chosen_policy='dn', _timing=timing)
+
+        if not result.get('success'):
+            print(f"  [CDM] 调用失败: {result.get('error', 'unknown')}")
+            continue
+
+        cdm_depth = result['depth']
+        timing_str = ' '.join(f'{k}={v:.0f}ms' for k, v in timing.items())
+        print(f"  CDM 耗时: {timing_str}")
+
+        stats = compute_cdm_stats(raw_depth, cdm_depth)
+        print_cdm_stats(stats)
+
+        panel = build_cdm_compare_panel(raw_depth, cdm_depth, stats)
+        out_path = os.path.join(output_dir, f'{name}_cdm_compare.png')
+        cv2.imwrite(out_path, panel)
+        print(f"  面板已保存: {out_path}")
+
+    print(f"\n全部完成，结果在: {output_dir}")
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Perception 服务 Benchmark 脚本 (ROS2)')
     parser.add_argument('--vis', action='store_true', help='运行可视化测试并输出到 result 目录')
     parser.add_argument('--benchmark', action='store_true', help='运行耗时 benchmark 测试')
+    parser.add_argument('--cdm-compare', action='store_true', help='运行 CDM 深度偏差对比诊断')
     parser.add_argument('--num-runs', type=int, default=10, help='每组数据测试次数 (default: 10)')
     parser.add_argument('--warmup', type=int, default=3, help='预热次数 (default: 3)')
     parser.add_argument('--samples-dir', type=str,
@@ -569,7 +797,7 @@ def main():
     args = parser.parse_args()
 
     # 如果没有指定任何模式，默认运行 benchmark
-    if not args.vis and not args.benchmark:
+    if not args.vis and not args.benchmark and not args.cdm_compare:
         args.benchmark = True
 
     num_runs = args.num_runs
@@ -613,6 +841,14 @@ def main():
     if args.vis:
         run_dir = ensure_result_dir()
         run_visualization_test(all_data, run_dir, text_prompt_dinox, text_prompt_sam3, grasp_server_config)
+
+    # ========== CDM 深度偏差对比 ==========
+    if args.cdm_compare:
+        # samples_dir 来自用户参数，从它反推项目根目录
+        project_root = os.path.normpath(os.path.join(samples_dir, '..', '..', '..'))
+        output_dir = os.path.join(project_root, 'scripts', 'cdm_diag')
+        os.makedirs(output_dir, exist_ok=True)
+        run_cdm_compare_test(all_data, output_dir)
 
     # ========== Benchmark 测试 ==========
     if not args.benchmark:

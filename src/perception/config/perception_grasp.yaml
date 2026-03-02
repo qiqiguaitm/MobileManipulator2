@@ -26,9 +26,9 @@ perception_grasp_node:
       dinox:
         url: 'http://192.168.112.14:10086'
       sam3:
-        url: 'http://192.168.112.14:8080'
-      cdm:
         url: 'http://192.168.112.14:8081'
+      cdm:
+        url: 'http://192.168.112.14:8082'
         enabled: true
 
     # 深度有效范围 (米)

@@ -194,7 +194,7 @@ class MultiCameraPerceptionNode(Node):
         # 检测服务
         self.declare_parameter('detector_type', 'dinox')  # dinox | sam3
         self.declare_parameter('detector_url', 'http://192.168.112.14:10086')
-        self.declare_parameter('sam3_url', 'http://192.168.112.14:8080')
+        self.declare_parameter('sam3_url', 'http://192.168.112.14:8081')
         self.declare_parameter('detector_timeout', 3.0)
         self.declare_parameter('min_score', 0.25)
         self.declare_parameter('iou_threshold', 0.5)
@@ -206,7 +206,7 @@ class MultiCameraPerceptionNode(Node):
         self.iou_threshold = self.get_parameter('iou_threshold').value
 
         # 深度优化服务
-        self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8081')
+        self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8082')
         self.declare_parameter('enable_depth_optimizer', True)
         self.depth_optimizer_url = self.get_parameter('depth_optimizer_url').value
         self.enable_depth_optimizer = self.get_parameter('enable_depth_optimizer').value
@@ -726,6 +726,34 @@ class MultiCameraPerceptionNode(Node):
 
         detections = future_detection.result(timeout=10.0)
         optimized_depth = future_depth.result(timeout=10.0)
+
+        # === DEBUG: 对比 raw depth vs CDM-optimized depth ===
+        _raw_depth_f32 = depth.astype(np.float32) / 1000.0 if depth.dtype == np.uint16 else depth.astype(np.float32)
+        for _dbg_det in detections[:3]:  # 最多打印前3个目标
+            _dbg_bbox = _dbg_det.get('bbox', [0, 0, 0, 0])
+            _dbg_cx = int((_dbg_bbox[0] + _dbg_bbox[2]) / 2)
+            _dbg_cy = int((_dbg_bbox[1] + _dbg_bbox[3]) / 2)
+            _dbg_mask = _dbg_det.get('mask')
+            if _dbg_mask is not None and 0 <= _dbg_cy < _raw_depth_f32.shape[0] and 0 <= _dbg_cx < _raw_depth_f32.shape[1]:
+                _raw_z = _raw_depth_f32[_dbg_cy, _dbg_cx]
+                _opt_z = optimized_depth[_dbg_cy, _dbg_cx]
+                # mask 内深度统计
+                _m_ys, _m_xs = np.where(_dbg_mask > 0)
+                if len(_m_ys) > 0:
+                    _raw_in_mask = _raw_depth_f32[_m_ys, _m_xs]
+                    _opt_in_mask = optimized_depth[_m_ys, _m_xs]
+                    _raw_valid = _raw_in_mask[_raw_in_mask > 0.1]
+                    _opt_valid = _opt_in_mask[_opt_in_mask > 0.1]
+                    self.get_logger().warn(
+                        f'[DEBUG-CDM][{camera_name}] {_dbg_det["object_id"]} '
+                        f'bbox_center=({_dbg_cx},{_dbg_cy}) '
+                        f'raw_center={_raw_z:.4f}m opt_center={_opt_z:.4f}m delta={(_opt_z-_raw_z)*1000:.1f}mm | '
+                        f'mask({len(_m_ys)}px) '
+                        f'raw[median={np.median(_raw_valid):.4f} mean={np.mean(_raw_valid):.4f} std={np.std(_raw_valid):.4f}] '
+                        f'opt[median={np.median(_opt_valid):.4f} mean={np.mean(_opt_valid):.4f} std={np.std(_opt_valid):.4f}] '
+                        f'delta_median={( np.median(_opt_valid)-np.median(_raw_valid))*1000:.1f}mm'
+                    )
+        # === END DEBUG ===
 
         _t1 = time.time()
 
