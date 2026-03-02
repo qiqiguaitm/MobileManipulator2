@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-Camera Perception 3D - ROS2 节点 (事件驱动 Worker 架构)
+Multi-Camera Perception 3D - ROS2 节点 (Timer+Queue 架构)
 
 双相机（Top + Chassis）联合感知节点，支持：
-1. 双相机并行检测（后台 Worker 线程，事件驱动）
+1. 双相机并行检测（Timer 限频 + Queue 传递 + Worker 消费）
 2. 独立发布各相机结果 + 匈牙利融合去重
 3. 统一的服务接口
 
 架构:
-    - 每相机一个 Worker 线程，轮询 sensor.get_latest_data()
-    - 帧去重（stamp 比较）→ 检测 + 批量 3D 测量 → 发布结果
-    - 无 Timer / 无 Queue，消除投递-消费速度不匹配的延迟
+    - Timer 按 auto_detect_rate 频率触发，采集各相机最新帧放入 Queue(maxsize=1)
+    - 每相机一个 Worker 线程，阻塞等待 Queue → 检测 + 3D 测量 → 发布
+    - Timer 控制 GPU 请求注入频率，避免连续满载；Queue 满时跳过（背压）
 
 发布:
     ~/top/objects_3d (Object3DArray) - Top相机检测结果
@@ -27,6 +27,7 @@ Usage:
 
 import os
 import time
+import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -97,7 +98,7 @@ class DetectionTask:
 
 
 class MultiCameraPerceptionNode(Node):
-    """多相机 3D 感知 ROS2 节点（后台线程架构）"""
+    """多相机 3D 感知 ROS2 节点（Timer+Queue 架构）"""
 
     def __init__(self):
         super().__init__('multi_camera_perception')
@@ -142,14 +143,15 @@ class MultiCameraPerceptionNode(Node):
             PerceptionStatus, '/perception/status', 1
         )
 
-        # ========== 事件驱动 Worker 架构 ==========
-        # 关闭标志
+        # ========== Timer + Queue 架构 ==========
         self._shutdown = False
-        # 工作线程（每相机一个）
+        self._task_queues: Dict[str, queue.Queue] = {}
         self._worker_threads: Dict[str, threading.Thread] = {}
         # 共享线程池（检测 + CDM 并行）
         self._detection_executor = ThreadPoolExecutor(max_workers=4)
-        # 启动工作线程
+        # Timer 帧去重用的 last_stamp
+        self._timer_last_stamps: Dict[str, float] = {}
+        # 启动 Timer + Worker
         self._init_worker_threads()
 
         self.get_logger().info('='*60)
@@ -437,12 +439,23 @@ class MultiCameraPerceptionNode(Node):
         self.pub_fused = self.create_publisher(Object3DArray, '~/fused/objects_3d', latched_qos)
 
     def _init_worker_threads(self):
-        """初始化事件驱动 Worker 线程（每相机一个，无队列）"""
+        """初始化 Timer + Queue + Worker 线程"""
         if not self.cameras or self.auto_detect_rate <= 0:
             return
 
-        self.get_logger().info(f'启动 {len(self.cameras)} 个事件驱动 Worker...')
+        # 每相机一个 Queue(maxsize=1)：满时 Timer 跳过，不堆积
+        for camera_name in self.cameras.keys():
+            self._task_queues[camera_name] = queue.Queue(maxsize=1)
+            self._timer_last_stamps[camera_name] = 0.0
 
+        # Timer：按 auto_detect_rate 频率采集数据 → 放入 Queue
+        timer_period = 1.0 / self.auto_detect_rate
+        self._auto_detect_timer = self.create_timer(
+            timer_period, self._on_camera_timer,
+            callback_group=ReentrantCallbackGroup()
+        )
+
+        # 每相机一个 Worker 线程，阻塞消费 Queue
         for camera_name in self.cameras.keys():
             t = threading.Thread(
                 target=self._detection_worker,
@@ -453,7 +466,10 @@ class MultiCameraPerceptionNode(Node):
             t.start()
             self._worker_threads[camera_name] = t
 
-        self.get_logger().info(f'Worker 已启动: {list(self._worker_threads.keys())}')
+        self.get_logger().info(
+            f'Timer+Queue 架构启动: {self.auto_detect_rate}Hz timer, '
+            f'{len(self._worker_threads)} workers: {list(self._worker_threads.keys())}'
+        )
 
     def _config_callback(self, msg: PerceptionConfig):
         """配置回调"""
@@ -468,70 +484,87 @@ class MultiCameraPerceptionNode(Node):
             f'min_score={self._current_min_score:.2f}'
         )
 
+    def _on_camera_timer(self):
+        """
+        Timer 回调：采集各相机最新帧 → 放入 Queue。
+        Queue 满（Worker 还在处理上一帧）时跳过，实现自然背压。
+        """
+        for camera_name, q in self._task_queues.items():
+            sensor = self.cameras.get(camera_name)
+            if not sensor:
+                continue
+
+            data = sensor.get_latest_data()
+            if data is None:
+                continue
+
+            # 数据过旧
+            if data.get('age', 0) > 3.0:
+                continue
+
+            # 帧去重
+            ts = data.get('timestamp')
+            if ts is not None:
+                stamp = stamp_to_sec(ts) if hasattr(ts, 'sec') else float(ts)
+            else:
+                stamp = time.time()
+
+            if stamp <= self._timer_last_stamps[camera_name]:
+                continue
+            self._timer_last_stamps[camera_name] = stamp
+
+            # TF 查询
+            transformer = self.transformers.get(camera_name)
+            optical_to_base = None
+            if transformer:
+                try:
+                    optical_to_base = transformer.get_transform('optical_to_base')
+                except Exception:
+                    optical_to_base = None
+
+            task = DetectionTask(
+                camera_name=camera_name,
+                rgb=data['rgb'],
+                depth=data['depth'],
+                intrinsics=sensor.intrinsics,
+                prompt=self._current_prompt,
+                optical_to_base_matrix=optical_to_base,
+                timestamp_sec=time.time(),
+                frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame')
+            )
+
+            try:
+                q.put_nowait(task)
+            except queue.Full:
+                # Worker 还在处理上一帧，跳过此 tick（自然背压）
+                pass
+
     def _detection_worker(self, camera_name: str):
         """
-        事件驱动 Worker 线程（每相机独立，无队列）
-
-        轮询 sensor.get_latest_data()，帧去重后执行检测 + 发布。
+        Worker 线程：阻塞等待 Queue 中的任务 → 检测 + 发布。
+        Timer 控制注入频率，Worker 只管消费。
         """
-        self.get_logger().info(f'[Worker-{camera_name}] 启动（事件驱动）')
+        self.get_logger().info(f'[Worker-{camera_name}] 启动（Timer+Queue）')
 
-        sensor = self.cameras.get(camera_name)
-        transformer = self.transformers.get(camera_name)
-        if not sensor:
-            self.get_logger().error(f'[Worker-{camera_name}] sensor 不存在，退出')
+        q = self._task_queues.get(camera_name)
+        if not q:
+            self.get_logger().error(f'[Worker-{camera_name}] queue 不存在，退出')
             return
-
-        last_stamp = 0.0
-        optical_frame = f'{camera_name}_camera_optical_frame'
 
         while not self._shutdown and rclpy.ok():
             try:
-                # 轮询最新数据
-                data = sensor.get_latest_data()
-                if data is None:
-                    time.sleep(0.015)
+                # 阻塞等待下一个任务（1s 超时避免死锁）
+                try:
+                    task = q.get(timeout=1.0)
+                except queue.Empty:
                     continue
 
-                # 数据过旧检查
-                if data.get('age', 0) > 3.0:
-                    self._log.warn(f'[{camera_name}] 数据过旧: {data["age"]:.1f}s', period=10.0)
-                    time.sleep(0.015)
-                    continue
+                # sentinel 退出
+                if task is None:
+                    break
 
-                # 帧去重
-                ts = data.get('timestamp')
-                if ts is not None:
-                    stamp = stamp_to_sec(ts) if hasattr(ts, 'sec') else float(ts)
-                else:
-                    stamp = time.time()
-
-                if stamp <= last_stamp:
-                    time.sleep(0.010)
-                    continue
-                last_stamp = stamp
-
+                _tw_age = (time.time() - task.timestamp_sec) * 1000  # queue wait
                 _tw0 = time.time()
-
-                # TF 查询（使用正确的 API）
-                optical_to_base = None
-                if transformer:
-                    try:
-                        optical_to_base = transformer.get_transform('optical_to_base')
-                    except Exception:
-                        optical_to_base = None
-
-                # 构造检测任务（数据已深拷贝于 get_latest_data，无需额外 copy）
-                task = DetectionTask(
-                    camera_name=camera_name,
-                    rgb=data['rgb'],
-                    depth=data['depth'],
-                    intrinsics=sensor.intrinsics,
-                    prompt=self._current_prompt,
-                    optical_to_base_matrix=optical_to_base,
-                    timestamp_sec=_tw0,
-                    frame_id=data.get('frame_id', optical_frame)
-                )
 
                 # 执行检测
                 result = self._run_detection_task(task)
@@ -554,6 +587,7 @@ class MultiCameraPerceptionNode(Node):
 
                     self.get_logger().info(
                         f'[{camera_name}] WORKER: '
+                        f'qwait={_tw_age:.0f}ms '
                         f'detect={(_tw1-_tw0)*1000:.0f}ms '
                         f'pub={(_tw2-_tw1)*1000:.0f}ms '
                         f'fusion={(_tw3-_tw2)*1000:.0f}ms '
@@ -711,32 +745,45 @@ class MultiCameraPerceptionNode(Node):
         mask_ms = _det_timing.get('mask_decode', 0) * 1000
         cdm_total_ms = _cdm_timing.get('api_total', 0) * 1000
         n_obj = _det_timing.get('n_objects', 0)
-        # SAM3 内部 timing
+        # SAM3 内部 timing（已是 ms）
         sam3_pre = _det_timing.get('sam3_preprocess', 0)
         sam3_enc = _det_timing.get('sam3_encode', 0)
         sam3_http = _det_timing.get('sam3_http', 0)
-        # CDM 内部 timing
+        # CDM 内部 timing（已是 ms）
         cdm_pre = _cdm_timing.get('cdm_preprocess', 0)
         cdm_enc = _cdm_timing.get('cdm_encode', 0)
         cdm_http = _cdm_timing.get('cdm_http', 0)
         cdm_post = _cdm_timing.get('cdm_postprocess', 0)
-        # 并行等待时间
+        # 并行 wall 及各线程总耗时
         parallel_ms = (_t1 - _t_submit) * 1000
+        threadA_ms = det_http_ms + mask_ms   # SAM3 + mask_decode
+        threadB_ms = cdm_total_ms            # CDM
+        idle_ms = parallel_ms - max(threadA_ms, threadB_ms)  # 调度/争抢开销
+
+        # 深度图发布
+        _t_dp = time.time()
+        depth_pub_ms = (_t_dp - _t1) * 1000
+
+        # 构造 sub-timing 字符串（复用于各分支）
+        _a_str = (f'A=[pre:{sam3_pre:.0f}+enc:{sam3_enc:.0f}+http:{sam3_http:.0f}'
+                  f'+mask:{mask_ms:.0f}={threadA_ms:.0f}ms]')
+        _b_str = (f'B=[pre:{cdm_pre:.0f}+enc:{cdm_enc:.0f}+http:{cdm_http:.0f}'
+                  f'+post:{cdm_post:.0f}={threadB_ms:.0f}ms]')
 
         if not detections:
             self.get_logger().info(
                 f'[{camera_name}] PERF: '
-                f'sam3=[enc:{sam3_enc:.0f}+http:{sam3_http:.0f}={det_http_ms:.0f}ms] '
-                f'cdm=[pre:{cdm_pre:.0f}+enc:{cdm_enc:.0f}+http:{cdm_http:.0f}+post:{cdm_post:.0f}={cdm_total_ms:.0f}ms] '
-                f'parallel={parallel_ms:.0f}ms wall={(_t1-_t0)*1000:.0f}ms | 0 objs')
+                f'parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
+                f'{_a_str} {_b_str} '
+                f'wall={(_t_dp-_t0)*1000:.0f}ms | 0 objs')
             return result
 
-        _t2 = time.time()
-
         # 2. 批量 bbox-scoped 3D 测量
+        _t_3d0 = time.time()
         measurement_results = core.batch_camera_3d_percept(
             optimized_depth, detections, skip_transform=True
         )
+        _t_3d1 = time.time()
 
         # 过滤无效测量
         valid_items = []
@@ -746,31 +793,31 @@ class MultiCameraPerceptionNode(Node):
                 valid_items.append((det, meas))
                 optical_centroids.append(meas.centroid_optical)
 
+        batch_3d_ms = (_t_3d1 - _t_3d0) * 1000
+
         if not valid_items:
             self.get_logger().info(
                 f'[{camera_name}] PERF: '
-                f'sam3=[enc:{sam3_enc:.0f}+http:{sam3_http:.0f}={det_http_ms:.0f}ms] '
-                f'mask={mask_ms:.0f}ms '
-                f'cdm=[pre:{cdm_pre:.0f}+enc:{cdm_enc:.0f}+http:{cdm_http:.0f}+post:{cdm_post:.0f}={cdm_total_ms:.0f}ms] '
-                f'parallel={parallel_ms:.0f}ms '
-                f'wall={(_t2-_t0)*1000:.0f}ms | {n_obj} det, 0 valid')
+                f'parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
+                f'{_a_str} {_b_str} '
+                f'3d={batch_3d_ms:.0f}ms '
+                f'wall={(_t_3d1-_t0)*1000:.0f}ms | {n_obj} det, 0 valid')
             return result
 
         # 3. 批量坐标变换到 base_link
+        _t_tf0 = time.time()
         if task.optical_to_base_matrix is not None:
-            # 使用预计算的变换矩阵
             optical_points = np.array(optical_centroids)
-            # 齐次坐标变换
             points_h = np.hstack([optical_points, np.ones((len(optical_points), 1))])
             target_centroids = (task.optical_to_base_matrix @ points_h.T).T[:, :3]
         else:
-            # 回退：使用 transformer（可能在线程中不安全，但尽量尝试）
             transformer = self.transformers.get(camera_name)
             if transformer:
                 optical_points = np.array(optical_centroids)
                 target_centroids = transformer.optical_to_target(optical_points, self.target_frame)
             else:
-                target_centroids = np.array(optical_centroids)  # 无变换
+                target_centroids = np.array(optical_centroids)
+        _t_tf1 = time.time()
 
         # 4. 构建 Object3D 消息
         distance_offset = self.distance_offset_default
@@ -782,7 +829,6 @@ class MultiCameraPerceptionNode(Node):
             obj.score = float(det['score'])
             obj.bbox = [float(x) for x in det['bbox']]
 
-            # 应用距离补偿
             target_centroid = target_centroids[i]
             original_distance = np.linalg.norm(target_centroid)
             if original_distance > 0.01:
@@ -799,26 +845,26 @@ class MultiCameraPerceptionNode(Node):
             obj.distance = float(np.linalg.norm(compensated_centroid))
             obj.confidence = float(camera_result.confidence)
 
-            # 保存相机光学坐标系下的原始位置 (用于调试)
             optical_centroid = optical_centroids[i]
             obj.position_optical = Point(
                 x=float(optical_centroid[0]),
                 y=float(optical_centroid[1]),
                 z=float(optical_centroid[2])
             )
-            obj.depth = float(optical_centroid[2])  # z 值即为深度
+            obj.depth = float(optical_centroid[2])
             obj.source_camera = camera_name
 
             result.objects.append(obj)
 
         _t3 = time.time()
+        coord_tf_ms = (_t_tf1 - _t_tf0) * 1000
+        obj_build_ms = (_t3 - _t_tf1) * 1000
+        post_ms = depth_pub_ms + batch_3d_ms + coord_tf_ms + obj_build_ms
         self.get_logger().info(
             f'[{camera_name}] PERF: '
-            f'sam3=[enc:{sam3_enc:.0f}+http:{sam3_http:.0f}={det_http_ms:.0f}ms] '
-            f'mask={mask_ms:.0f}ms '
-            f'cdm=[pre:{cdm_pre:.0f}+enc:{cdm_enc:.0f}+http:{cdm_http:.0f}+post:{cdm_post:.0f}={cdm_total_ms:.0f}ms] '
-            f'parallel={parallel_ms:.0f}ms '
-            f'meas={(_t3-_t2)*1000:.0f}ms '
+            f'parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
+            f'{_a_str} {_b_str} '
+            f'post=[dpub:{depth_pub_ms:.0f}+3d:{batch_3d_ms:.0f}+tf:{coord_tf_ms:.0f}+build:{obj_build_ms:.0f}={post_ms:.0f}ms] '
             f'wall={(_t3-_t0)*1000:.0f}ms | {len(result.objects)} objs')
         return result
 
@@ -1084,16 +1130,20 @@ class MultiCameraPerceptionNode(Node):
 
             # 如果有任意相机的结果，进行融合
             if len(valid_results) >= 1:
+                _tf0 = time.time()
                 fused = self._fuse_results(valid_results)
+                _tf1 = time.time()
                 if fused and len(fused.objects) > 0:
-                    # === ByteTracker3D 跟踪 ===
                     tracked_result = self._apply_tracking(fused)
+                    _tf2 = time.time()
 
-                    # 发布跟踪后的结果
                     self.pub_fused.publish(tracked_result)
                     self._last_results['fused'] = tracked_result
+                    n_in = sum(len(r.objects) for r in valid_results.values())
                     self.get_logger().info(
-                        f'[FUSION] 发布 fused 话题: {len(tracked_result.objects)} objects (tracked)'
+                        f'[FUSION] in={n_in} fused={len(fused.objects)} tracked={len(tracked_result.objects)} '
+                        f'match={(_tf1-_tf0)*1000:.0f}ms track={(_tf2-_tf1)*1000:.0f}ms '
+                        f'total={(_tf2-_tf0)*1000:.0f}ms'
                     )
                 else:
                     self.get_logger().warn(
@@ -1395,8 +1445,19 @@ class MultiCameraPerceptionNode(Node):
 
     def destroy_node(self):
         """清理资源"""
-        self.get_logger().info('正在停止 Worker 线程...')
+        self.get_logger().info('正在停止 Timer + Worker...')
         self._shutdown = True
+
+        # 停止 Timer
+        if hasattr(self, '_auto_detect_timer'):
+            self._auto_detect_timer.cancel()
+
+        # 向每个 Queue 投入 sentinel 解除阻塞
+        for q in self._task_queues.values():
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
 
         # 等待所有工作线程结束（最多5秒）
         for t in self._worker_threads.values():
@@ -1405,7 +1466,7 @@ class MultiCameraPerceptionNode(Node):
         # 关闭共享线程池
         self._detection_executor.shutdown(wait=False)
 
-        self.get_logger().info('Worker 线程已停止')
+        self.get_logger().info('Timer + Worker 已停止')
         super().destroy_node()
 
 

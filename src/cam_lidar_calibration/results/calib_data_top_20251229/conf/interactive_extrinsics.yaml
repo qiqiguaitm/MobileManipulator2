@@ -1,0 +1,16 @@
+child_frame_id: top_camera_optical_frame
+frame_id: rs16_lidar
+header:
+  calibration_date: '2025-12-29'
+  method: interactive_multi_frame
+  n_frames: 8
+transform:
+  rotation:
+    w: 0.49494235226875766
+    x: -0.5090322875236803
+    y: 0.5210187176897315
+    z: -0.4737696634505275
+  translation:
+    x: -0.41471447540103445
+    y: -0.015117160532966386
+    z: 0.4706440550391771

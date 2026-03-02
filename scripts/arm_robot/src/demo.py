@@ -11,7 +11,7 @@ import numpy as np
 
 # import open3d as o3d
 from camera import RealSenseCamera
-from percept import GraspAnythingOnline, DinoXDetectorOnline
+from percept import GraspAnythingOnline, SAM3Online
 from mmengine.config import Config
 from PIL import Image, ImageDraw, ImageFont
 #from robot_xarm import XArmRobot as ArmRobot
@@ -54,7 +54,7 @@ class DemoRobot:
             camera: 主相机对象（RealSenseCamera），用于RGB-D采集
             det: 检测对象（GraspAnythingOnline），用于抓取点检测
             arm: 机械臂对象（ArmRobot），用于执行抓取
-            ref: 参考定位对象（DinoXDetectorOnline），用于语义定位
+            ref: 参考定位对象（SAM3Online），用于语义定位
             voc: 语音输入对象（VoiceInput），用于语音控制
             tracker: 跟踪器对象，用于多目标跟踪
             chassis: 底盘控制对象（SimpleTracer），用于移动底盘控制
@@ -75,6 +75,11 @@ class DemoRobot:
         fp = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
         self._font = ImageFont.truetype(fp, size=30)  # 中文字体，用于显示
         self._last_arm_op_done_time = None  # 记录上次操作完成时间
+
+        # 检测线程相关
+        self._det_frame_q = Queue(maxsize=1)   # 主循环 → 检测线程的帧队列
+        self._det_state = None                  # 最新检测结果 (dict)
+        self._det_lock = threading.Lock()       # 保护 _det_state
 
     def is_at_init_position(self, tolerance=20):
         """检查机械臂是否在初始位置
@@ -1020,280 +1025,207 @@ class DemoRobot:
                 pass
             return False
 
-    def start(self):
-        """主循环函数，系统的核心运行逻辑
+    def _detection_worker(self):
+        """后台检测线程：从队列取帧，运行 Grasp + Refer，更新共享结果
 
-        该函数实现了完整的感知-决策-执行循环：
-        1. 采集RGB-D图像
-        2. 调用检测服务获取抓取点
-        3. 选择最优抓取方案
-        4. 坐标变换和可视化
-        5. 根据模式执行相应动作
+        与主循环解耦，主循环不再因检测阻塞而卡顿。
         """
-        # 初始化显示窗口
-        cv2.namedWindow(self.cfg.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.cfg.window_name, self.cfg.img_w, 2 * self.cfg.img_h)
-        
-        fts = dict()  # 过滤器，用于指定抓取目标
-        cmd = None  # 用户的文本/语音命令
-        just_change_fts = False
-        
-        # 主循环：持续运行直到用户退出
+        text = self.cfg.get('detect_prompt', 'object')
         while True:
-            if self.is_at_init_position(tolerance=20):
-                
-                # 获取相机数据（RGB + 深度）
-                #out = self.camera.get_image_bundle()
-                out = self.camera.get_image_bundle_enhanced(skip_frames=5, apply_filters=True)
-                # 获取机械臂当前位姿（单位：mm）
-                _, end_pos = self.arm.arm.get_position(return_gripper_center=True)
+            try:
+                frame_data = self._det_frame_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
 
-                end_pos = np.array(end_pos)
-                end_pos[0:3] /= 1000.0
-                intrinsics = self.camera.intrinsics
-                K = dict(coeffs=intrinsics.coeffs, fx=intrinsics.fx, fy=intrinsics.fy, height=intrinsics.height, width=intrinsics.width, ppx=intrinsics.ppx, ppy=intrinsics.ppy)
-                scale = self.camera.scale
+            rgb_ori, depth, end_pos = frame_data
+            rgb_bgr = cv2.cvtColor(rgb_ori, cv2.COLOR_RGB2BGR)
 
-                rgb = out['rgb']
-                rgb_ori = rgb.copy()
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                state = dict()
-                # breakpoint()
-                state['arm.end_pos'] = end_pos.tolist()
-                state['camera.K'] = K
-                state['camera.scale'] = scale
-                state['mode'] = self.mode
-                state['time_now'] = time.time()
-
-                depth = out['depth']
-                bag = self.mode == 'voice' and cmd is not None and '袋子' in cmd
-                bag = False
-                if bag:
-                    print('bag!!!')
-            else:
-                None
-            
-            # 检查是否在初始位置，只有在初始位置才进行检测
-            if self.is_at_init_position(tolerance=20):
-                # Grasp检测，重试3次
-                affs = None
-                for retry in range(3):
-                    try:
-                        affs, _ = self.det.forward(rgb_ori, depth, bag=bag)  # quick, delay < 0.1s
-                        break
-                    except Exception as e:
-                        print(f"Grasp检测失败 (尝试 {retry+1}/3): {e}")
-                    if retry < 2:  # 不是最后一次尝试
-                        time.sleep(0.5)
-                
-                if affs is None:
-                    affs = [{}]  # 如果全部失败，使用空结果
-                    print("⚠ Grasp检测失败3次，跳过")
-                    continue  # 跳过本次循环，等待下一帧
-                
-
-                # Refer检测
-                cmd = text = 'toy cubic.remote.bottle'
-                targets = []
+            # --- Grasp 检测 (重试3次) ---
+            affs = None
+            for retry in range(3):
                 try:
-                    task = self.ref.forward(rgb=rgb_ori, text=text)
-                    targets = task.result.get('objects', [])
+                    affs, _ = self.det.forward(rgb_ori, depth, bag=False)
+                    break
                 except Exception as e:
-                    print(f"Refer检测失败: {e}")
+                    print(f"Grasp检测失败 (尝试 {retry+1}/3): {e}")
+                    if retry < 2:
+                        time.sleep(0.3)
 
-                fts['targets'] = targets
-                if not targets:
-                    print("⚠ Refer未找到目标")
-                    continue  # 跳过本次循环，等待下一帧
+            if affs is None:
+                affs = [{}]
+                print("⚠ Grasp检测失败3次，跳过")
+                with self._det_lock:
+                    self._det_state = self._make_empty_state(affs, text)
+                continue
 
+            # --- Refer 检测 ---
+            targets = []
+            try:
+                task = self.ref.forward(rgb=rgb_ori, text=text)
+                targets = task.result.get('objects', [])
+            except Exception as e:
+                print(f"Refer检测失败: {e}")
 
+            fts = {'targets': targets}
+            if not targets:
+                print("⚠ Refer未找到目标")
+                with self._det_lock:
+                    self._det_state = self._make_empty_state(affs, text, fts=fts)
+                continue
 
-                chosen_aff = self.choose(rgb_ori, depth, affs, fts=fts)
-            
-            else:
-                # 不在初始位置，跳过检测
-                affs = [{}]  # 空的检测结果
-                chosen_aff = None
-                # 可选：打印提示信息
-                if hasattr(self, '_last_position_warning_time'):
-                    if time.time() - self._last_position_warning_time > 5:  # 每5秒最多提示一次
-                        print("⚠ 机械臂不在初始位置，跳过检测")
-                        self._last_position_warning_time = time.time()
-                else:
-                    print("⚠ 机械臂不在初始位置，跳过检测")
-                    self._last_position_warning_time = time.time()
-            point_in_base = None
-            if chosen_aff is not None and (chosen_aff['aff'][0] >= rgb.shape[1] or chosen_aff['aff'][1] >= rgb.shape[0]):
-                print(f'out of scene: {chosen_aff}')
-                chosen_aff = rect = offset = point3d = angle = width3d = None
+            # --- 选择最优抓取点 ---
+            chosen_aff = self.choose(rgb_ori, depth, affs, fts=fts)
+
+            offset = point3d = angle = width3d = point_in_base = eef_in_base = None
 
             if chosen_aff is not None:
-                data3d = self.camera.unprj(aff=chosen_aff, rgb=rgb, depth=depth)  # point in camera frame
+                # 边界检查
+                if chosen_aff['aff'][0] >= rgb_ori.shape[1] or chosen_aff['aff'][1] >= rgb_ori.shape[0]:
+                    print(f'out of scene: {chosen_aff}')
+                    chosen_aff = None
+
+            if chosen_aff is not None:
+                # 3D 反投影
+                data3d = self.camera.unprj(aff=chosen_aff, rgb=rgb_bgr, depth=depth)
                 point3d = data3d['point3d']
                 width3d = data3d['width3d']
-                # offset = self.arm.offset2tool_in_base(point3d_in_cam=point3d)  # 
-                
+
+                # 坐标变换
                 data = self.arm.offset_from_end(point3d=point3d, end_pos=end_pos, src_frame='cam')
                 offset = data['offset']
                 point_in_base = data['point_in_base']
                 eef_in_base = data['eef_in_base']
+
                 rect = chosen_aff['aff']
-                rect = ((rect[0], rect[1]), (rect[2], rect[3]), rect[4] * 180 / math.pi)
-                angle = rect[2]
-                
-                
-                ### 增加工作范围过滤 - Piper gripper 安全工作范围
-                # 基于 URDF 文件计算的 Piper 机械臂实际工作空间（单位：米）
-                # 连杆总长: base(0.123) + link2(0.285) + link3(0.273) + link5(0.091) + gripper(0.136) ≈ 0.908m
-                min_reach = 0.250
-                max_reach = 0.600
-                min_height = -0.270
-                max_height = 0.300
-                
-                # 计算目标点到基座的水平距离
+                angle = rect[4] * 180 / math.pi
+
+                # 工作范围检查
                 if point_in_base is not None:
-                    horizontal_distance = np.sqrt(point_in_base[0]**2 + point_in_base[1]**2)
-                    z_height = point_in_base[2]
-                    
-                    # 检查是否在安全工作范围内
-                    in_workspace = (min_reach <= horizontal_distance <= max_reach and 
-                                  min_height <= z_height <= max_height)
-                    
-                    if not in_workspace:
-                        # 超出工作范围，清空所有抓取相关变量
-                        print(f"⚠ 目标超出工作范围: 距离={horizontal_distance:.3f}m (安全范围: {min_reach}-{max_reach}m), "
-                              f"高度={z_height:.3f}m (安全范围: {min_height}-{max_height}m)")
-                        chosen_aff = rect = offset = point3d = angle = width3d = None
-                      
-            else:  # cannot find a valid aff for given fts
-                chosen_aff = rect = offset = point3d = angle = width3d = None
+                    h_dist = np.sqrt(point_in_base[0]**2 + point_in_base[1]**2)
+                    z_h = point_in_base[2]
+                    if not (0.250 <= h_dist <= 0.600 and -0.270 <= z_h <= 0.300):
+                        print(f"⚠ 目标超出工作范围: 距离={h_dist:.3f}m, 高度={z_h:.3f}m")
+                        chosen_aff = offset = point3d = angle = width3d = point_in_base = eef_in_base = None
 
-            state['affs'] = affs
-            state['chosen_aff'] = chosen_aff
-            state['fts'] = fts
-            state['cmd'] = cmd
-            state['point3d'] = point3d
-            state['offset'] = offset
-            state['point_in_base'] = point_in_base
-            state['eef_in_base'] = eef_in_base
-            state['category'] = chosen_aff.get('category', 'unknown') if chosen_aff else None
-            if chosen_aff != None:
-                try:
-                    vis_rgb = self.vis_frame(rgb=rgb, depth=depth, state=state)
-                    cv2.imshow(self.cfg.window_name, vis_rgb)
-                    cv2.waitKey(1)
-                except Exception as e:
-                    print(f"可视化失败: {e}")
-                   
+            # 更新共享检测结果
+            with self._det_lock:
+                self._det_state = {
+                    'affs': affs, 'fts': fts, 'cmd': text,
+                    'chosen_aff': chosen_aff,
+                    'point3d': point3d, 'offset': offset,
+                    'angle': angle, 'width3d': width3d,
+                    'point_in_base': point_in_base,
+                    'eef_in_base': eef_in_base,
+                    'category': chosen_aff.get('category', 'unknown') if chosen_aff else None,
+                }
 
+    def _make_empty_state(self, affs=None, cmd=None, fts=None):
+        """构造空检测结果"""
+        return {
+            'affs': affs or [{}], 'fts': fts or {}, 'cmd': cmd,
+            'chosen_aff': None, 'point3d': None, 'offset': None,
+            'angle': None, 'width3d': None,
+            'point_in_base': None, 'eef_in_base': None, 'category': None,
+        }
 
-            
-            
-            key = cv2.waitKey(1)
-            if self.mode.startswith('arm_'):  # arm is doing ops, mode is set in listen_on_arm_ops
-                # when ops is done, mode is set to be not arm_, gurantee by listen_on_arm_ops
+    def start(self):
+        """主循环：采图 + 显示 + 按键（检测在后台线程运行，不阻塞显示）"""
+        cv2.namedWindow(self.cfg.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.cfg.window_name, self.cfg.img_w, 2 * self.cfg.img_h)
+
+        # 启动后台检测线程
+        det_thread = threading.Thread(target=self._detection_worker, daemon=True)
+        det_thread.start()
+
+        while True:
+            # ---- 1. 采图（快速，skip_frames=1 保证显示流畅）----
+            at_init = self.is_at_init_position(tolerance=20)
+            try:
+                out = self.camera.get_image_bundle_enhanced(
+                    skip_frames=1 if at_init else 0, apply_filters=at_init)
+                rgb_ori = out['rgb']
+                rgb = cv2.cvtColor(rgb_ori, cv2.COLOR_RGB2BGR)
+                depth = out['depth']
+            except Exception as e:
+                print(f"相机采图失败: {e}")
+                time.sleep(0.05)
                 continue
-            
-            '''
-            if key & 0xFF == ord('q'):
-                self.vis.stop()
-                time.sleep(3.0)
-                cv2.destroyAllWindows()
-                break
-            elif key & 0xFF == ord('t'):  # ref to an object
-                self.mode = 'ref'
-                cmd = text = input('\n\nprompt->')
-                task = self.ref.forward(rgb=rgb_ori, text=text)  # time consuming, delay in 3s to 6s
-                targets = task.result
-                targets = targets['objects']
-                fts['targets'] = targets
-            '''
+
+            # 在初始位置时，把帧送给检测线程（丢弃旧帧）
+            if at_init:
+                _, end_pos = self.arm.arm.get_position(return_gripper_center=True)
+                end_pos = np.array(end_pos)
+                end_pos[0:3] /= 1000.0
+                if self._det_frame_q.full():
+                    try:
+                        self._det_frame_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._det_frame_q.put((rgb_ori, depth, end_pos))
+
+            # ---- 2. 读取最新检测结果（非阻塞）----
+            with self._det_lock:
+                det = dict(self._det_state) if self._det_state else None
+
+            # ---- 3. 显示 ----
+            try:
+                if det and det.get('chosen_aff') is not None:
+                    vis_rgb = self.vis_frame(rgb=rgb.copy(), depth=depth, state=det)
+                else:
+                    # 无检测结果时也显示相机画面 + 深度图
+                    depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
+                    depth_colored = cv2.applyColorMap(depth_norm.astype(np.uint8), cv2.COLORMAP_TURBO)
+                    disp = rgb.copy()
+                    cv2.putText(disp, f'mode: {self.mode}', (100, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    if det and det.get('cmd'):
+                        cv2.putText(disp, f'detecting: {det["cmd"]}', (100, 80),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                    if not at_init:
+                        cv2.putText(disp, 'arm not at init pos', (100, 110),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    vis_rgb = np.vstack((disp, depth_colored))
+                cv2.imshow(self.cfg.window_name, vis_rgb)
+            except Exception as e:
+                print(f"可视化失败: {e}")
+
+            # ---- 4. 按键处理（30ms 间隔 ≈ 33fps 刷新率）----
+            key = cv2.waitKey(30)
+
+            if self.mode.startswith('arm_'):
+                continue
+
+            # 从检测结果构建抓取参数
+            chosen_aff = det.get('chosen_aff') if det else None
+            offset = det.get('offset') if det else None
+            angle = det.get('angle') if det else None
+            width3d = det.get('width3d') if det else None
+            point3d = det.get('point3d') if det else None
+            point_in_base = det.get('point_in_base') if det else None
+            category = det.get('category', 'unknown') if det else 'unknown'
 
             action = 'pick'
-            # 添加类别和3D信息到参数中
-            category = chosen_aff.get('category', 'unknown') if chosen_aff else 'unknown'
-            para = dict(offset=offset, angle=angle, gripper_width=width3d, 
-                       category=category, point3d=point3d, point_in_base=point_in_base)    
-            if key != -1:
-                just_change_fts = True
+            para = dict(offset=offset, angle=angle, gripper_width=width3d,
+                        category=category, point3d=point3d, point_in_base=point_in_base)
+
             if key & 0xFF == ord('q'):
                 cv2.destroyAllWindows()
                 break
-            elif key & 0xFF == ord('a'):
-                self.mode = 'auto'
-                fts.clear()
             elif key & 0xFF == ord('g'):
                 self.mode = 'confirm'
-                self.add_arm_ops(action=action, para=para)  # make sure, mode is starts with 'arm_'
-            elif key & 0xFF == ord('w'):  # freeze
+                self.add_arm_ops(action=action, para=para)
+            elif key & 0xFF == ord('a'):
+                self.mode = 'auto'
+            elif key & 0xFF == ord('w'):
                 self.mode = 'wait'
-                key = cv2.waitKey()
-                if key & 0xFF == ord('g'):
-                    self.add_arm_ops(action=action, para=para)
-            elif key & 0xFF == ord('t'):  # ref to an object
+            elif key & 0xFF == ord('t'):
                 self.mode = 'ref'
-                cmd = text = 'toy cubic.remote.bottle'
-                # 只有在初始位置才执行参考检测
-                if self.is_at_init_position(tolerance=20):
-                    targets = []
-                    try:
-                        task = self.ref.forward(rgb=rgb_ori, text=text)
-                        targets = task.result.get('objects', [])
-                    except Exception as e:
-                        print(f"Refer检测失败: {e}")
-                    fts['targets'] = targets
-                    if not targets:
-                        print("⚠ Refer未找到目标")
-                else:
-                    print("⚠ 机械臂不在初始位置，无法执行参考检测")
-                    fts['targets'] = []
-
-
-            elif key & 0xFF == ord('v'):  # sound
-                self.mode = 'voice'
-                if self.voc is None:
-                    print('voc is not enabled')
-                    sys.exit(1)
-            elif key == ord('c'):
+            elif key & 0xFF == ord('c'):
                 self.mode = 'confirm'
-                fts.clear()
             elif key == -1:
-                if self.mode in ['auto', 'ref']:  # set fts once and use it for the following
+                # 无按键：auto/ref 模式下检测到目标则自动抓取
+                if self.mode in ['auto', 'ref'] and chosen_aff is not None:
                     self.add_arm_ops(action=action, para=para)
-                    
-                    fts.clear()    ####清理 fts
-                    
-                elif self.mode in ['voice']:  # two things to do: pick if previous loop has set condition; accept new condition by voice
-                    if cmd is not None and 'targets' in fts and chosen_aff is not None:
-                        self.add_arm_ops(action=action, para=para)
-                    else:
-                        # keep accepting new fts inputs via voice with non-blocking style
-                        try:
-                            cmd = text = self.voc.cmd_q.get(timeout=0.1)
-                            print(f'demo gets voice command: {text}')
-                            if self.is_at_init_position(tolerance=20):
-                                targets = []
-                                try:
-                                    task = self.ref.forward(rgb=rgb_ori, text=text)
-                                    targets = task.result.get('objects', [])
-                                except Exception as e:
-                                    print(f"语音Refer检测失败: {e}")
-
-                                if len(targets) > 0:
-                                    fts['targets'] = targets
-                                    print(f'ref: {targets} via {cmd=}')
-                                    just_change_fts = False
-                                else:
-                                    print(f'no ref via {cmd=}')
-                                    cmd = None
-                            else:
-                                print("⚠ 机械臂不在初始位置，无法执行语音参考检测")
-                                cmd = None
-                        except queue.Empty:
-                            pass
-                        except Exception as e:
-                            print(f'{e}')
-                just_change_fts = False
             else:
                 self.mode = 'wait'
             
@@ -1318,13 +1250,13 @@ def init_robot():
     
 
 
-    ### 20260109
-    cfg.T_cam2flan = [-0.07583874846136467,0.05292914229358449,0.05706895145407312]
-    q = [0.1558761610824957,-0.16214154506130807,0.6975255175538586,-0.6803461575790205]
+    ### cam2flan: direct from extrinsics_flan_to_hand_camera.yaml (2026-01-26)
+    ### TF convention: (R_tf, t_tf) directly transforms p_flan = R_tf @ p_cam + t_tf
+    cfg.T_cam2flan = [-0.05564710239993588, 0.03727781226794723, 0.031246679490387654]
+    q = [-0.12905985339122353, 0.11551209453132931, -0.677635370030719, 0.7147103018307148]
 
     cfg.R_cam2flan = R.from_quat(q).as_matrix().tolist()
     cfg.T_gripper2flan = [0.0, 0.0, 0.13503]
-    #cfg.T_gripper2flan = [0.0, 0.0, 0.1000]
     arm = ArmRobot(cfg)
     arm.connect()
 
@@ -1340,7 +1272,7 @@ def init_robot():
 
 
     cfg = Config()
-    ref = DinoXDetectorOnline(cfg)
+    ref = SAM3Online(cfg)
     
     
     voc = None
@@ -1382,6 +1314,7 @@ def init_robot():
     cfg = Config()
     cfg.window_name = 'DINO-X Grasp'
     cfg.mode = 'ref'
+    cfg.detect_prompt = 'object'
     cfg.img_w = img_width
     cfg.img_h = img_height
     demo_robot = DemoRobot(cfg=cfg, camera=camera, det=det, arm=arm, ref=ref, voc=voc, tracker=tracker, chassis=chassis)

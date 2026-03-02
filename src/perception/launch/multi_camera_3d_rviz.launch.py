@@ -85,7 +85,7 @@ def generate_launch_description():
 
     # 检测参数
     auto_detect_rate_arg = DeclareLaunchArgument(
-        'auto_detect_rate', default_value='10.0',
+        'auto_detect_rate', default_value='5.0',
         description='Auto detection rate in Hz (0=disable)'
     )
     
@@ -149,7 +149,7 @@ def generate_launch_description():
             {'enable_chassis': LaunchConfiguration('enable_chassis')},
             {'detector_type': LaunchConfiguration('detector_type')},
             {'auto_detect_rate': LaunchConfiguration('auto_detect_rate')},
-            {'default_prompt': 'bottle.cup.box.barrel.toy.cabinet'},
+            {'default_prompt': 'bottle.cup.can.box.barrel.toy.cabinet'},
             # 匈牙利匹配融合参数
             {'fusion_distance_threshold': 0.2},  # 20cm 距离硬门控
             {'fusion_max_cost': 0.7},
@@ -186,6 +186,7 @@ def generate_launch_description():
             'enable_chassis': LaunchConfiguration('enable_chassis'),
             'target_frame': 'base_link',
             'extrinsics_dir': config_dir,
+            'extrinsics_suffix': LaunchConfiguration('extrinsics_suffix'),
             # 性能自适应参数
             'publish_rate': PythonExpression([
                 '0.0 if ', LaunchConfiguration('perf_mode'), '==0 else ',

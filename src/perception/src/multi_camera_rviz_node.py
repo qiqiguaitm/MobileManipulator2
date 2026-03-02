@@ -211,6 +211,7 @@ class MultiCameraRVizNode(Node):
         self.declare_parameter('lidar_skip', 1)
         self.declare_parameter('lidar_publish_rate', 10.0)
         self.declare_parameter('extrinsics_dir', '')
+        self.declare_parameter('extrinsics_suffix', '')
 
         self._target_frame = self.get_parameter('target_frame').value
         self._publish_rate = self.get_parameter('publish_rate').value
@@ -228,6 +229,7 @@ class MultiCameraRVizNode(Node):
         self._lidar_skip = self.get_parameter('lidar_skip').value
         self._lidar_publish_rate = self.get_parameter('lidar_publish_rate').value
         self._extrinsics_dir = self.get_parameter('extrinsics_dir').value
+        self._extrinsics_suffix = self.get_parameter('extrinsics_suffix').value
 
         # 感知节点名称（用于构建话题路径）
         self.declare_parameter('perception_node_name', 'multi_camera_perception')
@@ -239,8 +241,9 @@ class MultiCameraRVizNode(Node):
             if self._extrinsics_dir:
                 state.transformer.set_config_dir(self._extrinsics_dir)
             try:
-                state.transformer.load_all_extrinsics(camera_name=camera_name)
-                self.get_logger().info(f"[{camera_name}] Extrinsics loaded")
+                suffix = self._extrinsics_suffix if camera_name == 'chassis' else ''
+                state.transformer.load_all_extrinsics(camera_name=camera_name, suffix=suffix)
+                self.get_logger().info(f"[{camera_name}] Extrinsics loaded (suffix='{suffix}')")
             except Exception as e:
                 self.get_logger().warn(f"[{camera_name}] Failed to load extrinsics: {e}")
 

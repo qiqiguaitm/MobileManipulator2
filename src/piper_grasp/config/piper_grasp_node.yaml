@@ -23,9 +23,10 @@ piper_ros:
     # === Hand-eye calibration (20260109) ===
     #T_cam2flan: [-0.07583874846136467, 0.05292914229358449, 0.05706895145407312]  # meters
     #q_cam2flan: [0.1558761610824957, -0.16214154506130807, 0.6975255175538586, -0.6803461575790205]  # [x,y,z,w]
-    # === Hand-eye calibration (20260125) ===
-    T_cam2flan: [-0.05564710239993588,0.03727781226794723,0.031246679490387654]
-    q_cam2flan: [-0.12905985339122353,0.11551209453132931,-0.677635370030719,0.7147103018307148]
+    # === Hand-eye calibration: direct from flan_to_hand_camera (2026-01-26) ===
+    # TF convention: (R_tf, t_tf) directly transforms p_flan = R @ p_cam + t
+    T_cam2flan: [-0.05564710239993588, 0.03727781226794723, 0.031246679490387654]
+    q_cam2flan: [-0.12905985339122353, 0.11551209453132931, -0.677635370030719, 0.7147103018307148]
     # Gripper to flange offset (in meters)
     T_gripper2flan: [0.0, 0.0, 0.13503]  # meters (~135mm Z offset)
     # Z correction for grasp (empirical, in meters; 0.005m = 5mm)
@@ -105,7 +106,7 @@ piper_ros:
     # Segmented = multiple small MoveJ steps (reliable + near-straight)
     # IK = Pinocchio IK-planned trajectory (precise straight line with XY monitoring)
     use_segmented_descent: true  # Use segmented MoveJ for descent (recommended)
-    descent_segment_size: 100     # mm per segment (smaller = straighter path)
+    descent_segment_size: 60      # mm per segment (smaller = straighter, more stable near workspace limits)
     use_movel_descent: false     # MoveL for descending (has retract issue)
     use_movel_lift: false        # MoveL for lifting
 

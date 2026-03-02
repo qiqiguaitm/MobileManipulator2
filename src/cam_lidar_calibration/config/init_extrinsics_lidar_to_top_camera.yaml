@@ -1,0 +1,15 @@
+      
+header:
+  calibration_date: 2025-08-27
+  frame_id: rs16_lidar
+child_frame_id: top_camera_optical_frame
+transform:
+  translation:
+    x: -0.43
+    y: -0.013
+    z: 0.46
+  rotation: 
+    x: -0.509566
+    y: 0.510878
+    z: -0.483488
+    w: 0.495566

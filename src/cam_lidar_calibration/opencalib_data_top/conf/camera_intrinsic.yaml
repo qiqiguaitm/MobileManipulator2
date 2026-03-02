@@ -1,0 +1,12 @@
+image_width: 640
+image_height: 480
+camera_matrix: !!opencv-matrix
+  rows: 3
+  cols: 3
+  dt: d
+  data: [388.4384421889999, 0, 320.14125670968434, 0, 388.4845861268674, 243.6022810986274, 0, 0, 1]
+distortion_coefficients: !!opencv-matrix
+  rows: 1
+  cols: 5
+  dt: d
+  data: [-0.04981065633405169, 0.04404224258964281, -0.00037056971720793845, 2.7145387341935336e-05, 0.0]

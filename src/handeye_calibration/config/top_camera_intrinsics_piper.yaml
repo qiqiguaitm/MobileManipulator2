@@ -1,0 +1,87 @@
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: top_camera
+image_width: 640
+image_height: 480
+reprojection_error: 8.4434126017945088e-02
+distortion_parameters:
+   k1: -4.9810656334051691e-02
+   k2: 4.4042242589642809e-02
+   p1: -3.7056971720793845e-04
+   p2: 2.7145387341935336e-05
+projection_parameters:
+   fx: 3.8843844218899989e+02
+   fy: 3.8848458612686738e+02
+   cx: 3.2014125670968434e+02
+   cy: 2.4360228109862740e+02
+
+   
+model_type: PINHOLE
+camera_name: top_camera
+image_width: 640
+image_height: 360
+reprojection_error: 5.2961775244953928e-02
+distortion_parameters:
+   k1: -4.6910743427354823e-02
+   k2: 3.8651598185131648e-02
+   p1: -2.5412220429376546e-04
+   p2: 2.5903909496869282e-04
+projection_parameters:
+   fx: 3.2165544884804245e+02
+   fy: 3.2171526316358614e+02
+   cx: 3.1976838140570459e+02
+   cy: 1.8323639000254749e+02
+
+
+
+model_type: PINHOLE
+camera_name: top_camera
+image_width: 848
+image_height: 480
+reprojection_error: 9.3138267033913855e-02
+distortion_parameters:
+   k1: -4.5703326290427351e-02
+   k2: 3.7422194722764250e-02
+   p1: -2.7305737373640483e-04
+   p2: -4.5573724220853601e-05
+projection_parameters:
+   fx: 4.2924623210363569e+02
+   fy: 4.2923442865714514e+02
+   cx: 4.2403184893654031e+02
+   cy: 2.4394131061487414e+02
+
+model_type: PINHOLE
+camera_name: top_camera
+image_width: 1280
+image_height: 720
+reprojection_error: 1.0068347671465927e-01
+distortion_parameters:
+   k1: -4.6042043482716580e-02
+   k2: 3.8266427398921984e-02
+   p1: -3.1086007922858706e-04
+   p2: 1.1075007867296217e-04
+projection_parameters:
+   fx: 6.4328984784029933e+02
+   fy: 6.4345268414416012e+02
+   cx: 6.3947958898677075e+02
+   cy: 3.6631305223572861e+02
+
+model_type: PINHOLE
+camera_name: top_camera
+image_width: 1280
+image_height: 800
+reprojection_error: 8.2546009727728645e-02
+distortion_parameters:
+   k1: -4.5448965106484218e-02
+   k2: 3.6450871355310742e-02
+   p1: -4.0896976550170420e-04
+   p2: 1.0577731309945843e-04
+projection_parameters:
+   fx: 6.4310365518513868e+02
+   fy: 6.4315514600331994e+02
+   cx: 6.3952060386302560e+02
+   cy: 4.0511162221564825e+02
+
+
+    

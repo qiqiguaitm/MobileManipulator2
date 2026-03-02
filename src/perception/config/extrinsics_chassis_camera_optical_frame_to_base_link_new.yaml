@@ -1,20 +1,20 @@
 # Extrinsics: chassis_camera_optical_frame -> base_link
-# Computed: T_chassis_top (new calibration) @ T_top_base
-# Generated: 2026-02-26
+# Computed: T_chassis_to_top (2 coeff, fixed intrinsics) @ T_top_to_base
+# Generated: 2026-02-28
 
 header:
-  calibration_date: '2026-02-26'
-  source: 'Computed: T_chassis_top_new @ T_top_base'
+  calibration_date: '2026-02-28'
+  source: 'Computed: T_chassis_to_top (2 coeff) @ T_top_to_base'
   frame_id: chassis_camera_optical_frame
   child_frame_id: base_link
 
 transform:
   translation:
-    x: 0.042030867774618
-    y: 0.009355165975167
-    z: -0.389683702251641
+    x: 0.0404445557725642
+    y: -0.0248996193300302
+    z: -0.3996267589994176
   rotation:
-    x: -0.495077305610573
-    y: 0.503939003456685
-    z: -0.500959282894174
-    w: -0.499983738882191
+    x: 0.4751428351600755
+    y: -0.4817134000984054
+    z: 0.5212252778898581
+    w: 0.5201112343050466

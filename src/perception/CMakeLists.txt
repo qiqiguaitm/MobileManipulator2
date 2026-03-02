@@ -62,6 +62,7 @@ set(_node_scripts
   multi_camera_rviz_node
   dual_camera_baselink_validation
   percept_benchmark
+  stereo_chessboard_capture
 )
 foreach(_script ${_node_scripts})
   install(PROGRAMS "src/${_script}.py"

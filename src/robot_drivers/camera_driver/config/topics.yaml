@@ -9,15 +9,15 @@ topics:
         type: sensor_msgs/Image
     hand_camera:
       color_raw:
-        name: /camera/top/color/raw
+        name: /camera/hand/color/raw
         type: sensor_msgs/Image
       depth_raw:
-        name: /camera/top/depth/raw
+        name: /camera/hand/depth/raw
         type: sensor_msgs/Image
     chassis_camera:
       color_raw:
-        name: /camera/top/color/raw
+        name: /camera/chassis/color/raw
         type: sensor_msgs/Image
       depth_raw:
-        name: /camera/top/depth/raw
+        name: /camera/chassis/depth/raw
         type: sensor_msgs/Image

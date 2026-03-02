@@ -176,7 +176,7 @@ class PiperRobot:
         eef_in_base = end_pos_m
         return dict(point_in_base=point_in_base, offset=offset,eef_in_base=eef_in_base)
     
-    def pick(self, offset, angle=None, min_z=-150, gripper_width=None):
+    def pick(self, offset, angle=None, min_z=-270, gripper_width=None):
         """
         Execute pick operation - simplified V2 style
         
@@ -428,12 +428,12 @@ def create_config():
     # cfg.init_pos = dict(x=345, y=0, z=380, roll=180, pitch=30, yaw=180)  #flange
     cfg.init_pos =dict(x=400, y=0, z=150, roll=180, pitch=30, yaw=180) # gripper center
     
-    # Coordinate transforms (from existing config)
-    cfg.T_cam2flan = [0.04010927904656854, 0.08283986339504643, 0.0025333968091171308]
-    cfg.q_cam2flan = [0.14206540330899609, -0.1423312973808512, 0.6810236905433535, 0.7041064947060541]
+    # cam2flan: direct from extrinsics_flan_to_hand_camera.yaml (2026-01-26)
+    # TF convention: (R_tf, t_tf) directly transforms p_flan = R_tf @ p_cam + t_tf
+    cfg.T_cam2flan = [-0.05564710239993588, 0.03727781226794723, 0.031246679490387654]
+    cfg.q_cam2flan = [-0.12905985339122353, 0.11551209453132931, -0.677635370030719, 0.7147103018307148]
     cfg.R_cam2flan = R.from_quat(cfg.q_cam2flan).as_matrix().tolist()
-    #cfg.T_gripper2flan = [0.0, 0.0, 0.13503]
-    cfg.T_gripper2flan = [0.0, 0.0, 0.1000]
+    cfg.T_gripper2flan = [0.0, 0.0, 0.13503]
     cfg.gripper_as_end = True
     
     # Gripper config

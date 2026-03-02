@@ -1,0 +1,104 @@
+# Hand Camera Intrinsics
+# Multiple resolutions calibrated with OpenCV
+# Camera ID: 337122071190 (RealSense D435)
+
+# Resolution: 640x480
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 640
+image_height: 480
+reprojection_error: 9.7057594546085799e-02
+distortion_parameters:
+   k1: 1.1033357611334441e-01
+   k2: -2.3608190334358059e-01
+   p1: -1.2299948498537954e-04
+   p2: -2.2040822376272629e-03
+projection_parameters:
+   fx: 5.9862224999338537e+02
+   fy: 5.9858790156676343e+02
+   cx: 3.2589258390330514e+02
+   cy: 2.5167975200211239e+02
+
+
+
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 640
+image_height: 360
+reprojection_error: 1.0106710378819475e-01
+distortion_parameters:
+   k1: 9.8313639794911631e-02
+   k2: -1.9372686101021064e-01
+   p1: -9.1901628001115861e-04
+   p2: -5.8934767490080868e-04
+projection_parameters:
+   fx: 4.4925619240639361e+02
+   fy: 4.4917137799349501e+02
+   cx: 3.2630224164796573e+02
+   cy: 1.8830418403658612e+02
+
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 848
+image_height: 480
+reprojection_error: 1.1231152910332438e-01
+distortion_parameters:
+   k1: 9.2760285966257738e-02
+   k2: -1.8625192572189364e-01
+   p1: -1.5313079642532851e-03
+   p2: -1.0088156460161671e-03
+projection_parameters:
+   fx: 5.9671595832595415e+02
+   fy: 5.9673277995899082e+02
+   cx: 4.3245498058889547e+02
+   cy: 2.4940523451364908e+02
+
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 960
+image_height: 540
+reprojection_error: 1.3282678349077143e-01
+distortion_parameters:
+   k1: 9.3631210864477496e-02
+   k2: -1.8181186321648499e-01
+   p1: 2.1366273367628399e-04
+   p2: -9.1491990337056643e-04
+projection_parameters:
+   fx: 6.7399453020025271e+02
+   fy: 6.7397824068741932e+02
+   cx: 4.8928195521842957e+02
+   cy: 2.8436613134407247e+02
+
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 1280
+image_height: 720
+reprojection_error: 1.5740265417108823e-01
+distortion_parameters:
+   k1: 9.5397640854840010e-02
+   k2: -1.8900324464918383e-01
+   p1: -5.6648965656800883e-04
+   p2: -9.0360347538127211e-04
+projection_parameters:
+   fx: 8.9851958403808044e+02
+   fy: 8.9849079913179310e+02
+   cx: 6.5245076567517492e+02
+   cy: 3.7679089645648418e+02
+
+model_type: PINHOLE
+camera_name: hand_camera
+image_width: 1920
+image_height: 1080
+reprojection_error: 1.7945962811401434e-01
+distortion_parameters:
+   k1: 9.6602900717685500e-02
+   k2: -1.9895636291289751e-01
+   p1: -7.5319630390754933e-04
+   p2: -1.1906182026939713e-03
+projection_parameters:
+   fx: 1.3419673934320035e+03
+   fy: 1.3419921790478343e+03
+   cx: 9.7755406531759002e+02
+   cy: 5.6524736594658668e+02
+
+    

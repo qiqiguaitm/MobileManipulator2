@@ -1,0 +1,10 @@
+# Ignore calibration data files
+*.bag
+*.pcd
+*.png
+*.yaml
+*.json
+
+# Keep directory structure
+!.gitkeep
+!.gitignore

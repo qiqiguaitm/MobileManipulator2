@@ -465,13 +465,13 @@ def init_robot():
     #q =  [0.10700593899442587, -0.10600588348980507, 0.7000388532345616, 0.6980387422253201]  # [x,y,z,w]
 
 
-    ### 20260109
-    cfg.T_cam2flan = [-0.07583874846136467,0.05292914229358449,0.05706895145407312]
-    q = [0.1558761610824957,-0.16214154506130807,0.6975255175538586,-0.6803461575790205]
+    ### cam2flan: direct from extrinsics_flan_to_hand_camera.yaml (2026-01-26)
+    ### TF convention: (R_tf, t_tf) directly transforms p_flan = R_tf @ p_cam + t_tf
+    cfg.T_cam2flan = [-0.05564710239993588, 0.03727781226794723, 0.031246679490387654]
+    q = [-0.12905985339122353, 0.11551209453132931, -0.677635370030719, 0.7147103018307148]
 
     cfg.R_cam2flan = R.from_quat(q).as_matrix().tolist()
     cfg.T_gripper2flan = [0.0, 0.0, 0.13503]
-    #cfg.T_gripper2flan = [0.0, 0.0, 0.1000]
     cfg.gripper_as_end = True
     arm = ArmRobot(cfg)
     arm.connect()

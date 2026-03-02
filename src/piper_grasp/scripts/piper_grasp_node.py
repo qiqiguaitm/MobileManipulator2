@@ -719,7 +719,7 @@ class PiperGraspNode(Node):
         except Exception as e:
             response.success = False
             response.message = str(e)
-            response.connection_state = 255  # CONN_ERROR
+            response.connection_state = EnableEnhanced.Response.CONN_ERROR
 
         return response
 
@@ -828,6 +828,7 @@ class PiperGraspNode(Node):
             if self._action_busy:
                 response.success = False
                 response.message = "Action in progress, cannot move"
+                self.get_logger().warn("GO_READY: Rejected - action in progress")
                 return response
 
         try:
@@ -844,6 +845,18 @@ class PiperGraspNode(Node):
                 'yaw': ready_cfg.get('yaw', 180),
             }
 
+            connected = self.arm.is_connected if self.arm else False
+            enabled = self.is_enabled
+
+            if not connected:
+                response.success = False
+                response.message = "Arm not connected"
+                return response
+            if not enabled:
+                response.success = False
+                response.message = "Arm not enabled"
+                return response
+
             with self._arm_lock:
                 result = self.arm.go_ready(
                     ready_pos=ready_pos,
@@ -852,13 +865,23 @@ class PiperGraspNode(Node):
                 )
 
                 if not result:
-                    raise RuntimeError("Failed to reach ready position")
+                    # Get error state for diagnosis
+                    try:
+                        has_err, err_type = self.arm._get_error_type()
+                        _, cur = self.arm.get_position(return_gripper_center=True)
+                        msg = (f"Failed to reach ready position: error={err_type if has_err else 'NONE'}, "
+                               f"current=({cur[0]:.1f},{cur[1]:.1f},{cur[2]:.1f})")
+                    except Exception:
+                        msg = "Failed to reach ready position (could not read status)"
+                    self.get_logger().error(f"GO_READY: {msg}")
+                    raise RuntimeError(msg)
 
                 _, pos = self.arm.get_position(return_gripper_center=True)
 
             response.success = True
             response.message = "Ready position reached"
             response.position = [float(p) for p in pos]
+            self.get_logger().info(f"GO_READY: Success, pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})")
 
         except Exception as e:
             response.success = False
@@ -868,6 +891,7 @@ class PiperGraspNode(Node):
             except Exception:
                 response.position = []
             response.message = str(e)
+            self.get_logger().error(f"GO_READY: Failed - {e}")
 
         return response
 
@@ -971,9 +995,15 @@ class PiperGraspNode(Node):
                     width3d_mm = percept_resp.width3d * M_TO_MM
 
                     # Coordinate transform (all in mm)
+                    self.get_logger().info(
+                        f'OBSERVE_DEBUG: cam=[{point3d_cam_mm[0]:.1f},{point3d_cam_mm[1]:.1f},{point3d_cam_mm[2]:.1f}] '
+                        f'eef=[{end_pose[0]:.1f},{end_pose[1]:.1f},{end_pose[2]:.1f},{end_pose[3]:.1f},{end_pose[4]:.1f},{end_pose[5]:.1f}]')
                     transform_result = self._compute_grasp_offset(point3d_cam_mm, end_pose)
                     point3d_base = transform_result['point_in_base']
                     offset = transform_result['offset']
+                    self.get_logger().info(
+                        f'OBSERVE_DEBUG: base=[{point3d_base[0]:.1f},{point3d_base[1]:.1f},{point3d_base[2]:.1f}] '
+                        f'offset=[{offset[0]:.1f},{offset[1]:.1f},{offset[2]:.1f}]')
 
                     # Check blacklist (retry on hit, matching ROS1)
                     is_black, reason = self._check_blacklist(
@@ -1044,7 +1074,7 @@ class PiperGraspNode(Node):
         end_pose = list(request.end_pose) if request.end_pose else None
         point_in_base_mm = list(request.point_in_base) if request.point_in_base else None
 
-        response.in_working_area = self.in_working_area(
+        response.in_area = self.in_working_area(
             offset=offset,
             yaw=yaw,
             point3d_cam_mm=point3d_cam_mm,
@@ -1176,7 +1206,8 @@ class PiperGraspNode(Node):
             target_z -= grasp_depth
 
             # Apply min_z limit
-            min_z = grasp_cfg.get('min_z', -150) if math.isnan(goal.min_z) else goal.min_z
+            # ROS2 float32 defaults to 0.0 (not NaN), so treat 0.0 as "use config"
+            min_z = grasp_cfg.get('min_z', -150) if (math.isnan(goal.min_z) or goal.min_z == 0.0) else goal.min_z
             if target_z < min_z:
                 target_z = min_z
 
@@ -1192,11 +1223,18 @@ class PiperGraspNode(Node):
 
             self.get_logger().info(f"Pick target: [{target_x:.1f}, {target_y:.1f}, {target_z:.1f}]mm")
 
-            # === APPROACHING ===
+            # === APPROACHING (single move, same as ROS1) ===
+            # ROS1 proven strategy: one MoveJ to [target_x, target_y, approach_z, approach_pitch]
+            # Two-stage (safe_z then descend) fails at far targets because
+            # safe_z=200mm + X=392mm → flange ~498mm, exceeding arm reach (~500mm).
+            # Single move to approach_z (target_z+100) keeps flange well within workspace.
             approach_pitch = grasp_cfg.get('approach_pitch', 10)
-            self.get_logger().info(f"=== PICK: APPROACHING === target=[{target_x:.1f}, {target_y:.1f}, {target_z + 100:.1f}]mm pitch={approach_pitch}")
-            send_feedback(2, "Approaching", 0.2, "Moving XY")
-            tmp = self.arm.set_position(x=target_x, y=target_y, z=target_z + 100,
+            approach_z = target_z + 100
+
+            self.get_logger().info(f"=== PICK: APPROACHING === target=[{target_x:.1f}, {target_y:.1f}, {approach_z:.1f}]mm pitch={approach_pitch}")
+            send_feedback(2, "Approaching", 0.2, "Moving to approach")
+
+            tmp = self.arm.set_position(x=target_x, y=target_y, z=approach_z,
                                         pitch=approach_pitch, wait=True, speed=speed,
                                         use_gripper_center=True)
             if not tmp:
@@ -1306,7 +1344,10 @@ class PiperGraspNode(Node):
             if not tmp:
                 raise RuntimeError("Failed to lift after pick")
 
-            # === RETURNING ===
+            # === RETURNING (always return to ready, same as ROS1) ===
+            # Must return to ready before place: at far pick positions (X>400mm),
+            # the arm can't safely lift or move XY without exceeding workspace limits.
+            # ROS1 always returns to ready; place starts from ready position.
             self.get_logger().info("=== PICK: RETURNING ===")
             ready_yaw = ready_cfg.get('yaw', 180)
             send_feedback(8, "Returning to ready", 0.9)
@@ -1454,6 +1495,11 @@ class PiperGraspNode(Node):
             place_y = flange_y + offset_base[1]
             place_z = flange_z + offset_base[2]
 
+            self.get_logger().info(
+                f"Place flange: [{flange_x:.1f}, {flange_y:.1f}, {flange_z:.1f}]mm, "
+                f"gripper_center: [{place_x:.1f}, {place_y:.1f}, {place_z:.1f}]mm, "
+                f"rpy=[{place_roll:.1f}, {place_pitch:.1f}, {place_yaw:.1f}]")
+
             # === SAFE LIFT ===  (state: MOVING=1)
             safe_z = max(place_z, grasp_cfg.get('safe_z', 200))
             self.get_logger().info("=== PLACE: SAFE LIFT ===")
@@ -1483,9 +1529,9 @@ class PiperGraspNode(Node):
                 goal_handle.canceled()
                 return result
 
-            # === DESCEND ===  (state: MOVING=1, matching ROS1)
+            # === DESCEND ===
             self.get_logger().info("=== PLACE: DESCENDING ===")
-            send_feedback(1, "Descending to place", 0.3)
+            send_feedback(2, "Descending to place", 0.3)
             use_movel = grasp_cfg.get('use_movel_descent', True)
             tmp = self.arm.set_position(z=place_z, wait=True, speed=speed,
                                   use_gripper_center=True, linear=use_movel)

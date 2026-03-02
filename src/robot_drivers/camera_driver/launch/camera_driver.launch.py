@@ -14,6 +14,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     GroupAction,
+    OpaqueFunction,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -163,41 +164,60 @@ def generate_launch_description():
         ]
     )
 
-    # ========== Hand Camera (delayed 3 seconds) ==========
-    hand_camera_launch = TimerAction(
-        period=3.0,
-        actions=[
-            GroupAction(
-                condition=IfCondition(hand_enable),
-                actions=[
-                    IncludeLaunchDescription(
-                        PythonLaunchDescriptionSource(
-                            os.path.join(realsense_dir, 'launch', 'rs_launch.py')
-                        ),
-                        launch_arguments=get_camera_args('hand', 'camera', hand_serial_no).items()
-                    )
-                ]
-            )
-        ]
-    )
+    # ========== Hand & Chassis Cameras (delayed, scope-safe) ==========
+    # NOTE: OpaqueFunction is used to resolve LaunchConfiguration values at
+    # traversal time. This avoids a scoping bug where TimerAction fires AFTER
+    # IncludeLaunchDescription has popped its LaunchConfiguration scope,
+    # causing "launch configuration does not exist" errors.
+    def _create_delayed_cameras(context, *args, **kwargs):
+        """Create delayed camera launches with resolved values."""
+        rs_launch = os.path.join(realsense_dir, 'launch', 'rs_launch.py')
+        cfg = context.launch_configurations
+        actions = []
 
-    # ========== Chassis Camera (delayed 3 seconds) ==========
-    chassis_camera_launch = TimerAction(
-        period=3.0,
-        actions=[
-            GroupAction(
-                condition=IfCondition(chassis_enable),
-                actions=[
-                    IncludeLaunchDescription(
-                        PythonLaunchDescriptionSource(
-                            os.path.join(realsense_dir, 'launch', 'rs_launch.py')
-                        ),
-                        launch_arguments=get_camera_args('chassis', 'camera', chassis_serial_no).items()
-                    )
-                ]
-            )
-        ]
-    )
+        def _resolved_camera_args(camera_name, serial_key):
+            return {
+                'camera_name': camera_name,
+                'camera_namespace': 'camera',
+                'serial_no': cfg.get(serial_key, ''),
+                'initial_reset': cfg.get('initial_reset', 'true'),
+                'enable_depth': cfg.get('enable_depth', 'true'),
+                'enable_color': cfg.get('enable_color', 'true'),
+                'enable_infra1': 'false',
+                'enable_infra2': 'false',
+                'enable_gyro': 'false',
+                'enable_accel': 'false',
+                'depth_module.depth_profile': cfg.get('depth_profile', '1280,720,6'),
+                'rgb_camera.color_profile': cfg.get('color_profile', '1280,720,6'),
+                'enable_sync': cfg.get('enable_sync', 'true'),
+                'align_depth.enable': cfg.get('align_depth_enable', 'true'),
+                'pointcloud.enable': cfg.get('pointcloud_enable', 'false'),
+                'publish_tf': cfg.get('publish_tf', 'true'),
+            }
+
+        delay = float(cfg.get('camera_delay', '3.0'))
+
+        if cfg.get('hand_enable', 'false').lower() == 'true':
+            actions.append(TimerAction(
+                period=delay,
+                actions=[IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(rs_launch),
+                    launch_arguments=_resolved_camera_args('hand', 'hand_serial_no').items()
+                )]
+            ))
+
+        if cfg.get('chassis_enable', 'false').lower() == 'true':
+            actions.append(TimerAction(
+                period=delay,
+                actions=[IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(rs_launch),
+                    launch_arguments=_resolved_camera_args('chassis', 'chassis_serial_no').items()
+                )]
+            ))
+
+        return actions
+
+    delayed_cameras = OpaqueFunction(function=_create_delayed_cameras)
 
     # ========== Camera TF Publisher ==========
     camera_tf_publisher_node = Node(
@@ -231,10 +251,9 @@ def generate_launch_description():
         enable_camera_tf_arg,
         camera_delay_arg,
 
-        # Launch cameras with delays to avoid USB conflicts
+        # Launch cameras
         top_camera_launch,      # Starts immediately
-        hand_camera_launch,     # Starts after 3 seconds
-        chassis_camera_launch,  # Starts after 6 seconds
+        delayed_cameras,        # Hand & chassis cameras (delayed, scope-safe)
 
         # Launch TF publisher
         camera_tf_publisher_node,

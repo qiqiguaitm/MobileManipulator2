@@ -63,6 +63,9 @@ for arg in "$@"; do
         --new-extrinsics)
             EXTRINSICS_SUFFIX="_new"
             ;;
+        --extrinsics-suffix=*)
+            EXTRINSICS_SUFFIX="${arg#*=}"
+            ;;
         -h|--help)
             head -25 "$0" | tail -23
             exit 0

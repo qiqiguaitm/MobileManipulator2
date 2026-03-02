@@ -216,7 +216,7 @@ class PerceptionGraspNode(Node):
         if detector_type == 'sam3':
             sam3_cfg = services_cfg.get('sam3', {})
             det_config = SimpleConfig(
-                url=sam3_cfg.get('url', 'http://192.168.112.14:8080'),
+                url=sam3_cfg.get('url', 'http://192.168.112.14:8081'),
                 min_score=min_score
             )
             self.object_detector = SAM3Online(det_config)
@@ -233,7 +233,7 @@ class PerceptionGraspNode(Node):
         # 3. DepthOptimizerOnline (CDM)
         cdm_cfg = services_cfg.get('cdm', {})
         cdm_config = SimpleConfig(
-            url=cdm_cfg.get('url', 'http://192.168.112.14:8086'),
+            url=cdm_cfg.get('url', 'http://192.168.112.14:8082'),
             chosen_policy=cdm_cfg.get('chosen_policy', 'dn'),
             warmup=0
         )
@@ -297,8 +297,9 @@ class PerceptionGraspNode(Node):
         if self.rgb is None or self.depth is None:
             return
 
-        # 调用检测 (不等待锁，如果正在检测则跳过)
-        self.detect(self._realtime_prompt, enable_cdm=self._realtime_enable_cdm, wait_for_lock=False)
+        # 调用检测 (不等待锁，如果正在检测则跳过; verbose=False 抑制例行日志)
+        self.detect(self._realtime_prompt, enable_cdm=self._realtime_enable_cdm,
+                    wait_for_lock=False, verbose=False)
 
     def _detect_service_callback(self, request, response):
         """Service 回调 (等待锁，确保服务调用能完成)"""
@@ -318,7 +319,7 @@ class PerceptionGraspNode(Node):
         response.detection_time_ms = result.get('detection_time_ms', 0.0)
         return response
 
-    def detect(self, prompt, enable_cdm=True, wait_for_lock=True):
+    def detect(self, prompt, enable_cdm=True, wait_for_lock=True, verbose=True):
         """
         三服务完全并行调用:
         - GraspAnything: forward(rgb) 内部已包含 post_process
@@ -329,6 +330,7 @@ class PerceptionGraspNode(Node):
             prompt: 检测提示词 (如 "bottle.cup" 或 "box")
             enable_cdm: 是否启用 CDM 深度优化
             wait_for_lock: True=等待锁(Service调用), False=跳过(Timer调用)
+            verbose: True=输出详细日志(Service调用), False=仅输出关键日志(实时模式)
 
         Returns:
             dict: 检测结果
@@ -350,7 +352,8 @@ class PerceptionGraspNode(Node):
             t0 = time.time()
             timing = {}  # 时间分布统计
 
-            self.log.info(f"DETECT: Start detection: prompt='{prompt}', enable_cdm={enable_cdm}")
+            if verbose:
+                self.log.info(f"DETECT: Start detection: prompt='{prompt}', enable_cdm={enable_cdm}")
 
             # === 获取当前帧 (加锁保护) ===
             with self._data_lock:
@@ -429,11 +432,13 @@ class PerceptionGraspNode(Node):
             if enable_cdm and results.get('cdm') and results['cdm'].get('success'):
                 depth_optimized = results['cdm']['depth'].astype(np.float32) / 1000.0
                 depth_optimized_mm = results['cdm']['depth']  # 保留 mm 格式用于发布
-                self.log.info("CDM: Using optimized depth")
+                if verbose:
+                    self.log.info("CDM: Using optimized depth")
+
             else:
                 depth_optimized = depth
                 depth_optimized_mm = depth_mm
-                if enable_cdm:
+                if enable_cdm and verbose:
                     self.log.warn("CDM: Depth optimization failed, using raw depth")
 
             # === 处理 GraspAnything 结果 ===
@@ -450,15 +455,16 @@ class PerceptionGraspNode(Node):
             else:
                 targets = []
 
-            self.log.info(f"DETECT: GraspAnything: {len(affs[0]) if affs and affs[0] else 0} objects, "
-                          f"DinoX: {len(targets)} targets")
+            if verbose:
+                self.log.info(f"DETECT: GraspAnything: {len(affs[0]) if affs and affs[0] else 0} objects, "
+                              f"DinoX: {len(targets)} targets")
 
             t3 = time.time()
             timing['parse_results'] = (t3 - t2) * 1000
 
             # === 构建 GraspObjectArray ===
             grasp_objects, chosen_idx = self._build_grasp_objects(
-                rgb, depth_optimized, affs, targets, img_w, img_h)
+                rgb, depth_optimized, affs, targets, img_w, img_h, verbose=verbose)
 
             t4 = time.time()
             timing['build_objects'] = (t4 - t3) * 1000
@@ -492,8 +498,9 @@ class PerceptionGraspNode(Node):
             timing['total'] = (t5 - t0) * 1000
 
             # === 输出时间分布 ===
-            timing_str = ' | '.join([f"{k}:{v:.0f}" for k, v in timing.items()])
-            self.log.info(f"TIMING: {timing_str}")
+            if verbose:
+                timing_str = ' | '.join([f"{k}:{v:.0f}" for k, v in timing.items()])
+                self.log.info(f"TIMING: {timing_str}")
 
             # 构建返回值 (兼容 Service 响应)
             if chosen_idx >= 0 and chosen_idx < len(grasp_objects):
@@ -509,16 +516,18 @@ class PerceptionGraspNode(Node):
                     'depth_value': chosen.depth,
                     'detection_time_ms': detection_time_ms
                 }
-                self.log.info(f"DETECT: Success: category={chosen.category}, "
-                              f"point3d={[round(x*1000) for x in result['point3d']]}mm, "
-                              f"score={chosen.grasp_score:.2f}, time={detection_time_ms:.0f}ms")
+                if verbose:
+                    self.log.info(f"DETECT: Success: category={chosen.category}, "
+                                  f"point3d={[round(x*1000) for x in result['point3d']]}mm, "
+                                  f"score={chosen.grasp_score:.2f}, time={detection_time_ms:.0f}ms")
             else:
                 result = {
                     'success': False,
                     'error_message': 'No valid grasp found',
                     'detection_time_ms': detection_time_ms
                 }
-                self.log.warn(f"DETECT: Failed: No valid grasp, time={detection_time_ms:.0f}ms")
+                if verbose:
+                    self.log.warn(f"DETECT: Failed: No valid grasp, time={detection_time_ms:.0f}ms")
 
             return result
 
@@ -604,7 +613,7 @@ class PerceptionGraspNode(Node):
 
         return combined
 
-    def _build_grasp_objects(self, rgb, depth, affs, targets, img_w, img_h):
+    def _build_grasp_objects(self, rgb, depth, affs, targets, img_w, img_h, verbose=True):
         """
         构建 GraspObject 列表
 
@@ -627,7 +636,8 @@ class PerceptionGraspNode(Node):
                 if isinstance(obj, dict):
                     total_grasp_points += len(obj.get('affs', []))
 
-        self.log.info(f"BUILD: GraspAnything total grasp points: {total_grasp_points}, DinoX targets: {len(targets)}")
+        if verbose:
+            self.log.info(f"BUILD: GraspAnything total grasp points: {total_grasp_points}, DinoX targets: {len(targets)}")
 
         # ===== 优化：预解码所有 mask（避免重复解码）=====
         mask_cache = {}  # 缓存已解码的 mask
@@ -667,10 +677,11 @@ class PerceptionGraspNode(Node):
                         }
                         mask_decode_success += 1
                 except Exception as e:
-                    self.log.warn(f"BUILD: Mask decode failed for target {target_idx} ({targets[target_idx].get('category', 'unknown')}): {e}")
+                    if verbose:
+                        self.log.warn(f"BUILD: Mask decode failed for target {target_idx} ({targets[target_idx].get('category', 'unknown')}): {e}")
 
         # 输出 mask 解码统计
-        if len(targets) > 0:
+        if verbose and len(targets) > 0:
             self.log.info(f"BUILD: Masks decoded: {mask_decode_success}/{len(targets)}")
 
         # 为每个 target 找到最佳抓取点
@@ -684,9 +695,6 @@ class PerceptionGraspNode(Node):
                 continue
 
             x1, y1, x2, y2 = target_bbox[:4]
-
-            # DEBUG: 输出 bbox 坐标
-            self.log.info(f"DEBUG T{target_idx}({target_category}): bbox=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]")
 
             # ============================================================
             # 规则2：bbox 短边尺寸过滤（提前过滤整个 target）
@@ -710,10 +718,6 @@ class PerceptionGraspNode(Node):
             total_affs_in_bbox = 0  # bbox内的总抓取点数
 
             if affs and len(affs) > 0 and affs[0]:
-                # DEBUG: 输出 grasp 物体数量
-                if target_idx == 0:
-                    self.log.info(f"DEBUG: Total grasp objects={len(affs[0])}")
-
                 for obj_idx, obj in enumerate(affs[0]):
                     if not isinstance(obj, dict):
                         continue
@@ -737,26 +741,8 @@ class PerceptionGraspNode(Node):
                     affs_obj = obj.get('affs', [])
                     tps = obj.get('touching_points', [])
 
-                    # DEBUG: 打印 grasp 服务返回的数据结构
-                    if obj_idx == 0 and target_idx == 0:  # 只打印第一个物体，避免日志过多
-                        self.log.info(f"DEBUG: Grasp result structure for obj {obj_idx}:")
-                        self.log.info(f"  - Available keys in obj: {list(obj.keys())}")
-                        self.log.info(f"  - scores_obj length: {len(scores_obj)}")
-                        self.log.info(f"  - affs_obj length: {len(affs_obj)}")
-                        self.log.info(f"  - tps length: {len(tps)}")
-                        if len(scores_obj) > 0:
-                            self.log.info(f"  - scores_obj[:3]: {scores_obj[:3]}")
-                        if len(affs_obj) > 0:
-                            self.log.info(f"  - affs_obj[0][:2] (cx,cy): {affs_obj[0][:2]}")
-                        else:
-                            self.log.warn(f"  - No score field found! Checked: scores, confidence, conf, score")
-
                     for i, aff in enumerate(affs_obj):
                         cx, cy = aff[0], aff[1]
-
-                        # DEBUG: 输出第一个 affordance 的坐标
-                        if i == 0 and obj_idx == 0 and target_idx == 0:
-                            self.log.info(f"DEBUG: First aff coord: ({cx:.1f}, {cy:.1f}), bbox: [{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]")
 
                         # 检查是否在 bbox 内
                         if not (x1 <= cx <= x2 and y1 <= cy <= y2):
@@ -788,8 +774,8 @@ class PerceptionGraspNode(Node):
                             depth_at_point = depth[cy_int, cx_int]
                             if not (min_depth < depth_at_point < max_depth):
                                 if depth_filtered_count == 0:
-                                    self.log.info(f"DEPTH_REJECT T{target_idx}({target_category}): "
-                                                  f"pixel=({cx_int},{cy_int}), depth={depth_at_point:.4f}m, "
+                                    self.log.warn(f"DEPTH_REJECT T{target_idx}({target_category}): "
+                                                  f"pixel=({cx_int},{cy_int}), depth={depth_at_point:.3f}m, "
                                                   f"range=[{min_depth},{max_depth}]")
                                 depth_filtered_count += 1
                                 continue  # 深度不在有效范围，跳过此 affordance
@@ -815,14 +801,7 @@ class PerceptionGraspNode(Node):
                                 'touching_points': tps[i] if i < len(tps) else []
                             }
 
-            # 收集统计信息（优化：批量输出减少日志开销）
-            # DEBUG: 输出每个 target 的抓取点查找结果
-            self.log.info(f"DEBUG T{target_idx}({target_category}): total_in_bbox={total_affs_in_bbox}, "
-                         f"best_grasp={'Found' if best_grasp else 'None'}, "
-                         f"score_filter={score_filtered_count}, depth_filter={depth_filtered_count}, "
-                         f"boundary_filter={boundary_filtered_count}, mask_filter={mask_overlap_filtered_count}")
-
-            # 详细过滤统计
+            # 收集过滤统计
             filter_details = []
             if total_affs_in_bbox > 0:
                 filter_details.append(f"total={total_affs_in_bbox}")
@@ -836,7 +815,7 @@ class PerceptionGraspNode(Node):
                 filter_details.append(f"mask={mask_overlap_filtered_count}")
 
             # 如果没有找到有效抓取点，打印详细信息
-            if total_affs_in_bbox > 0 and best_grasp is None:
+            if total_affs_in_bbox > 0 and best_grasp is None and verbose:
                 self.log.warn(f"BUILD: T{target_idx}({target_category}): All {total_affs_in_bbox} affs filtered! "
                              f"{', '.join(filter_details)}")
             elif filter_details:
@@ -878,7 +857,8 @@ class PerceptionGraspNode(Node):
                         obj_msg.mask_rle = ""
                         obj_msg.mask_size = [0, 0]
                 except Exception as e:
-                    self.log.warn(f"DETECT: Mask RLE encode failed: {e}")
+                    if verbose:
+                        self.log.warn(f"DETECT: Mask RLE encode failed: {e}")
                     obj_msg.mask_rle = ""
                     obj_msg.mask_size = [0, 0]
             else:
@@ -902,6 +882,9 @@ class PerceptionGraspNode(Node):
                 # 原: depth_val = depth[cy, cx] if 0 <= cy < img_h and 0 <= cx < img_w else 0
                 cached_mask = mask_cache.get(target_idx)
                 depth_val = self._get_robust_depth(depth, cached_mask, target_bbox, min_depth, max_depth)
+                if not (min_depth < depth_val < max_depth):
+                    self.log.warn(f"ROBUST_DEPTH_REJECT T{target_idx}({target_category}): "
+                                  f"depth={depth_val:.3f}m, range=[{min_depth},{max_depth}]")
                 if min_depth < depth_val < max_depth:
                     point3d = self._deproject_pixel_to_point([cx, cy], depth_val)
                     obj_msg.position = Point(x=point3d[0], y=point3d[1], z=point3d[2])
@@ -920,10 +903,8 @@ class PerceptionGraspNode(Node):
                     width_valid = (obj_msg.grasp_width3d == 0.0 or obj_msg.grasp_width3d <= max_gripper_width)
 
                     if not width_valid:
-                        # 优化：使用 debug 级别减少日志开销
-                        if self.get_parameter('log_level').value == 'DEBUG':
-                            self.log.debug(f"BUILD: Target {target_idx} ({target_category}): Grasp too wide "
-                                          f"({obj_msg.grasp_width3d*1000:.1f}mm > {max_gripper_width*1000:.1f}mm), skipped for chosen")
+                        self.log.warn(f"WIDTH_REJECT T{target_idx}({target_category}): "
+                                      f"width={obj_msg.grasp_width3d*1000:.1f}mm > max={max_gripper_width*1000:.1f}mm")
 
                     # 更新最佳选择（只有宽度有效时才更新）
                     if width_valid:
@@ -970,11 +951,11 @@ class PerceptionGraspNode(Node):
             grasp_objects.append(obj_msg)
 
         # 批量输出 bbox 尺寸过滤统计
-        if bbox_filtered_count > 0:
+        if verbose and bbox_filtered_count > 0:
             self.log.info(f"BUILD: Bbox size filter: {bbox_filtered_count} targets filtered (too large for gripper)")
 
         # 批量输出过滤日志摘要（优化：减少日志调用次数）
-        if build_logs:
+        if verbose and build_logs:
             self.log.info(f"BUILD: Filters applied: {' | '.join(build_logs)}")
 
         return grasp_objects, chosen_idx

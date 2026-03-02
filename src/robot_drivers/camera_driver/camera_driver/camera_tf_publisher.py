@@ -139,7 +139,9 @@ class CameraTFPublisher(Node):
                     self.get_logger().warning(f'Lidar config condition failed: parent={parent}, child={child}')
 
         # 2. Calibrated LiDAR to chassis camera physical position
-        chassis_config = os.path.join(self.config_path, 'extrinsics_lidar_to_chassis_camera.yaml')
+        chassis_config = os.path.join(self.config_path, 'extrinsics_lidar_to_chassis_camera_link.yaml')
+        if not os.path.exists(chassis_config):
+            self.get_logger().warning(f'Chassis camera extrinsics not found: {chassis_config}')
         if os.path.exists(chassis_config):
             result = self._load_transform_from_yaml(chassis_config)
             if result:
@@ -164,7 +166,9 @@ class CameraTFPublisher(Node):
                     )
 
         # 3. Calibrated LiDAR to top camera physical position
-        top_config = os.path.join(self.config_path, 'extrinsics_lidar_to_top_camera.yaml')
+        top_config = os.path.join(self.config_path, 'extrinsics_lidar_to_top_camera_link.yaml')
+        if not os.path.exists(top_config):
+            self.get_logger().warning(f'Top camera extrinsics not found: {top_config}')
         if os.path.exists(top_config):
             result = self._load_transform_from_yaml(top_config)
             if result:

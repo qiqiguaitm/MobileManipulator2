@@ -1,0 +1,13 @@
+# OpenCalib lidar_2_camera configuration
+
+# Checkerboard parameters
+checkerboard_rows: 7
+checkerboard_cols: 6
+square_size: 0.072
+
+# Data paths
+image_path: "/home/agilex/MobileManipulator/src/cam_lidar_calibrate/opencalib_data_top/image"
+pcd_path: "/home/agilex/MobileManipulator/src/cam_lidar_calibrate/opencalib_data_top/pcd"
+
+# Camera intrinsic file
+camera_intrinsic: "/home/agilex/MobileManipulator/src/cam_lidar_calibrate/opencalib_data_top/conf/camera_intrinsic.yaml"

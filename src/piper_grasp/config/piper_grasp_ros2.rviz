@@ -5,7 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 169
+    Tree Height: 441
   - Class: piper_grasp/PiperGraspPanel
     Name: Piper Grasp Control
     prompt: bottle.cup.box.toy.pen
@@ -40,13 +40,61 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        arm_base:
+          Value: true
+        base_link:
+          Value: true
+        calibration/lidar:
+          Value: true
+        camera/chassis_link:
+          Value: true
+        camera/hand_link:
+          Value: true
+        camera/top_link:
+          Value: true
+        chassis_camera_link:
+          Value: true
+        gripper_base:
+          Value: true
+        hand_camera_link:
+          Value: true
+        hand_color_frame:
+          Value: true
+        hand_color_optical_frame:
+          Value: true
+        hand_depth_frame:
+          Value: true
+        hand_depth_optical_frame:
+          Value: true
+        hand_link:
+          Value: true
+        link1:
+          Value: true
+        link2:
+          Value: true
+        link3:
+          Value: true
+        link4:
+          Value: true
+        link5:
+          Value: true
+        link6:
+          Value: true
+        link7:
+          Value: true
+        link8:
+          Value: true
+        top_camera_link:
+          Value: true
       Marker Scale: 0.30000001192092896
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
-        {}
+        base_link:
+          calibration/lidar:
+            {}
       Update Interval: 0
       Value: true
     - Alpha: 0.800000011920929
@@ -67,6 +115,56 @@ Visualization Manager:
         Expand Link Details: false
         Expand Tree: false
         Link Tree Style: Links in Alphabetic Order
+        arm_base:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        gripper_base:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link1:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link2:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link3:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link4:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link5:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link6:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link7:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        link8:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
       Mass Properties:
         Inertia: false
         Mass: false
@@ -194,13 +292,61 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        arm_base:
+          Value: true
+        base_link:
+          Value: true
+        calibration/lidar:
+          Value: true
+        camera/chassis_link:
+          Value: true
+        camera/hand_link:
+          Value: true
+        camera/top_link:
+          Value: true
+        chassis_camera_link:
+          Value: true
+        gripper_base:
+          Value: true
+        hand_camera_link:
+          Value: true
+        hand_color_frame:
+          Value: true
+        hand_color_optical_frame:
+          Value: true
+        hand_depth_frame:
+          Value: true
+        hand_depth_optical_frame:
+          Value: true
+        hand_link:
+          Value: true
+        link1:
+          Value: true
+        link2:
+          Value: true
+        link3:
+          Value: true
+        link4:
+          Value: true
+        link5:
+          Value: true
+        link6:
+          Value: true
+        link7:
+          Value: true
+        link8:
+          Value: true
+        top_camera_link:
+          Value: true
       Marker Scale: 0.30000001192092896
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
-        {}
+        base_link:
+          calibration/lidar:
+            {}
       Update Interval: 0
       Value: true
   Enabled: true
@@ -247,18 +393,18 @@ Visualization Manager:
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 968
+  Height: 1016
   Hide Left Dock: false
   Hide Right Dock: false
   PerceptionPanel:
     collapsed: false
   Piper Grasp Control:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000001900000036efc0200000004fb0000001e00500065007200630065007000740069006f006e00500061006e0065006c010000003d000000d10000002800fffffffc00000114000000b50000002800fffffffa000000000100000002fb000000100052006100770049006d0061006700650100000000ffffffff0000007b00fffffffb000000100044006900730070006c0061007900730000000000000001900000015600fffffffb000000260050006900700065007200200047007200610073007000200043006f006e00740072006f006c01000001cf000001dc0000005a00fffffffb0000000a0056006900650077007300000002b3000000f8000000a400ffffff000004e80000036e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000003840000039efc0200000004fb0000001e00500065007200630065007000740069006f006e00500061006e0065006c010000003d000000dd0000002800fffffffc00000120000000bf0000002800fffffffa000000000100000002fb000000100052006100770049006d0061006700650100000000ffffffff0000007b00fffffffb000000100044006900730070006c0061007900730000000000000001900000015600fffffffb000000260050006900700065007200200047007200610073007000200043006f006e00740072006f006c01000001e5000001f60000005a00fffffffb0000000a0056006900650077007300000002b3000000f8000000a400ffffff000003b00000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   RawImage:
     collapsed: false
   Views:
     collapsed: false
-  Width: 1662
-  X: 117
-  Y: 55
+  Width: 1850
+  X: 70
+  Y: 27

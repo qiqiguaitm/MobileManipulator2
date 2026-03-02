@@ -1,0 +1,50 @@
+{
+    "camera-intrinsic": {
+        "sensor_name": "camera",
+        "target_sensor_name": "camera",
+        "device_type": "camera",
+        "param_type": "intrinsic",
+        "param": {
+            "img_dist_w": 640,
+            "img_dist_h": 480,
+            "cam_K": {
+                "rows": 3,
+                "cols": 3,
+                "type": 6,
+                "continuous": true,
+                "data": [
+                    [
+                        388.4384421889999,
+                        0,
+                        320.14125670968434
+                    ],
+                    [
+                        0,
+                        388.4845861268674,
+                        243.6022810986274
+                    ],
+                    [
+                        0,
+                        0,
+                        1
+                    ]
+                ]
+            },
+            "cam_dist": {
+                "rows": 1,
+                "cols": 5,
+                "type": 6,
+                "continuous": true,
+                "data": [
+                    [
+                        -0.04981065633405169,
+                        0.04404224258964281,
+                        -0.00037056971720793845,
+                        2.7145387341935336e-05,
+                        0.0
+                    ]
+                ]
+            }
+        }
+    }
+}

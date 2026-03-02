@@ -88,14 +88,10 @@ def generate_launch_description():
         description='Logging level: DEBUG, INFO, WARN, ERROR, FATAL'
     )
 
-    # Camera config (matching ROS1 demo_grasp.launch)
+    # Camera config - parameters forwarded to camera_driver.launch.py
     hand_camera_arg = DeclareLaunchArgument(
         'hand_camera', default_value='true',
-        description='Enable hand camera'
-    )
-    hand_serial_arg = DeclareLaunchArgument(
-        'hand_serial_no', default_value="'337122071190'",
-        description='Hand camera serial number (D435)'
+        description='Enable hand camera (via camera_driver)'
     )
 
     # Perception config
@@ -136,40 +132,22 @@ def generate_launch_description():
         description='Place object after picking in demo mode'
     )
 
-    # ==================== Hand Camera ====================
+    # ==================== Hand Camera (via camera_driver) ====================
+    # Delegate to camera_driver.launch.py - single source of truth for camera params
+    # (resolution, fps, serial_no, etc. all configured in camera_driver)
     hand_camera_launch = None
-    if _is_package_available('realsense2_camera'):
-        realsense_dir = get_package_share_directory('realsense2_camera')
-        hand_camera_launch = TimerAction(
-            period=1.0,  # Small delay for system init
+    if _is_package_available('camera_driver'):
+        camera_driver_dir = get_package_share_directory('camera_driver')
+        hand_camera_launch = GroupAction(
+            condition=IfCondition(LaunchConfiguration('hand_camera')),
             actions=[
-                GroupAction(
-                    condition=IfCondition(LaunchConfiguration('hand_camera')),
-                    actions=[
-                        IncludeLaunchDescription(
-                            PythonLaunchDescriptionSource(
-                                os.path.join(realsense_dir, 'launch', 'rs_launch.py')
-                            ),
-                            launch_arguments={
-                                'camera_name': 'hand',
-                                'camera_namespace': 'camera',
-                                'serial_no': LaunchConfiguration('hand_serial_no'),
-                                'initial_reset': 'true',
-                                'enable_depth': 'true',
-                                'enable_color': 'true',
-                                'enable_infra1': 'false',
-                                'enable_infra2': 'false',
-                                'enable_gyro': 'false',
-                                'enable_accel': 'false',
-                                'depth_module.depth_profile': '640,480,15',
-                                'rgb_camera.color_profile': '640,480,15',
-                                'enable_sync': 'true',
-                                'align_depth.enable': 'true',
-                                'pointcloud.enable': 'false',
-                                'publish_tf': 'true',
-                            }.items()
-                        )
-                    ]
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(camera_driver_dir, 'launch', 'camera_driver.launch.py')
+                    ),
+                    launch_arguments={
+                        'hand_enable': 'true',
+                    }.items()
                 )
             ]
         )
@@ -326,7 +304,6 @@ def generate_launch_description():
         log_level_arg,
         # Camera config arguments
         hand_camera_arg,
-        hand_serial_arg,
         # Perception config arguments
         perception_arg,
         perf_mode_arg,

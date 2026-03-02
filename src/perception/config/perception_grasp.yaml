@@ -11,7 +11,7 @@ perception_grasp_node:
     # 触发模式配置
     trigger:
       realtime_mode:
-        enabled: true
+        enabled: false
         rate: 1.0
         default_prompt: 'pen.box.phone.bottle.toy'
         prompt_topic: '/usr/prompt/grasp'
@@ -42,7 +42,7 @@ perception_grasp_node:
       distance_weight: 0.8
       distance_mode: 'reciprocal'
       normalize_distance: true
-      debug: true
+      debug: false
 
     # 过滤参数
     filter:

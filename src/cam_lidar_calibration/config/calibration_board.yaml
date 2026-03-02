@@ -1,0 +1,14 @@
+# 标定板配置
+# Calibration Board Configuration
+
+chessboard:
+  # 内角点数量 (cols x rows)
+  pattern_cols: 7
+  pattern_rows: 6
+
+  # 方格边长 (米)
+  square_size: 0.072
+
+  # 标定板物理尺寸 (米) - 包括边框的完整尺寸
+  board_width: 0.70
+  board_height: 0.60

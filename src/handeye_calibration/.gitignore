@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Calibration data
+calibration_data/
+*.png
+*.jpg
+*.jpeg
+
+# Ignore verified_data images but allow metadata files
+verified_data/**/*.png
+verified_data/**/*.jpg
+verified_data/**/*.jpeg
+
+# Allow verified_data metadata files
+!verified_data/**/poses.txt
+!verified_data/**/calibration_data.json
+!verified_data/**/calibration_metadata.json
+!verified_data/**/*.yaml
+!verified_data/**/*.json
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak

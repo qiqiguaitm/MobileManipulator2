@@ -692,13 +692,13 @@ class DepthOptimizerOnline:
 
         Args:
             cfg: 配置对象，包含：
-                - url: 服务地址，默认 http://192.168.112.14:8081
+                - url: 服务地址，默认 http://192.168.112.14:8082
                 - chosen_policy: 输出策略 ('dn,vis', 'dn', 'vis')
                 - target_long: letterbox 长边目标尺寸，默认 798
                 - target_short: letterbox 短边目标尺寸，默认 448
                 - warmup: 预热次数，默认 0
         """
-        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8081')
+        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8082')
         self.api_url = f'{self.base_url}/api/predict'
         self.chosen_policy = getattr(cfg, 'chosen_policy', 'dn,vis')
         self.target_long = getattr(cfg, 'target_long', 798)
@@ -976,7 +976,7 @@ class SAM3Online:
 
         Args:
             cfg: 配置对象，包含：
-                - url: 服务地址，默认 http://192.168.112.14:8080
+                - url: 服务地址，默认 http://192.168.112.14:8081
                 - confidence: 置信度阈值，默认 0.30
                 - return_mask: 是否返回 mask，默认 True
                 - tiled: 是否使用平铺模式，默认 False
@@ -984,7 +984,7 @@ class SAM3Online:
                 - resize: 图片缩放尺寸 (width, height)，默认 None
                 - warmup: 预热次数，默认 0
         """
-        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8080')
+        self.base_url = getattr(cfg, 'url', 'http://192.168.112.14:8081')
         self.api_url = f'{self.base_url}/api/predict'
         self.health_url = f'{self.base_url}/api/health'
         self.confidence = getattr(cfg, 'confidence', 0.30)

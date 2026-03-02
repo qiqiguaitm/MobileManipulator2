@@ -2,7 +2,6 @@ import logging
 import os
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import pyrealsense2 as rs
 from mmengine.config import Config
@@ -374,6 +373,8 @@ class RealSenseCamera:
         return ret
 
     def plot_image_bundle(self):
+        import matplotlib.pyplot as plt
+
         images = self.get_image_bundle()
 
         rgb = images['rgb']

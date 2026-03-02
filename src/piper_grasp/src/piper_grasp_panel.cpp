@@ -15,6 +15,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <limits>
 
 namespace piper_grasp
 {
@@ -646,6 +647,7 @@ void PiperGraspPanel::handleObserveResult(bool success, const QString& category,
                 goal.use_last_observe = true;
                 goal.speed = 30;
                 goal.return_to_ready = false;
+                goal.min_z = std::numeric_limits<float>::quiet_NaN();
 
                 auto send_goal_options = rclcpp_action::Client<PickAction>::SendGoalOptions();
                 send_goal_options.goal_response_callback =
@@ -864,7 +866,12 @@ void PiperGraspPanel::pickResultCallback(
             QString::fromStdString(result.result->error_message);
         Q_EMIT pickResult(result.result->success, msg);
     } else {
-        Q_EMIT pickResult(false, "Action failed");
+        // Show actual error_message from aborted/canceled results
+        QString msg = (result.result && !result.result->error_message.empty()) ?
+            QString::fromStdString(result.result->error_message) :
+            QString("Action %1").arg(
+                result.code == rclcpp_action::ResultCode::CANCELED ? "canceled" : "aborted");
+        Q_EMIT pickResult(false, msg);
     }
 }
 
@@ -896,7 +903,11 @@ void PiperGraspPanel::placeResultCallback(
             QString::fromStdString(result.result->error_message);
         Q_EMIT placeResult(result.result->success, msg);
     } else {
-        Q_EMIT placeResult(false, "Action failed");
+        QString msg = (result.result && !result.result->error_message.empty()) ?
+            QString::fromStdString(result.result->error_message) :
+            QString("Action %1").arg(
+                result.code == rclcpp_action::ResultCode::CANCELED ? "canceled" : "aborted");
+        Q_EMIT placeResult(false, msg);
     }
 }
 
@@ -1111,17 +1122,34 @@ void PiperGraspPanel::onObserveClicked()
     std::thread([this, prompt_str]() {
         if (!panel_alive_.load() || !node_) return;
 
-        // Go ready first
+        // Go ready with gripper open (matching ROS1 behavior)
         auto ready_req = std::make_shared<piper_msgs::srv::GoReady::Request>();
         ready_req->speed = 30;
         ready_req->open_gripper = true;
         auto ready_future = srv_go_ready_->async_send_request(ready_req);
-        if (ready_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready ||
-            !ready_future.get()->success) {
+        auto ready_status = ready_future.wait_for(std::chrono::seconds(30));
+        if (ready_status != std::future_status::ready) {
             if (panel_alive_.load()) {
-                Q_EMIT observeResult(false, "", 0, "Go ready failed");
+                Q_EMIT observeResult(false, "", 0, "Go ready timeout (30s)");
             }
             return;
+        }
+        auto ready_resp = ready_future.get();
+        if (!ready_resp->success) {
+            std::string msg = ready_resp->message;
+            // Critical errors: abort. Position timeout: continue (arm+gripper moved)
+            bool critical = (msg.find("not connected") != std::string::npos ||
+                             msg.find("not enabled") != std::string::npos ||
+                             msg.find("Action in progress") != std::string::npos);
+            if (critical) {
+                if (panel_alive_.load()) {
+                    Q_EMIT observeResult(false, "", 0,
+                        QString("Go ready failed: %1").arg(QString::fromStdString(msg)));
+                }
+                return;
+            }
+            // Soft failure (position timeout) - arm+gripper moved, continue
+            RCLCPP_WARN(node_->get_logger(), "Go ready soft failure: %s (continuing)", msg.c_str());
         }
 
         if (!panel_alive_.load()) return;
@@ -1193,17 +1221,32 @@ void PiperGraspPanel::onLetsGraspClicked()
     std::thread([this, prompt_str]() {
         if (!panel_alive_.load() || !node_) return;
 
-        // Go ready first
+        // Go ready with gripper open (matching ROS1 behavior)
         auto ready_req = std::make_shared<piper_msgs::srv::GoReady::Request>();
         ready_req->speed = 30;
         ready_req->open_gripper = true;
         auto ready_future = srv_go_ready_->async_send_request(ready_req);
-        if (ready_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready ||
-            !ready_future.get()->success) {
+        auto ready_status = ready_future.wait_for(std::chrono::seconds(30));
+        if (ready_status != std::future_status::ready) {
             if (panel_alive_.load()) {
-                Q_EMIT observeResult(false, "", 0, "Go ready failed");
+                Q_EMIT observeResult(false, "", 0, "Go ready timeout (30s)");
             }
             return;
+        }
+        auto ready_resp = ready_future.get();
+        if (!ready_resp->success) {
+            std::string msg = ready_resp->message;
+            bool critical = (msg.find("not connected") != std::string::npos ||
+                             msg.find("not enabled") != std::string::npos ||
+                             msg.find("Action in progress") != std::string::npos);
+            if (critical) {
+                if (panel_alive_.load()) {
+                    Q_EMIT observeResult(false, "", 0,
+                        QString("Go ready failed: %1").arg(QString::fromStdString(msg)));
+                }
+                return;
+            }
+            RCLCPP_WARN(node_->get_logger(), "Go ready soft failure: %s (continuing)", msg.c_str());
         }
 
         if (!panel_alive_.load()) return;
@@ -1381,17 +1424,32 @@ void PiperGraspPanel::startNextAutoCycle()
     std::thread([this, prompt_str]() {
         if (!panel_alive_.load() || !node_) return;
 
-        // Go ready first
+        // Go ready with gripper open (matching ROS1 behavior)
         auto ready_req = std::make_shared<piper_msgs::srv::GoReady::Request>();
         ready_req->speed = 30;
         ready_req->open_gripper = true;
         auto ready_future = srv_go_ready_->async_send_request(ready_req);
-        if (ready_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready ||
-            !ready_future.get()->success) {
+        auto ready_status = ready_future.wait_for(std::chrono::seconds(30));
+        if (ready_status != std::future_status::ready) {
             if (panel_alive_.load()) {
-                Q_EMIT observeResult(false, "", 0, "Go ready failed");
+                Q_EMIT observeResult(false, "", 0, "Go ready timeout (30s)");
             }
             return;
+        }
+        auto ready_resp = ready_future.get();
+        if (!ready_resp->success) {
+            std::string msg = ready_resp->message;
+            bool critical = (msg.find("not connected") != std::string::npos ||
+                             msg.find("not enabled") != std::string::npos ||
+                             msg.find("Action in progress") != std::string::npos);
+            if (critical) {
+                if (panel_alive_.load()) {
+                    Q_EMIT observeResult(false, "", 0,
+                        QString("Go ready failed: %1").arg(QString::fromStdString(msg)));
+                }
+                return;
+            }
+            RCLCPP_WARN(node_->get_logger(), "Go ready soft failure: %s (continuing)", msg.c_str());
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(CAMERA_SETTLE_TIME_MS));

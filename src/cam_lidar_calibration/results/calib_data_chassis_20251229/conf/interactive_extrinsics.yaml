@@ -1,0 +1,16 @@
+child_frame_id: chassis_camera_optical_frame
+frame_id: rs16_lidar
+header:
+  calibration_date: '2025-12-29'
+  method: interactive_multi_frame
+  n_frames: 9
+transform:
+  rotation:
+    w: 0.5365022917777225
+    x: -0.47599014793835215
+    y: 0.45778585478722
+    z: -0.5253863160947488
+  translation:
+    x: 0.05238698781974381
+    y: 0.02134418909748536
+    z: 0.0722020663750455

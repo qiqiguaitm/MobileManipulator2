@@ -1,0 +1,43 @@
+{
+    "lidar-to-camera-extrinsic": {
+        "sensor_name": "lidar",
+        "target_sensor_name": "camera",
+        "device_type": "relational",
+        "param_type": "extrinsic",
+        "param": {
+            "time_lag": 0,
+            "sensor_calib": {
+                "rows": 4,
+                "cols": 4,
+                "type": 6,
+                "continuous": true,
+                "data": [
+                    [
+                        0.010486045943999933,
+                        -0.04145168948,
+                        0.999085626312,
+                        -0.43
+                    ],
+                    [
+                        -0.9998525463119999,
+                        0.013163691000000144,
+                        0.011040403783999897,
+                        -0.013
+                    ],
+                    [
+                        -0.01360944148000015,
+                        -0.99905393364,
+                        -0.04130767847999994,
+                        0.46
+                    ],
+                    [
+                        0,
+                        0,
+                        0,
+                        1
+                    ]
+                ]
+            }
+        }
+    }
+}

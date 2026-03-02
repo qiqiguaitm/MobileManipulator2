@@ -261,7 +261,7 @@ def run_visualization_test(all_data, run_dir, text_prompt_dinox, text_prompt_sam
     # SAM3
     try:
         cfg = SimpleConfig(
-            url='http://192.168.112.14:8080',
+            url='http://192.168.112.14:8081',
             min_score=0.30,
             return_mask=False,
             warmup=0
@@ -289,7 +289,7 @@ def run_visualization_test(all_data, run_dir, text_prompt_dinox, text_prompt_sam
     # CDM
     try:
         cfg = SimpleConfig(
-            url='http://192.168.112.14:8081',
+            url='http://192.168.112.14:8082',
             chosen_policy='dn',
             warmup=0
         )
@@ -650,7 +650,7 @@ def main():
     # ========== 2. SAM3 测试 ==========
     try:
         cfg = SimpleConfig(
-            url='http://192.168.112.14:8080',
+            url='http://192.168.112.14:8081',
             min_score=0.30,
             return_mask=False,
             warmup=0
@@ -704,7 +704,7 @@ def main():
     # ========== 4. CDM 测试 ==========
     try:
         cfg = SimpleConfig(
-            url='http://192.168.112.14:8081',
+            url='http://192.168.112.14:8082',
             chosen_policy='dn',
             warmup=0
         )
@@ -732,7 +732,7 @@ def main():
         # 复用已有的 SAM3 和 CDM 服务实例
         if 'sam3_service' not in dir():
             cfg = SimpleConfig(
-                url='http://192.168.112.14:8080',
+                url='http://192.168.112.14:8081',
                 min_score=0.30,
                 return_mask=False,
                 warmup=0
@@ -741,7 +741,7 @@ def main():
 
         if 'cdm_service' not in dir():
             cfg = SimpleConfig(
-                url='http://192.168.112.14:8081',
+                url='http://192.168.112.14:8082',
                 chosen_policy='dn',
                 warmup=0
             )

@@ -1,0 +1,120 @@
+# Hand-Eye Calibration Configuration
+# Version: 3.5.1
+
+# ============================================================================
+# 标定模式配置
+# ============================================================================
+# 可选值: eye_in_hand, eye_to_hand
+calibration_mode: eye_in_hand
+
+# ============================================================================
+# Eye-in-Hand 配置 (相机在末端)
+# ============================================================================
+eye_in_hand:
+  # 相机配置
+  camera:
+    serial_id: "344322074267"  # RealSense hand camera
+    intrinsics_file: "hand_camera_intrinsics_xarm.yaml"  # 相对于 config/ 目录
+
+  # 棋盘格参数（Eye-in-Hand 模式）
+  chessboard:
+    board_size: [11, 8]  # 内角点数量 (width, height)
+    square_size_mm: 30.0  # 每个方格边长（毫米）
+
+  # 物理配置
+  target:
+    position: "fixed"  # 棋盘格固定在外部（base附近）
+    description: "11x8 chessboard, 30mm squares"
+
+# ============================================================================
+# Eye-to-Hand 配置 (相机固定)
+# ============================================================================
+eye_to_hand:
+  # 相机配置
+  camera:
+    serial_id: "318122302992"  # RealSense top camera
+    intrinsics_file: "top_camera_intrinsics_xarm.yaml"  # 相对于 config/ 目录
+
+  # 棋盘格参数（Eye-to-Hand 模式）
+  chessboard:
+    board_size: [6, 4]  # 内角点数量 (width, height)
+    square_size_mm: 40.0  # 每个方格边长（毫米）- 注意：夹爪上的棋盘格较小
+
+  # 物理配置
+  target:
+    position: "on_gripper"  # 棋盘格固定在机械臂末端
+    description: "6x4 chessboard, 40mm squares, mounted on gripper"
+    mounting_note: "使用示教模式手动固定在末端"
+
+
+# ============================================================================
+# 机器人配置
+# ============================================================================
+robot:
+  initial_position: [320, 0, 450, 90, -80, 80]  # mm, mm, mm, deg, deg, deg
+
+  # TCP偏移配置（Tool Center Point Offset）
+  # 用于补偿相机相对于机械臂法兰的物理偏移
+  # 格式: [x, y, z, roll, pitch, yaw] (mm, mm, mm, deg, deg, deg)
+  tcp_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 相机Z轴向下偏移172mm
+
+  motion_config:
+    warmup_speed: 40
+    normal_speed: 25
+    capture_speed: 20
+    stability_wait: 2.0
+    extra_settle_time: 2.0
+
+# ============================================================================
+# 数据质量过滤（两种模式通用）
+# ============================================================================
+quality_filter:
+  min_motion_mm: 5.0  # 最小位移（毫米）
+  min_rotation_deg: 2.0  # 最小旋转（度）
+  boundary_margin_ratio: 0.05  # 边界裕度（图像宽度的5%），减少过滤
+  max_pitch_deg: null  # 最大俯仰角变化量（相对初始位姿，度），null 表示不限制
+  max_roll_deg: null  # 最大滚转角变化量（相对初始位姿，度），null 表示不限制
+  max_yaw_deg: null  # 最大偏航角变化量（相对初始位姿，度），null 表示不限制
+  max_reprojection_error_px: 3.0  # 最大重投影误差（像素），放宽限制
+
+# ============================================================================
+# RANSAC 配置（两种模式通用）
+# ============================================================================
+ransac:
+  threshold_mm: 10.0  # RANSAC 内点阈值（毫米），放宽到10mm
+  min_inlier_ratio: 0.2  # 最小内点比例，降低要求
+  max_iterations: 2000  # 最大迭代次数，增加迭代
+
+# ============================================================================
+# 标定算法配置
+# ============================================================================
+calibration:
+  min_frames: 10  # 最少标定帧数
+  algorithms:  # 支持的算法
+    - TSAI
+    - PARK
+    - HORAUD
+    - DANIILIDIS
+    - ANDREFF
+
+  optimization:
+    method: "L-BFGS-B"
+    max_iterations: 50
+    ftol: 1.0e-6
+    gtol: 1.0e-5
+    rotation_bound_deg: 5.0  # 旋转优化边界（度）
+    translation_bound_mm: 10.0  # 平移优化边界（毫米）
+
+# ============================================================================
+# 质量评估标准
+# ============================================================================
+quality_thresholds:
+  excellent:
+    translation_mm: 2.0
+    rotation_deg: 0.3
+  good:
+    translation_mm: 5.0
+    rotation_deg: 0.5
+  acceptable:
+    translation_mm: 10.0
+    rotation_deg: 1.0

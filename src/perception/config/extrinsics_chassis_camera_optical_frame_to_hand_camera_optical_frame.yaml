@@ -1,0 +1,30 @@
+# Extrinsics: chassis_camera_optical_frame -> hand_camera_optical_frame
+# P_chassis = R * P_hand + T
+#
+# IMPORTANT: hand camera is mounted on the arm flange.
+# This transform is ONLY valid at the specific flange pose recorded during capture:
+#   x=60.49mm y=3.643mm z=550.536mm roll=-166.498 pitch=83.085 yaw=-163.317 deg
+#   (see calibration_data/multi_eye_20260302_113545/arm_pose.yaml)
+
+header:
+  calibration_date: '2026-03-02'
+  method: matlab_stereo_calibration
+  source: MATLAB Stereo Camera Calibrator App
+  note: Camera1=Chassis, Camera2=Hand in MATLAB. P_chassis = R * P_hand + T
+  stereo_data: calibration_data/multi_eye_20260302_113545
+  flange_pose_at_capture: 'x=60.49 y=3.643 z=550.536 mm, roll=-166.498 pitch=83.085 yaw=-163.317 deg'
+  hand_eye_ref: extrinsics_flan_to_hand_camera.yaml
+
+frame_id: chassis_camera_optical_frame
+child_frame_id: hand_camera_optical_frame
+
+transform:
+  translation:
+    x: -0.0122554867182891
+    y: -0.7336852985178058
+    z: -0.0754040754695580
+  rotation:
+    x: -0.2892069230341667
+    y: -0.0115720017640440
+    z: -0.0071256116657309
+    w: 0.9571701364452778

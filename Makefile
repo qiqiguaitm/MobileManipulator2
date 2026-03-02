@@ -19,7 +19,7 @@ ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
         build build-all build-drivers build-slam build-nav build-perception \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
-        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-stop \
+        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-full-sam3-stereo-hand percept-stop \
         status stop clean kill-ros health
 
 help:
@@ -388,6 +388,18 @@ percept-full-sam3:
 # 一键启动 - 使用新标定外参（测试用）
 percept-full-new:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --new-extrinsics
+
+# 测试新标定外参 (2系数固定内参, 2026-02-28)
+percept-full-sam3-new:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_new
+
+# 测试立体手链外参 (chassis→hand→flange→base, 2026-03-02)
+percept-full-sam3-stereo-hand:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_stereo_hand
+
+# 临时测试 - 使用最早的旧外参 (_back)
+percept-full-sam3-back:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_back
 
 # 停止感知节点（Python节点用pkill，[x]技巧避免自杀）
 percept-stop:
