@@ -335,8 +335,10 @@ class ByteTracker3D:
         remaining_tracks = [all_stracks[i] for i in unmatched_track_indices]
 
         matches2 = []
+        unmatched_low_det_indices = list(range(len(low_dets)))  # 默认：全部未匹配
+
         if remaining_tracks and low_dets:
-            matches2, unmatched_remaining_indices, _ = \
+            matches2, unmatched_remaining_indices, unmatched_low_det_indices = \
                 self._match(remaining_tracks, low_dets, self.cfg.second_thresh)
 
             # 更新/恢复匹配的轨迹
@@ -383,7 +385,8 @@ class ByteTracker3D:
                 # 未确认的新轨迹也标记为Lost
                 track.mark_lost()
 
-        # ========== Step 5: 新轨迹 (未匹配的高置信度检测) ==========
+        # ========== Step 5: 新轨迹 (未匹配的检测) ==========
+        # 5a: 高置信度（双相机融合）
         for d_idx in unmatched_det_indices:
             det = high_dets[d_idx]
             new_track = STrack3D(
@@ -391,7 +394,7 @@ class ByteTracker3D:
                 category=det['category'],
                 confidence=det['confidence'],
                 cfg=self.cfg,
-                detection=det,  # 保存原始检测数据
+                detection=det,
             )
             new_track.frame_id = self.frame_id
             new_track.start_frame = self.frame_id
@@ -399,7 +402,26 @@ class ByteTracker3D:
             self.tracked_stracks.append(new_track)
 
             if self.log:
-                self.log.debug(f"New track {new_track.track_id}: {det['category']}")
+                self.log.debug(f"New track {new_track.track_id}: {det['category']} (fused)")
+
+        # 5b: 低置信度（单相机检测）
+        # 单相机检测也可以创建新轨迹，confirm_frames 机制会过滤噪声
+        for d_idx in unmatched_low_det_indices:
+            det = low_dets[d_idx]
+            new_track = STrack3D(
+                position=det['position'],
+                category=det['category'],
+                confidence=det['confidence'],
+                cfg=self.cfg,
+                detection=det,
+            )
+            new_track.frame_id = self.frame_id
+            new_track.start_frame = self.frame_id
+            new_track.tracklet_len = 1
+            self.tracked_stracks.append(new_track)
+
+            if self.log:
+                self.log.debug(f"New track {new_track.track_id}: {det['category']} (single-cam)")
 
         # ========== Step 6: 更新轨迹池 ==========
         self._update_pools()
@@ -526,7 +548,7 @@ class ByteTracker3D:
                 # 已确认轨迹：使用 track_id + Kalman 滤波位置
                 track = confirmed_tracks[det_id]
                 obj = {
-                    'track_id': track.track_id,
+                    'track_id': f"track_{track.track_id}",
                     'category': track.category,
                     'position': track.position,  # Kalman 滤波后的位置
                     'confidence': track.confidence,
