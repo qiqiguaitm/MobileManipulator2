@@ -120,6 +120,7 @@ class MultiCameraPerceptionNode(Node):
         self._last_detect_time = 0.0
         self._last_results = {'top': None, 'chassis': None, 'fused': None}
         self._results_lock = threading.Lock()  # 保护 _last_results 和 fusion 的线程安全
+        self._fused_counter = 0  # 融合对象顺序计数器（替代 id(obj) % 10000）
 
         # CV Bridge
         self._bridge = CvBridge()
@@ -264,24 +265,30 @@ class MultiCameraPerceptionNode(Node):
         )
 
         # 初始化 ByteTracker3D 跟踪器（跟踪融合后的结果）
-        # 根据检测率动态计算参数
-        detect_rate = max(self.auto_detect_rate, 1.0)  # 至少 1Hz
-        track_buffer = int(detect_rate * 3.0)  # 3秒最大丢失时间
-        confirm_frames = max(2, int(detect_rate * 0.3))  # 0.3秒确认时间，至少2帧
+        # 频率关系: 每个相机 ~auto_detect_rate Hz，融合回调 ~2×auto_detect_rate Hz
+        # tracker.update() 每次融合回调调用一次，frame_id 按此计数
+        n_cameras = int(self.enable_top) + int(self.enable_chassis)
+        fusion_rate = max(self.auto_detect_rate * max(n_cameras, 1), 1.0)
+        track_buffer = int(fusion_rate * 3.0)    # 3秒丢失容忍
+        confirm_frames = max(2, int(fusion_rate * 0.3))  # 0.3秒确认，至少2帧
+        reid_buffer = int(fusion_rate * 10.0)    # 10秒 Re-ID 窗口 (+ Lost 3秒 = 总计13秒)
 
         tracker_cfg = TrackerConfig(
             match_thresh=0.15,       # 第一阶段: 15cm 匹配阈值
             second_thresh=0.25,      # 第二阶段: 25cm (ByteTrack低置信度恢复)
             track_buffer=track_buffer,
             confirm_frames=confirm_frames,
+            reid_thresh=0.3,         # Re-ID: 30cm (比匹配更宽松)
+            reid_buffer=reid_buffer,
         )
         self._tracker = ByteTracker3D(tracker_cfg, self.get_logger())
         self.get_logger().info(
             f"[TRACKER] ByteTracker3D 已初始化: "
             f"match_thresh={tracker_cfg.match_thresh}m, "
             f"second_thresh={tracker_cfg.second_thresh}m, "
-            f"buffer={track_buffer} ({detect_rate}Hz×3s), "
-            f"confirm={confirm_frames}"
+            f"buffer={track_buffer} ({fusion_rate:.0f}Hz×3s), "
+            f"confirm={confirm_frames}, "
+            f"reid_thresh={tracker_cfg.reid_thresh}m, reid_buf={reid_buffer}"
         )
 
     def _health_check(self):
@@ -1360,7 +1367,8 @@ class MultiCameraPerceptionNode(Node):
 
             # 构建融合后的 Object3D
             fused_obj = Object3D()
-            fused_obj.object_id = f"fused_{obj_chassis.category}_{id(fused_obj) % 10000}"
+            self._fused_counter += 1
+            fused_obj.object_id = f"fused_{obj_chassis.category}_{self._fused_counter}"
             fused_obj.category = match.fused_category if match.fused_category else obj_chassis.category
             fused_obj.score = max(obj_chassis.score, obj_top.score)
             fused_obj.bbox = obj_chassis.bbox  # 使用 chassis 的 bbox

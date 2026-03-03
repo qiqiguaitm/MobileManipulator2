@@ -31,8 +31,8 @@ echo ""
 cleanup_can_interfaces() {
     echo "清理残留的 CAN 接口..."
 
-    # 关闭并删除所有 _t 结尾的临时接口
-    for iface in $(ip -br link show type can | awk '{print $1}' | grep '_t$'); do
+    # 关闭并删除所有 _ct 结尾的临时接口
+    for iface in $(ip -br link show type can | awk '{print $1}' | grep '_ct$'); do
         sudo ip link set "$iface" down 2>/dev/null
         sudo ip link delete "$iface" 2>/dev/null || true
     done
@@ -81,7 +81,7 @@ configure_can_by_usb() {
 
     # 如果目标名被占用，先把它改成临时名
     if ip link show "$TARGET_NAME" &>/dev/null; then
-        local TEMP_NAME="${TARGET_NAME}_tmp_$$"
+        local TEMP_NAME="${TARGET_NAME}_ct"
         sudo ip link set "$TARGET_NAME" down
         sudo ip link set "$TARGET_NAME" name "$TEMP_NAME"
         echo "  将占用的 $TARGET_NAME 临时改名为 $TEMP_NAME"
@@ -132,8 +132,8 @@ elif [ "$MODE" == "manual" ]; then
     CHASSIS_OK=$?
 
     # 清理临时接口
-    for iface in $(ip -br link show type can | awk '{print $1}' | grep '_tmp_'); do
-        sudo ip link delete "$iface" 2>/dev/null || true
+    for iface in $(ip -br link show type can | awk '{print $1}' | grep '_ct$'); do
+        sudo ip link set "$iface" down 2>/dev/null || true
     done
 
 else

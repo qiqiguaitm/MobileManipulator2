@@ -23,6 +23,7 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <pclomp/ndt_omp.h>
 
 #include <hdl_localization/pose_estimator.hpp>
@@ -148,6 +149,22 @@ private:
     this->declare_parameter<double>("cool_time_duration", 2.0);
     this->declare_parameter<bool>("enable_robot_odometry_prediction", false);
     this->declare_parameter<double>("status_max_correspondence_dist", 0.5);
+
+    // 参数化初始位姿
+    this->declare_parameter<bool>("specify_init_pose", false);
+    this->declare_parameter<double>("init_pos_x", 0.0);
+    this->declare_parameter<double>("init_pos_y", 0.0);
+    this->declare_parameter<double>("init_pos_z", 0.0);
+    this->declare_parameter<double>("init_ori_w", 1.0);
+    this->declare_parameter<double>("init_ori_x", 0.0);
+    this->declare_parameter<double>("init_ori_y", 0.0);
+    this->declare_parameter<double>("init_ori_z", 0.0);
+
+    // 自动重定位参数
+    this->declare_parameter<bool>("auto_relocalization", false);
+    this->declare_parameter<int>("auto_reloc_delay_ms", 3000);
+    this->declare_parameter<double>("auto_reloc_conf_threshold", 0.4);
+    this->declare_parameter<int>("auto_reloc_ndt_candidates", 6);
 
     relocalizing_ = false;
   }
@@ -360,6 +377,21 @@ private:
       auto result = set_global_map_client_->async_send_request(req);
       RCLCPP_INFO(this->get_logger(), "set_global_map request sent");
     }
+
+    // 尝试从参数自动初始化位姿 (specify_init_pose)
+    if (try_auto_init_from_params()) {
+      // specify_init_pose 成功，不需要自动重定位
+    } else if (this->get_parameter("auto_relocalization").as_bool() && !auto_reloc_triggered_) {
+      // 延迟触发自动重定位 (等待足够的 scan 数据)
+      int delay_ms = this->get_parameter("auto_reloc_delay_ms").as_int();
+      RCLCPP_INFO(this->get_logger(), "Auto-relocalization enabled, will trigger in %dms", delay_ms);
+      auto_reloc_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(delay_ms),
+        [this]() {
+          auto_reloc_timer_->cancel();
+          trigger_auto_relocalization();
+        });
+    }
   }
 
   void relocalize(
@@ -440,6 +472,188 @@ private:
     relocalizing_ = false;
   }
 
+  /**
+   * @brief 自动重定位: 在 globalmap 到达后延迟触发全局定位查询
+   */
+  void trigger_auto_relocalization() {
+    if (auto_reloc_triggered_) return;
+    auto_reloc_triggered_ = true;
+
+    // 检查前置条件
+    if (!globalmap_) {
+      RCLCPP_WARN(this->get_logger(), "Auto-reloc: no globalmap yet");
+      auto_reloc_triggered_ = false;
+      return;
+    }
+    if (!global_service_ready_) {
+      RCLCPP_WARN(this->get_logger(), "Auto-reloc: global localization service not ready");
+      auto_reloc_triggered_ = false;
+      return;
+    }
+    if (!last_scan_) {
+      RCLCPP_WARN(this->get_logger(), "Auto-reloc: no scan available yet, will retry in 2s");
+      auto_reloc_triggered_ = false;
+      auto_reloc_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(2000),
+        [this]() {
+          auto_reloc_timer_->cancel();
+          trigger_auto_relocalization();
+        });
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Auto-reloc: triggering global localization query (multi-candidate + NDT validation)...");
+    relocalizing_ = true;
+    delta_estimater_->reset();
+
+    auto req = std::make_shared<hdl_global_localization::srv::QueryGlobalLocalization::Request>();
+    pcl::toROSMsg(*last_scan_, req->cloud);
+    req->max_num_candidates = this->get_parameter("auto_reloc_ndt_candidates").as_int();  // 参数化: 多候选 NDT 验证
+
+    auto future = query_global_localization_client_->async_send_request(
+      req,
+      [this](rclcpp::Client<hdl_global_localization::srv::QueryGlobalLocalization>::SharedFuture future) {
+        try {
+          auto result = future.get();
+          if (result->poses.empty()) {
+            RCLCPP_WARN(this->get_logger(), "Auto-reloc: no result, will retry once in 5s");
+            relocalizing_ = false;
+            auto_reloc_triggered_ = false;
+            auto_reloc_timer_ = this->create_wall_timer(
+              std::chrono::milliseconds(5000),
+              [this]() {
+                auto_reloc_timer_->cancel();
+                trigger_auto_relocalization();
+              });
+            return;
+          }
+
+          // NDT 验证: 对每个 SC 候选做 NDT 精配准，选 inlier_fraction 最高的
+          double best_inlier = -1.0;
+          int best_candidate = -1;
+          Eigen::Isometry3f best_pose = Eigen::Isometry3f::Identity();
+
+          RCLCPP_INFO(this->get_logger(), "Auto-reloc: %zu candidates, NDT-validating each...",
+                      result->poses.size());
+
+          for (size_t i = 0; i < result->poses.size(); i++) {
+            const auto& p = result->poses[i];
+            double sc_dist = result->errors[i];
+
+            Eigen::Isometry3f candidate_pose = Eigen::Isometry3f::Identity();
+            candidate_pose.linear() = Eigen::Quaternionf(
+              p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z).toRotationMatrix();
+            candidate_pose.translation() = Eigen::Vector3f(p.position.x, p.position.y, p.position.z);
+
+            // NDT 验证: 用候选位姿作为初始猜测，跑 NDT 对齐
+            pcl::PointCloud<PointT> aligned;
+            registration_->setInputSource(last_scan_);
+            registration_->align(aligned, candidate_pose.matrix().cast<float>());
+
+            if (!registration_->hasConverged()) {
+              RCLCPP_INFO(this->get_logger(), "  Candidate[%zu]: NDT not converged, skip (sc_dist=%.3f)", i, sc_dist);
+              continue;
+            }
+
+            // 计算 inlier_fraction
+            double max_corr_dist = this->get_parameter("status_max_correspondence_dist").as_double();
+            int inlier_count = 0;
+            pcl::PointCloud<PointT>::Ptr aligned_ptr(new pcl::PointCloud<PointT>(aligned));
+            pcl::KdTreeFLANN<PointT> kdtree;
+            kdtree.setInputCloud(globalmap_);
+            for (const auto& pt : aligned_ptr->points) {
+              std::vector<int> nn_idx(1);
+              std::vector<float> nn_dist(1);
+              if (kdtree.nearestKSearch(pt, 1, nn_idx, nn_dist) > 0 && nn_dist[0] < max_corr_dist * max_corr_dist) {
+                inlier_count++;
+              }
+            }
+            double inlier_fraction = aligned_ptr->empty() ? 0.0 : (double)inlier_count / aligned_ptr->size();
+
+            Eigen::Matrix4f ndt_result = registration_->getFinalTransformation();
+            float ndt_score = registration_->getFitnessScore();
+
+            RCLCPP_INFO(this->get_logger(),
+              "  Candidate[%zu]: sc_dist=%.3f, ndt_score=%.4f, inlier=%.2f, pos=(%.2f, %.2f)",
+              i, sc_dist, ndt_score, inlier_fraction,
+              ndt_result(0, 3), ndt_result(1, 3));
+
+            if (inlier_fraction > best_inlier) {
+              best_inlier = inlier_fraction;
+              best_candidate = i;
+              best_pose = Eigen::Isometry3f::Identity();
+              best_pose.linear() = ndt_result.block<3, 3>(0, 0);
+              best_pose.translation() = ndt_result.block<3, 1>(0, 3);
+            }
+          }
+
+          // 最低 inlier_fraction 阈值
+          const double MIN_INLIER_FRACTION = 0.3;
+          if (best_candidate < 0 || best_inlier < MIN_INLIER_FRACTION) {
+            RCLCPP_WARN(this->get_logger(),
+              "Auto-reloc: NDT validation failed (best_inlier=%.2f < %.2f), falling back to manual",
+              best_inlier, MIN_INLIER_FRACTION);
+            relocalizing_ = false;
+            return;
+          }
+
+          // 应用运动增量
+          best_pose = best_pose * Eigen::Isometry3f(delta_estimater_->estimated_delta());
+
+          std::lock_guard<std::mutex> lock(pose_estimator_mutex_);
+          pose_estimator_.reset(new hdl_localization::PoseEstimator(
+            registration_,
+            best_pose.translation(),
+            Eigen::Quaternionf(best_pose.linear()),
+            this->get_parameter("cool_time_duration").as_double()));
+
+          RCLCPP_INFO(this->get_logger(),
+            "Auto-reloc: SUCCESS! candidate[%d], inlier=%.2f, pos=(%.2f, %.2f, %.2f)",
+            best_candidate, best_inlier,
+            best_pose.translation().x(), best_pose.translation().y(), best_pose.translation().z());
+
+        } catch (const std::exception& e) {
+          RCLCPP_WARN(this->get_logger(), "Auto-reloc failed: %s", e.what());
+        }
+        relocalizing_ = false;
+      });
+  }
+
+  /**
+   * @brief 从参数自动初始化位姿 (修复 specify_init_pose 死代码)
+   * 在 globalmap 收到后调用，如果 specify_init_pose=true 且 pose_estimator_ 未创建
+   * @return true if auto-init succeeded
+   */
+  bool try_auto_init_from_params() {
+    if (!this->get_parameter("specify_init_pose").as_bool()) {
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pose_estimator_mutex_);
+    if (pose_estimator_) {
+      return false;  // 已经初始化过
+    }
+
+    double px = this->get_parameter("init_pos_x").as_double();
+    double py = this->get_parameter("init_pos_y").as_double();
+    double pz = this->get_parameter("init_pos_z").as_double();
+    double ow = this->get_parameter("init_ori_w").as_double();
+    double ox = this->get_parameter("init_ori_x").as_double();
+    double oy = this->get_parameter("init_ori_y").as_double();
+    double oz = this->get_parameter("init_ori_z").as_double();
+
+    RCLCPP_INFO(this->get_logger(), "Auto-init from params: pos=(%.2f, %.2f, %.2f) quat=(%.3f, %.3f, %.3f, %.3f)",
+                px, py, pz, ow, ox, oy, oz);
+
+    pose_estimator_.reset(new hdl_localization::PoseEstimator(
+      registration_,
+      Eigen::Vector3f(px, py, pz),
+      Eigen::Quaternionf(ow, ox, oy, oz),
+      this->get_parameter("cool_time_duration").as_double()));
+
+    return true;
+  }
+
   void initialpose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr pose_msg) {
     RCLCPP_INFO(this->get_logger(), "initialpose received");
 
@@ -485,10 +699,13 @@ private:
         RCLCPP_WARN(this->get_logger(), "%s", ex.what());
       }
     } else {
+      // 回退: 发布 map->odom (而非 map->base_link!)
+      // 发布 map->base_link 会与 body->base_link 静态TF冲突，导致base_link有两个父节点，TF树断裂
+      // 此处近似 map->odom ≈ map->base_link (当 odom->base_link ≈ identity，即Fast-LIO未启动时)
       geometry_msgs::msg::TransformStamped odom_trans = tf2::eigenToTransform(Eigen::Isometry3d(pose.cast<double>()));
       odom_trans.header.stamp = stamp;
       odom_trans.header.frame_id = "map";
-      odom_trans.child_frame_id = odom_child_frame_id_;
+      odom_trans.child_frame_id = robot_odom_frame_id_;
       tf_broadcaster_.sendTransform(odom_trans);
     }
 
@@ -591,6 +808,10 @@ private:
   std::atomic_bool relocalizing_;
   std::unique_ptr<DeltaEstimater> delta_estimater_;
   pcl::PointCloud<PointT>::ConstPtr last_scan_;
+
+  // 自动重定位
+  std::atomic_bool auto_reloc_triggered_{false};
+  rclcpp::TimerBase::SharedPtr auto_reloc_timer_;
 };
 
 } // namespace hdl_localization

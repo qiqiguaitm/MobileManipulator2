@@ -39,8 +39,13 @@ class TrackerConfig:
     second_thresh: float = 0.25     # 第二阶段匹配阈值 (25cm, 更宽松)
 
     # 轨迹管理
-    track_buffer: int = 15          # Lost轨迹保留帧数 (5Hz × 3秒)
+    track_buffer: int = 15          # Lost轨迹保留帧数
     confirm_frames: int = 2         # 新轨迹确认帧数
+
+    # Re-ID: 从 Removed 池恢复旧 ID（物体消失后重新出现）
+    # 注意: position 在 base_link 坐标系，机器人移动时 Re-ID 不可靠
+    reid_thresh: float = 0.3        # Re-ID 距离阈值 (30cm)
+    reid_buffer: int = 100          # Removed 轨迹保留帧数 (~10s @10Hz)
 
     # Kalman滤波器参数
     process_noise_pos: float = 0.01     # 位置过程噪声
@@ -165,10 +170,11 @@ class STrack3D:
 
     def __init__(self, position: np.ndarray, category: str,
                  confidence: float, cfg: TrackerConfig,
-                 detection: dict = None):
-        # 分配唯一ID
-        STrack3D._count += 1
-        self.track_id = STrack3D._count
+                 detection: dict = None, reuse_id: int = None):
+        # ID 延迟分配：构造时不消耗 ID，确认时才分配
+        # 噪声轨迹（活不到 confirm_frames）永远不会消耗 ID 号
+        self.track_id = None
+        self._reuse_id = reuse_id  # Re-ID 复用的旧 ID，在 activate() 时使用
 
         # 基本信息
         self.category = category
@@ -221,14 +227,26 @@ class STrack3D:
         self.state = TrackState.Removed
 
     def activate(self, frame_id: int):
-        """激活轨迹（New → Tracked）"""
+        """激活轨迹（New → Tracked），此时才分配 ID"""
         self.state = TrackState.Tracked
         self.start_frame = frame_id
+
+        # 只在确认时分配 ID —— 噪声轨迹永远走不到这里
+        if self.track_id is None:
+            if self._reuse_id is not None:
+                self.track_id = self._reuse_id
+            else:
+                STrack3D._count += 1
+                self.track_id = STrack3D._count
 
     def reactivate(self, detection: dict, frame_id: int):
         """重新激活轨迹（Lost → Tracked）"""
         self.update(detection, frame_id)
         self.state = TrackState.Tracked
+        # 修复：New → Lost → reactivate 路径中 track_id 永远为 None 的 bug
+        # 若累计观测已达确认门槛，立即分配 ID
+        if self.track_id is None and self.tracklet_len >= self.cfg.confirm_frames:
+            self.activate(frame_id)
 
     @staticmethod
     def reset_id():
@@ -329,6 +347,11 @@ class ByteTracker3D:
                 else:
                     track.state = TrackState.Tracked
 
+            # 延迟激活: 轨迹经历 New→Lost→reactivate 后 track_id 仍为 None
+            # 此时 state=Tracked 但未分配 ID，需要在 tracklet_len 达标后补发
+            if track.track_id is None and track.tracklet_len >= self.cfg.confirm_frames:
+                track.activate(self.frame_id)
+
         # ========== Step 3: 第二阶段匹配 (低置信度 vs 未匹配轨迹) ==========
         # ByteTrack核心: 用单相机检测恢复/继续跟踪
         # 注意: 这里匹配所有未匹配轨迹，不仅是Lost轨迹
@@ -362,6 +385,10 @@ class ByteTracker3D:
                     if self.log:
                         self.log.debug(f"Continued track {track.track_id} with low-conf detection")
 
+                # 延迟激活（同 Step 2）
+                if track.track_id is None and track.tracklet_len >= self.cfg.confirm_frames:
+                    track.activate(self.frame_id)
+
         # ========== Step 4: 处理未匹配轨迹 ==========
         # 找出所有未匹配的轨迹
         matched_track_ids = set()
@@ -386,15 +413,19 @@ class ByteTracker3D:
                 track.mark_lost()
 
         # ========== Step 5: 新轨迹 (未匹配的检测) ==========
-        # 5a: 高置信度（双相机融合）
-        for d_idx in unmatched_det_indices:
-            det = high_dets[d_idx]
+        # 创建新轨迹前，先尝试 Re-ID（从 Removed 池复用旧 ID）
+        all_unmatched = [(high_dets[i], 'fused') for i in unmatched_det_indices] + \
+                        [(low_dets[i], 'single-cam') for i in unmatched_low_det_indices]
+
+        for det, source_label in all_unmatched:
+            reuse_id = self._try_reid(det)
             new_track = STrack3D(
                 position=det['position'],
                 category=det['category'],
                 confidence=det['confidence'],
                 cfg=self.cfg,
                 detection=det,
+                reuse_id=reuse_id,
             )
             new_track.frame_id = self.frame_id
             new_track.start_frame = self.frame_id
@@ -402,26 +433,12 @@ class ByteTracker3D:
             self.tracked_stracks.append(new_track)
 
             if self.log:
-                self.log.debug(f"New track {new_track.track_id}: {det['category']} (fused)")
-
-        # 5b: 低置信度（单相机检测）
-        # 单相机检测也可以创建新轨迹，confirm_frames 机制会过滤噪声
-        for d_idx in unmatched_low_det_indices:
-            det = low_dets[d_idx]
-            new_track = STrack3D(
-                position=det['position'],
-                category=det['category'],
-                confidence=det['confidence'],
-                cfg=self.cfg,
-                detection=det,
-            )
-            new_track.frame_id = self.frame_id
-            new_track.start_frame = self.frame_id
-            new_track.tracklet_len = 1
-            self.tracked_stracks.append(new_track)
-
-            if self.log:
-                self.log.debug(f"New track {new_track.track_id}: {det['category']} (single-cam)")
+                if reuse_id:
+                    self.log.debug(
+                        f"Re-ID track {new_track.track_id}: {det['category']} ({source_label})")
+                else:
+                    self.log.debug(
+                        f"New track {new_track.track_id}: {det['category']} ({source_label})")
 
         # ========== Step 6: 更新轨迹池 ==========
         self._update_pools()
@@ -471,7 +488,7 @@ class ByteTracker3D:
         """
         计算代价矩阵（3D距离 + 类别兼容性）
 
-        类别不兼容的设为无穷大
+        类别不兼容 → 无穷大
         """
         n_tracks = len(tracks)
         n_dets = len(detections)
@@ -486,14 +503,12 @@ class ByteTracker3D:
                     continue  # 不兼容，保持无穷大
 
                 # 3D距离
-                dist = np.linalg.norm(track.position - det['position'])
-                cost[i, j] = dist
+                cost[i, j] = np.linalg.norm(track.position - det['position'])
 
         return cost
 
     def _update_pools(self):
         """更新轨迹池"""
-        # 分类轨迹
         new_tracked = []
         new_lost = []
 
@@ -503,17 +518,51 @@ class ByteTracker3D:
             elif track.state == TrackState.Lost:
                 new_lost.append(track)
             elif track.state == TrackState.New:
-                # 新轨迹放入tracked池
                 new_tracked.append(track)
             elif track.state == TrackState.Removed:
-                self.removed_stracks.append(track)
+                # 只保留已确认过的轨迹用于 Re-ID（噪声轨迹不保留）
+                if track.tracklet_len >= self.cfg.confirm_frames:
+                    self.removed_stracks.append(track)
 
         self.tracked_stracks = new_tracked
         self.lost_stracks = new_lost
 
-        # 限制removed池大小（可选）
-        if len(self.removed_stracks) > 100:
-            self.removed_stracks = self.removed_stracks[-50:]
+        # 清理过期的 Removed 轨迹（超过 reid_buffer 帧）
+        self.removed_stracks = [
+            t for t in self.removed_stracks
+            if self.frame_id - t.frame_id <= self.cfg.reid_buffer
+        ]
+
+    def _try_reid(self, detection: dict) -> Optional[int]:
+        """
+        尝试从 Removed 池中找到同类别、位置接近的旧轨迹，复用其 track_id。
+
+        Returns:
+            旧 track_id (int) 如果匹配成功，否则 None
+        """
+        if not self.removed_stracks:
+            return None
+
+        best_dist = self.cfg.reid_thresh
+        best_idx = -1
+
+        det_pos = detection['position']
+        det_cat = detection['category']
+
+        for i, track in enumerate(self.removed_stracks):
+            # 类别必须兼容
+            if not CategoryCompatibility.is_compatible(track.category, det_cat):
+                continue
+            dist = np.linalg.norm(track.position - det_pos)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx >= 0:
+            old_track = self.removed_stracks.pop(best_idx)
+            return old_track.track_id
+
+        return None
 
     def _get_output(self, fused_objects: List[dict]) -> List[dict]:
         """
@@ -531,12 +580,7 @@ class ByteTracker3D:
         # 使用 id(detection) 作为 key，因为每个检测是独立的 dict 对象
         confirmed_tracks = {}
         for track in self.tracked_stracks:
-            is_confirmed = (
-                track.state == TrackState.Tracked or
-                (track.state == TrackState.New and
-                 track.tracklet_len >= self.cfg.confirm_frames)
-            )
-            if is_confirmed and track.last_detection:
+            if track.track_id is not None and track.last_detection:
                 det_id = id(track.last_detection)
                 confirmed_tracks[det_id] = track
 

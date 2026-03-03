@@ -735,6 +735,242 @@ def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
     }
 
 
+def compute_centroid_from_mask(depth_m, mask, bbox, intrinsics,
+                               erode_kernel=5, iqr_factor=1.5,
+                               depth_min=0.3, depth_max=10.0, min_pts=10):
+    """用与 batch_camera_3d_percept 完全相同的算法计算单个物体的 3D 质心。
+
+    Args:
+        depth_m: 深度图 (H,W) float32 米
+        mask: 二值 mask (H,W) uint8
+        bbox: [x1, y1, x2, y2]
+        intrinsics: {fx, fy, cx, cy}
+        erode_kernel: mask 腐蚀核大小
+        iqr_factor: IQR 异常值剔除因子
+        depth_min/depth_max: 深度范围 (米)
+        min_pts: 最少有效点数
+
+    Returns:
+        dict with centroid_optical (3D), depth_median, num_points, or None if invalid
+    """
+    H, W = depth_m.shape[:2]
+    fx, fy = intrinsics['fx'], intrinsics['fy']
+    cx, cy = intrinsics['cx'], intrinsics['cy']
+
+    x1 = max(0, int(bbox[0]))
+    y1 = max(0, int(bbox[1]))
+    x2 = min(W, int(bbox[2]))
+    y2 = min(H, int(bbox[3]))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    mask_roi = mask[y1:y2, x1:x2]
+    depth_roi = depth_m[y1:y2, x1:x2]
+
+    kernel = np.ones((erode_kernel, erode_kernel), np.uint8)
+    eroded_roi = cv2.erode(mask_roi, kernel, iterations=1)
+    if eroded_roi.sum() < min_pts:
+        return None
+
+    ys_local, xs_local = np.where(eroded_roi > 0)
+    ds = depth_roi[ys_local, xs_local]
+    valid = (ds > depth_min) & (ds < depth_max)
+    if valid.sum() < min_pts:
+        return None
+
+    depth_values = ds[valid]
+    q1, q3 = np.percentile(depth_values, [25, 75])
+    iqr = q3 - q1
+    lower_bound = q1 - iqr_factor * iqr
+    upper_bound = q3 + iqr_factor * iqr
+
+    valid2 = valid & (ds >= lower_bound) & (ds <= upper_bound)
+    if valid2.sum() < min_pts:
+        return None
+
+    xs_img = xs_local[valid2].astype(np.float64) + x1
+    ys_img = ys_local[valid2].astype(np.float64) + y1
+    ds_valid = ds[valid2]
+
+    X = (xs_img - cx) * ds_valid / fx
+    Y = (ys_img - cy) * ds_valid / fy
+    Z = ds_valid
+    points = np.column_stack([X, Y, Z])
+    centroid = np.median(points, axis=0)
+
+    return {
+        'centroid': centroid,
+        'depth_median': float(np.median(ds_valid)),
+        'depth_mean': float(np.mean(ds_valid)),
+        'depth_std': float(np.std(ds_valid)),
+        'num_points': int(valid2.sum()),
+    }
+
+
+def run_cdm_3d_compare(all_data, output_dir, text_prompt='pen,box,phone,bottle,toy',
+                        cdm_url='http://192.168.112.14:8082',
+                        sam3_url='http://192.168.112.14:8081'):
+    """CDM 3D 质心偏差诊断：用真实 mask 对比 raw vs CDM 的 3D 定位差异。
+
+    流程：SAM3 检测 → 解码 mask → 分别用 raw/CDM depth 计算 3D 质心 → 对比。
+    使用与 pipeline (batch_camera_3d_percept) 完全相同的测量算法。
+    """
+    import pycocotools.mask as coco_mask
+
+    print(f"\n{'='*70}")
+    print(f"CDM 3D 质心偏差诊断")
+    print(f"{'='*70}")
+
+    # 初始化服务
+    sam3_cfg = SimpleConfig(url=sam3_url, min_score=0.30, return_mask=True, warmup=0)
+    sam3_service = SAM3Online(sam3_cfg)
+    print(f"[SAM3] OK ({sam3_url})")
+
+    cdm_cfg = SimpleConfig(url=cdm_url, chosen_policy='dn', warmup=0)
+    cdm_service = DepthOptimizerOnline(cdm_cfg)
+    print(f"[CDM] OK ({cdm_url})")
+
+    # 典型 RealSense D435i @ 720x1280 内参 (用于相对比较，绝对值不影响 delta)
+    intrinsics = {'fx': 640.0, 'fy': 640.0, 'cx': 640.0, 'cy': 360.0}
+    print(f"[内参] fx={intrinsics['fx']}, fy={intrinsics['fy']}, "
+          f"cx={intrinsics['cx']}, cy={intrinsics['cy']} (典型值，delta 不受影响)")
+
+    all_deltas = []
+
+    for data in all_data:
+        name = data['name']
+        rgb = data['rgb']
+        raw_depth_mm = data['depth']  # uint16 mm
+
+        print(f"\n--- {name} ---")
+
+        # 1. SAM3 检测
+        try:
+            det_result = sam3_service.forward(text_prompt, rgb)
+        except Exception as e:
+            print(f"  [SAM3] 检测失败: {e}")
+            continue
+
+        objects = det_result.result.get('objects', [])
+        if not objects:
+            print(f"  [SAM3] 未检测到物体")
+            continue
+
+        # 解码 mask
+        rle_masks = []
+        obj_indices = []
+        for i, obj in enumerate(objects):
+            mask_rle = obj.get('mask')
+            if mask_rle:
+                rle_masks.append(mask_rle)
+                obj_indices.append(i)
+
+        if not rle_masks:
+            print(f"  无可用 mask")
+            continue
+
+        masks_array = coco_mask.decode(rle_masks)
+        if masks_array.ndim == 2:
+            masks_array = masks_array[:, :, np.newaxis]
+
+        decoded = {}
+        for idx, obj_idx in enumerate(obj_indices):
+            decoded[obj_idx] = masks_array[:, :, idx].astype(np.uint8)
+
+        # 2. CDM 优化 (与 pipeline 相同: uint16 mm → forward → uint16 mm)
+        cdm_result = cdm_service.forward(rgb, raw_depth_mm, chosen_policy='dn')
+        if not cdm_result.get('success'):
+            print(f"  [CDM] 失败: {cdm_result.get('error')}")
+            continue
+
+        cdm_depth_mm = cdm_result['depth']  # uint16 mm
+
+        # 转 float32 m (与 pipeline 一致)
+        raw_depth_m = raw_depth_mm.astype(np.float32) / 1000.0
+        cdm_depth_m = cdm_depth_mm.astype(np.float32) / 1000.0
+
+        print(f"  检测到 {len(objects)} 个物体, {len(rle_masks)} 个有 mask")
+        print(f"  {'物体':<20} {'Raw Z(m)':<10} {'CDM Z(m)':<10} "
+              f"{'ΔX(mm)':<9} {'ΔY(mm)':<9} {'ΔZ(mm)':<9} {'Δ3D(mm)':<9} {'点数':<6}")
+        print(f"  {'─'*86}")
+
+        for i, obj in enumerate(objects):
+            mask = decoded.get(i)
+            if mask is None or mask.sum() < 300:
+                continue
+            bbox = obj.get('bbox', [0, 0, 0, 0])
+            category = obj.get('category', f'obj{i}')
+            score = obj.get('score', 0)
+
+            raw_meas = compute_centroid_from_mask(raw_depth_m, mask, bbox, intrinsics)
+            cdm_meas = compute_centroid_from_mask(cdm_depth_m, mask, bbox, intrinsics)
+
+            if raw_meas is None or cdm_meas is None:
+                status = 'raw无效' if raw_meas is None else 'cdm无效'
+                print(f"  {category}({score:.2f}){'':<10} {status}")
+                continue
+
+            rc = raw_meas['centroid']
+            cc = cdm_meas['centroid']
+            dx = (cc[0] - rc[0]) * 1000  # mm
+            dy = (cc[1] - rc[1]) * 1000
+            dz = (cc[2] - rc[2]) * 1000
+            d3d = np.sqrt(dx**2 + dy**2 + dz**2)
+
+            print(f"  {category}({score:.2f}){'':<8} "
+                  f"{rc[2]:<10.4f} {cc[2]:<10.4f} "
+                  f"{dx:<+9.1f} {dy:<+9.1f} {dz:<+9.1f} {d3d:<9.1f} "
+                  f"{raw_meas['num_points']}")
+
+            all_deltas.append({
+                'sample': name, 'object': category, 'score': score,
+                'raw_z': rc[2], 'cdm_z': cc[2],
+                'dx_mm': dx, 'dy_mm': dy, 'dz_mm': dz, 'd3d_mm': d3d,
+                'num_points': raw_meas['num_points'],
+                'raw_depth_std': raw_meas['depth_std'],
+                'cdm_depth_std': cdm_meas['depth_std'],
+            })
+
+    # 汇总
+    if all_deltas:
+        print(f"\n{'='*70}")
+        print(f"汇总 ({len(all_deltas)} 个有效物体)")
+        print(f"{'='*70}")
+
+        dxs = [d['dx_mm'] for d in all_deltas]
+        dys = [d['dy_mm'] for d in all_deltas]
+        dzs = [d['dz_mm'] for d in all_deltas]
+        d3ds = [d['d3d_mm'] for d in all_deltas]
+
+        print(f"  ΔX: mean={np.mean(dxs):+.1f}mm, std={np.std(dxs):.1f}mm, "
+              f"max_abs={max(abs(d) for d in dxs):.1f}mm")
+        print(f"  ΔY: mean={np.mean(dys):+.1f}mm, std={np.std(dys):.1f}mm, "
+              f"max_abs={max(abs(d) for d in dys):.1f}mm")
+        print(f"  ΔZ: mean={np.mean(dzs):+.1f}mm, std={np.std(dzs):.1f}mm, "
+              f"max_abs={max(abs(d) for d in dzs):.1f}mm")
+        print(f"  3D: mean={np.mean(d3ds):.1f}mm, max={max(d3ds):.1f}mm")
+
+        # 找出偏差最大的物体
+        worst = max(all_deltas, key=lambda d: d['d3d_mm'])
+        print(f"\n  最大偏差: {worst['sample']}/{worst['object']} "
+              f"Δ3D={worst['d3d_mm']:.1f}mm "
+              f"(ΔX={worst['dx_mm']:+.1f}, ΔY={worst['dy_mm']:+.1f}, ΔZ={worst['dz_mm']:+.1f})")
+
+        # 按深度分段统计
+        near = [d for d in all_deltas if d['raw_z'] < 1.0]
+        mid = [d for d in all_deltas if 1.0 <= d['raw_z'] < 2.0]
+        far = [d for d in all_deltas if d['raw_z'] >= 2.0]
+        for label, group in [('近(<1m)', near), ('中(1-2m)', mid), ('远(>2m)', far)]:
+            if group:
+                g3d = [d['d3d_mm'] for d in group]
+                gdz = [d['dz_mm'] for d in group]
+                print(f"  {label}: n={len(group)}, "
+                      f"ΔZ mean={np.mean(gdz):+.1f}mm, "
+                      f"Δ3D mean={np.mean(g3d):.1f}mm max={max(g3d):.1f}mm")
+    else:
+        print("\n无有效测量数据")
+
+
 def run_cdm_compare_test(all_data, output_dir, cdm_url='http://192.168.112.14:8082'):
     """遍历样本数据，调用 CDM，输出统计 + 可视化面板。
 
@@ -786,6 +1022,7 @@ def main():
     parser.add_argument('--vis', action='store_true', help='运行可视化测试并输出到 result 目录')
     parser.add_argument('--benchmark', action='store_true', help='运行耗时 benchmark 测试')
     parser.add_argument('--cdm-compare', action='store_true', help='运行 CDM 深度偏差对比诊断')
+    parser.add_argument('--cdm-3d', action='store_true', help='CDM 3D 质心偏差诊断 (SAM3 mask + raw/CDM depth 对比)')
     parser.add_argument('--num-runs', type=int, default=10, help='每组数据测试次数 (default: 10)')
     parser.add_argument('--warmup', type=int, default=3, help='预热次数 (default: 3)')
     parser.add_argument('--samples-dir', type=str,
@@ -797,7 +1034,7 @@ def main():
     args = parser.parse_args()
 
     # 如果没有指定任何模式，默认运行 benchmark
-    if not args.vis and not args.benchmark and not args.cdm_compare:
+    if not args.vis and not args.benchmark and not args.cdm_compare and not args.cdm_3d:
         args.benchmark = True
 
     num_runs = args.num_runs
@@ -849,6 +1086,13 @@ def main():
         output_dir = os.path.join(project_root, 'scripts', 'cdm_diag')
         os.makedirs(output_dir, exist_ok=True)
         run_cdm_compare_test(all_data, output_dir)
+
+    # ========== CDM 3D 质心偏差诊断 ==========
+    if args.cdm_3d:
+        project_root = os.path.normpath(os.path.join(samples_dir, '..', '..', '..'))
+        output_dir = os.path.join(project_root, 'scripts', 'cdm_diag')
+        os.makedirs(output_dir, exist_ok=True)
+        run_cdm_3d_compare(all_data, output_dir)
 
     # ========== Benchmark 测试 ==========
     if not args.benchmark:

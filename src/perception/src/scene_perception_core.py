@@ -52,6 +52,16 @@ class ScenePerceptionCore:
     MIN_DEPTH_POINTS = 10
     MIN_LIDAR_POINTS = 3
 
+    # 近距离深度处理参数 (D435 在 <0.3m 时 stereo match 部分失效)
+    NEAR_RANGE_ZERO_THRESH = 0.3   # 零值占比 >30% → 太近，丢弃
+    NEAR_RANGE_DEPTH_MIN = 0.05    # m — 去零值和噪声
+    NEAR_RANGE_DEPTH_MAX = 0.5     # m — 切背景穿透
+
+    # 深度值剔除参数 (砍背景穿透，防止双峰骗过 IQR)
+    DEPTH_SPREAD_THRESH = 0.3      # m — 深度跨度超过此值视为双峰
+    DEPTH_CLUSTER_BAND = 0.3       # m — 最近表面簇允许宽度
+    DEPTH_REF_PERCENTILE = 10      # 用第10百分位锚定最近表面
+
     def __init__(self,
                  transformer: CoordinateTransformer,
                  intrinsics: dict,
@@ -127,13 +137,38 @@ class ScenePerceptionCore:
         # 2. 提取深度值
         depth_values = depth[eroded_mask > 0]
 
+        # 2.5 近距离检测（仅影响 <0.3m 目标，正常距离完全不动）
+        nonzero = depth_values[depth_values > 0.01]
+        if len(nonzero) == 0:
+            result.error_msg = "No valid depth (all zero)"
+            return result
+
+        is_near_range = np.percentile(nonzero, 25) < self.DEPTH_MIN
+        if is_near_range:
+            zero_ratio = 1.0 - len(nonzero) / len(depth_values)
+            if zero_ratio > self.NEAR_RANGE_ZERO_THRESH:
+                result.error_msg = f"Too close: {zero_ratio:.0%} zero depth"
+                return result
+            depth_min_eff = self.NEAR_RANGE_DEPTH_MIN
+            depth_max_eff = self.NEAR_RANGE_DEPTH_MAX
+        else:
+            depth_min_eff = self.DEPTH_MIN
+            depth_max_eff = self.DEPTH_MAX
+
         # 3. 剔除无效值
-        valid_mask = (depth_values > self.DEPTH_MIN) & (depth_values < self.DEPTH_MAX)
+        valid_mask = (depth_values > depth_min_eff) & (depth_values < depth_max_eff)
         depth_values = depth_values[valid_mask]
 
         if len(depth_values) < self.MIN_DEPTH_POINTS:
             result.error_msg = f"Too few valid depth points: {len(depth_values)}"
             return result
+
+        # 3.5 深度值剔除（仅近距离：砍背景穿透）
+        if is_near_range:
+            depth_values = self._filter_depth_outliers(depth_values)
+            if len(depth_values) < self.MIN_DEPTH_POINTS:
+                result.error_msg = f"Too few points after depth filter: {len(depth_values)}"
+                return result
 
         # 4. IQR 异常值剔除
         q1, q3 = np.percentile(depth_values, [25, 75])
@@ -156,7 +191,7 @@ class ScenePerceptionCore:
 
         # 向量化过滤：深度范围 + IQR 边界
         valid = (ds >= lower_bound) & (ds <= upper_bound) & \
-                (ds > self.DEPTH_MIN) & (ds < self.DEPTH_MAX)
+                (ds > depth_min_eff) & (ds < depth_max_eff)
 
         if valid.sum() < self.MIN_DEPTH_POINTS:
             result.error_msg = f"Too few 3D points: {valid.sum()}"
@@ -261,14 +296,42 @@ class ScenePerceptionCore:
             # 提取深度值
             ds = depth_roi[ys_local, xs_local]
 
+            # 近距离检测（仅影响 <0.3m 目标，正常距离完全不动）
+            nonzero = ds[ds > 0.01]
+            if len(nonzero) == 0:
+                result.error_msg = "No valid depth (all zero)"
+                results.append(result)
+                continue
+
+            is_near_range = np.percentile(nonzero, 25) < self.DEPTH_MIN
+            if is_near_range:
+                zero_ratio = 1.0 - len(nonzero) / len(ds)
+                if zero_ratio > self.NEAR_RANGE_ZERO_THRESH:
+                    result.error_msg = f"Too close: {zero_ratio:.0%} zero depth"
+                    results.append(result)
+                    continue
+                depth_min_eff = self.NEAR_RANGE_DEPTH_MIN
+                depth_max_eff = self.NEAR_RANGE_DEPTH_MAX
+            else:
+                depth_min_eff = self.DEPTH_MIN
+                depth_max_eff = self.DEPTH_MAX
+
             # 剔除无效值
-            valid = (ds > self.DEPTH_MIN) & (ds < self.DEPTH_MAX)
+            valid = (ds > depth_min_eff) & (ds < depth_max_eff)
             if valid.sum() < self.MIN_DEPTH_POINTS:
                 result.error_msg = f"Too few valid depth points: {valid.sum()}"
                 results.append(result)
                 continue
 
             depth_values = ds[valid]
+
+            # 深度值剔除（仅近距离：砍背景穿透）
+            if is_near_range:
+                depth_values = self._filter_depth_outliers(depth_values)
+                if len(depth_values) < self.MIN_DEPTH_POINTS:
+                    result.error_msg = f"Too few points after depth filter: {len(depth_values)}"
+                    results.append(result)
+                    continue
 
             # IQR 异常值剔除
             q1, q3 = np.percentile(depth_values, [25, 75])
@@ -473,6 +536,16 @@ class ScenePerceptionCore:
         }
 
         return result
+
+    def _filter_depth_outliers(self, depth_values: np.ndarray) -> np.ndarray:
+        """深度值剔除：跨度过大时保留最近表面簇，砍掉背景穿透"""
+        if len(depth_values) < self.MIN_DEPTH_POINTS:
+            return depth_values
+        spread = depth_values.max() - depth_values.min()
+        if spread <= self.DEPTH_SPREAD_THRESH:
+            return depth_values
+        ref = np.percentile(depth_values, self.DEPTH_REF_PERCENTILE)
+        return depth_values[depth_values <= ref + self.DEPTH_CLUSTER_BAND]
 
     def _compute_confidence(self, num_points: int, depth_std: float,
                             max_std: float = 0.3) -> float:

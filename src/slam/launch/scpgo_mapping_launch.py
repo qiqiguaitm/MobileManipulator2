@@ -72,6 +72,10 @@ def generate_launch_description():
         name='sc_pgo',
         output='screen',
         parameters=[sc_pgo_config],
+        remappings=[
+            ('/Odometry', '/fastlio/odom'),
+            ('/cloud_registered_body', '/fastlio/cloud_body'),
+        ],
     )
 
     # ==================== Octomap (如果已安装) ====================

@@ -39,12 +39,12 @@ fi
 # Step 1: 合并扫描帧
 echo ""
 echo "[Step 1/4] 合并扫描帧到GlobalMap.pcd..."
-python3 "$SCRIPT_DIR/merge_scans_simple.py" "$MAP_DIR" GlobalMap 0.02
+python3 "$SCRIPT_DIR/merge_scans.py" "$MAP_DIR" GlobalMap 0.02
 
 # Step 2: 降采样用于HDL定位
 echo ""
 echo "[Step 2/4] 降采样用于定位..."
-python3 "$SCRIPT_DIR/downsample_pcd_simple.py" \
+python3 "$SCRIPT_DIR/downsample_pcd.py" \
     "$MAP_DIR/GlobalMap.pcd" \
     "$MAP_DIR/GlobalMap_hdl.pcd" \
     0.1
@@ -52,7 +52,7 @@ python3 "$SCRIPT_DIR/downsample_pcd_simple.py" \
 # Step 3: 生成2D栅格地图
 echo ""
 echo "[Step 3/4] 生成2D栅格地图..."
-python3 "$SCRIPT_DIR/pcd_to_2dmap_simple.py" \
+python3 "$SCRIPT_DIR/pcd_to_2dmap.py" \
     "$MAP_DIR/GlobalMap.pcd" \
     "$MAP_DIR" \
     0.05

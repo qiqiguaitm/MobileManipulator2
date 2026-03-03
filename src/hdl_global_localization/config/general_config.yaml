@@ -1,7 +1,11 @@
-# BBS, FPFH_RANSAC, FPFH_TEASER
-# globalmap_downsample_resolution: 0.5 会把这图下采样到约 8 点（体素过大），BBS 需要 ≥128 点
+# BBS, FPFH_RANSAC, SCANCONTEXT
 hdl_global_localization:
   ros__parameters:
-    global_localization_engine: BBS
+    global_localization_engine: SCANCONTEXT
     globalmap_downsample_resolution: 0.2
     query_downsample_resolution: 0.2
+    # ScanContext engine parameters
+    sc_database_path: /home/didi/workspace/MobileManipulator2/maps/sc_pgo/sc_database.bin
+    sc_dist_threshold: 0.72
+    sc_num_candidates: 20            # 10→20: KD-tree 返回更多近邻，覆盖更多空间簇
+    sc_max_radius: 10.0              # 4.0→10.0: 描述子覆盖更大范围，区分度更高

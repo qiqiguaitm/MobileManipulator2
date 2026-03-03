@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint8 state
+string state_name
+uint32 targets_total
+uint32 targets_picked
+uint32 targets_failed
+uint32 targets_remaining
+string current_target_category
+uint8 consecutive_failures
+float32 last_nav_time_ms
+float32 last_pick_time_ms
+string error_message

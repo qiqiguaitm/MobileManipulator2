@@ -136,18 +136,17 @@ void PoseEstimator::set_initial_pose(const geometry_msgs::msg::PoseWithCovarianc
  */
 void PoseEstimator::set_odom(const nav_msgs::msg::Odometry::SharedPtr odom_msg) {
   // Extract odometry delta from previous odom
-  static nav_msgs::msg::Odometry::SharedPtr prev_odom;
-  if (!prev_odom) {
-    prev_odom = odom_msg;
+  if (!prev_odom_) {
+    prev_odom_ = odom_msg;
     return;
   }
 
   // Calculate delta transform
   Eigen::Quaternionf prev_quat(
-    prev_odom->pose.pose.orientation.w,
-    prev_odom->pose.pose.orientation.x,
-    prev_odom->pose.pose.orientation.y,
-    prev_odom->pose.pose.orientation.z
+    prev_odom_->pose.pose.orientation.w,
+    prev_odom_->pose.pose.orientation.x,
+    prev_odom_->pose.pose.orientation.y,
+    prev_odom_->pose.pose.orientation.z
   );
   
   Eigen::Quaternionf curr_quat(
@@ -158,9 +157,9 @@ void PoseEstimator::set_odom(const nav_msgs::msg::Odometry::SharedPtr odom_msg) 
   );
   
   Eigen::Vector3f prev_pos(
-    prev_odom->pose.pose.position.x,
-    prev_odom->pose.pose.position.y,
-    prev_odom->pose.pose.position.z
+    prev_odom_->pose.pose.position.x,
+    prev_odom_->pose.pose.position.y,
+    prev_odom_->pose.pose.position.z
   );
   
   Eigen::Vector3f curr_pos(
@@ -177,7 +176,7 @@ void PoseEstimator::set_odom(const nav_msgs::msg::Odometry::SharedPtr odom_msg) 
   // Update odometry prediction
   predict_odom(delta);
 
-  prev_odom = odom_msg;
+  prev_odom_ = odom_msg;
 }
 
 void PoseEstimator::set_global_map(const pcl::PointCloud<PointT>::ConstPtr& cloud) {
@@ -416,6 +415,12 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
 
   ukf->correct(observation);
+
+  // UKF协方差安全检查: 非有限值或对角线非正值时重置为单位阵
+  if (!ukf->cov.allFinite() || (ukf->cov.diagonal().array() < 1e-6).any()) {
+    ukf->cov = Eigen::MatrixXf::Identity(16, 16) * 0.01;
+  }
+
   imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
 
   if(odom_ukf) {

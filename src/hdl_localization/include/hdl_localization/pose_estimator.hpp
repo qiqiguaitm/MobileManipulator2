@@ -151,6 +151,7 @@ private:
 
   pcl::Registration<PointT, PointT>::Ptr registration;
   pcl::PointCloud<PointT>::Ptr last_aligned_;
+  nav_msgs::msg::Odometry::SharedPtr prev_odom_;
   };
 
 }  // namespace hdl_localization

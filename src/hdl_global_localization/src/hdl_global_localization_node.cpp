@@ -15,6 +15,7 @@
 
 #include <hdl_global_localization/engines/global_localization_bbs.hpp>
 #include <hdl_global_localization/engines/global_localization_fpfh_ransac.hpp>
+#include <hdl_global_localization/engines/global_localization_sc.hpp>
 
 namespace hdl_global_localization {
 
@@ -48,8 +49,9 @@ private:
       engine.reset(new GlobalLocalizationBBS(rclcpp::Node::SharedPtr(this)));
     } else if (engine_name == "FPFH_RANSAC") {
       engine.reset(new GlobalLocalizationEngineFPFH_RANSAC(rclcpp::Node::SharedPtr(this)));
-    }
-    else {
+    } else if (engine_name == "SCANCONTEXT") {
+      engine.reset(new GlobalLocalizationSC(rclcpp::Node::SharedPtr(this)));
+    } else {
       RCLCPP_ERROR_STREAM(get_logger(), "Unknown Global Localization Engine:" << engine_name);
       return false;
     }

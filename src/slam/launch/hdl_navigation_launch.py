@@ -181,7 +181,7 @@ def generate_launch_description():
             'invert_acc': False,
             'invert_gyro': False,
             'cool_time_duration': 2.0,
-            'enable_robot_odometry_prediction': False,  # 与ROS1一致，纯NDT匹配
+            'enable_robot_odometry_prediction': True,   # 必须True: HDL通过TF查odom->base_link计算map->odom; False会直接发map->base_link，与body->base_link静态TF冲突导致TF树断裂
             'robot_odom_frame_id': 'odom',
             'odom_child_frame_id': 'base_link',
             'reg_method': 'NDT_OMP',
@@ -192,7 +192,7 @@ def generate_launch_description():
             'ndt_max_iterations': 50,  # ROS2优化，更稳定收敛
             'downsample_resolution': 0.15,  # 与ROS1一致，15cm下采样
             'status_max_correspondence_dist': 0.5,  # 匹配状态阈值
-            'specify_init_pose': True,
+            'specify_init_pose': False,          # Phase 3: 依靠 SC 自动重定位
             'init_pos_x': 0.0,
             'init_pos_y': 0.0,
             'init_pos_z': 0.0,
@@ -200,6 +200,10 @@ def generate_launch_description():
             'init_ori_x': 0.0,
             'init_ori_y': 0.0,
             'init_ori_z': 0.0,
+            'auto_relocalization': True,         # 启用自动重定位
+            'auto_reloc_delay_ms': 3000,         # globalmap 收到后等待3秒
+            'auto_reloc_conf_threshold': 0.4,    # SC 距离阈值
+            'auto_reloc_ndt_candidates': 10,     # NDT 验证候选数（覆盖多个空间簇）
             'use_global_localization': True,
         }],
         remappings=[
@@ -272,10 +276,12 @@ def generate_launch_description():
 
     # 严格仿照 ROS1 rslidar_driver.launch:24-38
     # angle_min/max: 只保留前方180°，屏蔽后方金属box反射
-    # min_height: -0.08m (地面以下，包含所有地面点)
+    # min_height: ROS1 用 -0.08 + costmap PointCloud2 的 min_obstacle_height 二次过滤
+    #   ROS2 走 LaserScan (2D,无高度)，costmap 无法二次过滤 → 必须在此过滤地面
+    #   lidar 距地面 ~6cm，rslidar 系下地面 ≈ z=-0.06m, 设 0.0 过滤地面回波
     # max_height: 1.36m (检测人、桌椅等)
     # transform_tolerance: 0.1s (系统时间统一后，无需大容错)
-    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': -0.08, 'max_height': 1.36,
+    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': 0.0, 'max_height': 1.36,
                         'angle_min': -1.5708, 'angle_max': 1.5708, 'angle_increment': 0.00872, 'scan_time': 0.1,
                         'range_min': 0.2, 'range_max': 10.0, 'use_inf': True}
     pointcloud_to_laserscan_aligned = Node(

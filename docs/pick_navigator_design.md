@@ -2,7 +2,7 @@
 
 > ROS2 自主机器人任务管理系统 — 当前任务: 自主拣取（Pick）
 >
-> 版本: 8.0
+> 版本: 9.0
 > 日期: 2026-03-02
 
 ---
@@ -71,7 +71,7 @@
            │                             │
            ▼                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                      ROBOT MANAGER (❌ 待实现)                               │
+│                      ROBOT MANAGER (✅ 已实现)                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  状态机: IDLE → PLANNING → STOWING → NAVIGATING → DEPLOYING →              │
@@ -80,7 +80,7 @@
 │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                    │
 │  │  TargetPool  │   │ Approach     │   │ Piper        │                    │
 │  │  (目标管理)   │   │ Navigator    │   │ GraspNode    │                    │
-│  │  (待实现)     │   │ (✅已实现)    │   │ (✅已实现)    │                    │
+│  │  (✅已实现)   │   │ (✅已实现)    │   │ (✅已实现)    │                    │
 │  └──────────────┘   └──────────────┘   └──────────────┘                    │
 │                                                                             │
 └──────────┬─────────────────────────────┬────────────────────────────────────┘
@@ -145,7 +145,7 @@ RobotManager
 | ApproachNavigator | ✅ 已实现 | `approach_navigator` | 三阶段精确导航 |
 | PiperGraspNode | ✅ 已实现 | `piper_grasp` | 机械臂控制 + observe/pick/place |
 | PiperAPI V2 | ✅ 已实现 | `piper_grasp` | CAN 总线通信，无ROS依赖 |
-| **RobotManager** | ❌ **待实现** | `robot_manager` | 任务编排 + 状态机 + 目标管理 |
+| **RobotManager** | ✅ 已实现 | `robot_manager` | 任务编排 + 状态机 + 目标管理 |
 
 ### 依赖关系
 
@@ -153,12 +153,16 @@ RobotManager
 Perception
 ├─ MultiCameraPerceptionNode ──remap──► ObjectTrackerNode ──┐
 │                                                            │
-SLAM                                                        ├──► RobotManager (待实现)
+SLAM                                                        ├──► RobotManager
 ├─ Nav2 (via ApproachNavigator) ────────────────────────────┤
 ├─ TF树 (map→odom→base_link) ──────────────────────────────┤
 │                                                            │
 Manipulation                                                │
 └─ PiperGraspNode ─────────────────────────────────────────┘
+
+### 依赖关系图（全部已实现）
+
+所有模块均已开发完毕并通过独立测试。Robot Manager 作为薄编排层将三大模块串联为完整的自主拣取系统。
 ```
 
 ---
@@ -426,8 +430,8 @@ class PickState(IntEnum):
     SCANNING = 5      # 工作区扫描
     PICKING = 6       # 批量抓取
     PLACING = 7       # 放置物品
-    COMPLETED = 8     # 全部完成
-    ERROR = 9         # 出错（可恢复）
+    ERROR = 8         # 出错（可恢复）
+    COMPLETED = 9     # 全部完成
 ```
 
 ### 8.2 状态转移
@@ -444,7 +448,7 @@ class PickState(IntEnum):
 │           │ 有目标           无工作区目标   │
 │           ▼                               │
 │       STOWING                             │
-│           │ go_zero/安全位                 │
+│           │ go_ready(close gripper)        │
 │           ▼                               │
 │       NAVIGATING                          │
 │           │ ApproachResult.success        │
@@ -495,6 +499,104 @@ class PickState(IntEnum):
 | DEPLOYING | go_ready 到观察位 | 导航完成后展臂准备扫描 |
 | PICKING/PLACING | 主动控制 | PiperGraspNode 管理 |
 
+### 8.4 进程与线程模型
+
+> 源码: `src/robot_manager/src/robot_manager_node.py`
+
+```
+┌─────────────── 进程: robot_manager_node ───────────────┐
+│                                                         │
+│  MultiThreadedExecutor (4 threads)                      │
+│  ├─ RobotManagerNode                                    │
+│  │   ├─ Subscription: tracked_objects (5Hz)             │
+│  │   ├─ Timer: status publisher (1Hz)                   │
+│  │   ├─ Service: ~/start, ~/abort                       │
+│  │   ├─ Service clients: observe, go_ready,             │
+│  │   │   in_working_area, get_status                    │
+│  │   ├─ Action clients: pick, place                     │
+│  │   └─ TF buffer + listener                            │
+│  └─ ApproachNavigator (独立 Node，共享 executor)        │
+│                                                         │
+│  Worker Thread (daemon):                                │
+│  └─ PickStateMachine.run(abort_event)                   │
+│      阻塞式状态机主循环                                  │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**线程分工**:
+
+| 线程 | 职责 |
+|------|------|
+| Executor threads (1-4) | ROS2 回调: timer, subscription, service, ApproachNavigator 回调 |
+| Worker thread (daemon) | 状态机主循环: 阻塞操作 (nav, pick, place) 在此运行 |
+
+**Service/Action 异步调用模式**:
+
+Worker thread 不能调用 `spin_until_future_complete()`（只有 executor 线程可以），因此使用 `call_async()` + 轮询：
+
+```python
+def _wait_future(self, future, timeout, abort_event):
+    deadline = time.time() + timeout
+    while not future.done():
+        if abort_event and abort_event.is_set():
+            return None
+        if time.time() > deadline:
+            return None
+        time.sleep(0.05)
+    return future.result()
+```
+
+Executor 线程持续 spin 处理 future 回调，所以 future 会正常 resolve。
+
+**Abort 机制**:
+
+1. `~/abort` service callback（executor 线程）→ 设置 `threading.Event`
+2. 同时调 `navigator.cancel()` + cancel 活跃的 pick/place `goal_handle`
+3. Worker thread 下次检查 `abort_event.is_set()` 时退出循环
+4. 退出前 best-effort stow arm → 状态回 IDLE
+
+### 8.5 状态处理器表（handler 驱动，消除 switch/case）
+
+> 源码: `src/robot_manager/robot_manager/pick_state_machine.py`
+
+```python
+self._handlers = {
+    PickState.PLANNING:   self._do_planning,
+    PickState.STOWING:    self._do_stowing,
+    PickState.NAVIGATING: self._do_navigating,
+    PickState.DEPLOYING:  self._do_deploying,
+    PickState.SCANNING:   self._do_scanning,
+    PickState.PICKING:    self._do_picking,
+    PickState.PLACING:    self._do_placing,
+    PickState.ERROR:      self._do_error,
+}
+```
+
+每个 handler 签名统一：`(abort_event) -> PickState`，返回下一状态。主循环：
+
+```python
+while not abort_event.is_set():
+    state = self.state
+    if state in (PickState.IDLE, PickState.COMPLETED):
+        break
+    next_state = self._handlers[state](abort_event)
+    self._set_state(next_state)
+```
+
+### 8.6 状态转移详表
+
+| 状态 | 动作 | 成功 → | 失败 → |
+|------|------|--------|--------|
+| PLANNING | `pool.get_nav_target()` | STOWING | COMPLETED (无目标) |
+| STOWING | `/piper/go_ready(open_gripper=False)` 收臂 | NAVIGATING | ERROR |
+| NAVIGATING | `navigator.approach_to_target()` + pool.pause | DEPLOYING | ERROR (连续失败≥3) 或 PLANNING (单次失败) |
+| DEPLOYING | `/piper/go_ready(open_gripper=True)` 展臂 | SCANNING | ERROR |
+| SCANNING | pool.resume + 等待稳定 + `pool.get_workspace_targets()` | PICKING | PLANNING (无工作区目标) |
+| PICKING | `/piper/observe` → `/piper/pick` | PLACING | ERROR (连续失败≥3) 或 PICKING (跳过当前) |
+| PLACING | `/piper/place` → mark_picked/failed | PICKING (队列非空) 或 PLANNING (队列空) | PICKING (继续下一个) |
+| ERROR | cooldown 5s → 重试 | PLANNING | COMPLETED (重试≥3次) |
+
 ---
 
 ## 9. 完整拣取流程（Pick 任务）
@@ -512,7 +614,7 @@ class PickState(IntEnum):
 │      └─ 选择: 距机器人最近的作为导航目标                                 │
 │                                                                         │
 │  [2] STOWING - 收臂                                                    │
-│      └─ 调用: /piper/go_zero 或 set_position(安全位)                   │
+│      └─ 调用: /piper/go_ready(speed=30, open_gripper=False)            │
 │                                                                         │
 │  [3] NAVIGATING - 三阶段导航                                            │
 │      ├─ 暂停 TargetPool 更新（避免导航中位置漂移污染）                    │
@@ -580,93 +682,62 @@ MATCH_THRESHOLD = 0.08  # 8cm
 
 ### 10.3 TargetPool 实现
 
+> 源码: `src/robot_manager/robot_manager/target_pool.py`
+
 ```python
+class TargetStatus(IntEnum):
+    ACTIVE = 0
+    PICKED = 1
+    FAILED = 2
+
 @dataclass
 class TargetRecord:
-    position_map: Point       # map 坐标系位置
-    category: str             # 类别
-    attempt_count: int = 0    # 尝试次数
-    picked: bool = False      # 是否已抓取
-    last_seen: float = 0.0    # 最后看到的时间戳
-    fail_reason: str = ""     # 最近一次失败原因
+    track_id: int
+    category: str
+    position_map: Point          # map 坐标系，单位 m
+    track_score: float
+    position_confidence: float
+    status: TargetStatus = TargetStatus.ACTIVE
+    attempts: int = 0
+    last_seen: float = field(default_factory=time.time)
+    fail_reason: str = ""
 
 
 class TargetPool:
-    MATCH_THRESHOLD = 0.08
-    MAX_ATTEMPTS = 3
+    """线程安全的目标池。单把 threading.Lock 保护 _targets 和 _update_enabled。"""
 
-    def __init__(self, tf_buffer: tf2_ros.Buffer):
-        self.tf_buffer = tf_buffer
-        self.targets: List[TargetRecord] = []
-        self.update_enabled = True    # NAVIGATING 时暂停
+    MATCH_THRESHOLD = 0.08  # 8cm
+
+    def __init__(self, tf_buffer, logger, min_track_score, min_position_confidence,
+                 min_distance, max_distance, max_attempts):
+        self._lock = threading.Lock()
+        self._targets: List[TargetRecord] = []
+        self._update_enabled = True
 
     def update_from_tracker(self, msg: TrackedObject3DArray) -> None:
-        if not self.update_enabled:
-            return
-        now = time.time()
-        for obj in msg.objects:
-            if obj.track_score < 0.3 or obj.position_confidence < 0.3:
-                continue
-            pos_map = self._transform_to_map(obj.position)
-            if pos_map is None:
-                continue
-            existing = self._find_by_position(pos_map)
-            if existing:
-                existing.last_seen = now
-                existing.category = obj.category
-            else:
-                self.targets.append(TargetRecord(
-                    position_map=pos_map,
-                    category=obj.category,
-                    last_seen=now
-                ))
+        """Subscription callback。TF lookup 在锁外执行，更新在锁内。"""
+        # 1. 检查 update_enabled（锁内）
+        # 2. lookup_transform('map', 'base_link', msg.header.stamp)（锁外）
+        # 3. 遍历 msg.objects，过滤 + 匹配 + 指数移动平均更新位置（锁内）
 
-    def get_nav_target(self) -> Optional[TargetRecord]:
-        candidates = [
-            t for t in self.targets
-            if not t.picked and t.attempt_count < self.MAX_ATTEMPTS
-        ]
-        if not candidates:
-            return None
-        robot_pos = self._get_robot_position()
-        if robot_pos is None:
-            return candidates[0]
-        return min(candidates, key=lambda t: self._distance(t.position_map, robot_pos))
+    def get_nav_target(self, robot_pos_map: Point) -> Optional[TargetRecord]:
+        """返回距机器人最近的 ACTIVE 且未超限目标。"""
 
-    def get_workspace_targets(self, in_working_area_client) -> List[TargetRecord]:
-        candidates = []
-        for t in self.targets:
-            if t.picked or t.attempt_count >= self.MAX_ATTEMPTS:
-                continue
-            pos_base = self._transform_to_base(t.position_map)
-            if pos_base is None:
-                continue
-            # 单位转换边界：m → mm
-            req = InWorkingArea.Request()
-            req.point_in_base = [
-                pos_base.x * 1000.0,
-                pos_base.y * 1000.0,
-                pos_base.z * 1000.0
-            ]
-            resp = in_working_area_client.call(req)
-            if resp.in_area:
-                candidates.append(t)
-        robot_pos = self._get_robot_position()
-        if robot_pos:
-            candidates.sort(key=lambda t: self._distance(t.position_map, robot_pos))
-        return candidates
+    def get_workspace_targets(self, in_working_area_fn, robot_pos_map) -> List[TargetRecord]:
+        """接受回调函数判断工作区，不直接持有 ROS client。按距离排序。"""
 
-    def mark_picked(self, position_map: Point) -> None:
-        target = self._find_by_position(position_map)
-        if target:
-            target.picked = True
+    def pause(self) / resume(self):
+        """NAVIGATING 期间暂停更新，SCANNING 恢复。"""
 
-    def mark_failed(self, position_map: Point, reason: str = "") -> None:
-        target = self._find_by_position(position_map)
-        if target:
-            target.attempt_count += 1
-            target.fail_reason = reason
+    def mark_picked(self, pos) / mark_failed(self, pos, reason):
+        """基于最近距离匹配，更新状态或累计 attempts。"""
 ```
+
+**关键改进（相对设计稿的变化）**：
+- 使用 `TargetStatus` 枚举替代 `picked: bool`，状态更清晰
+- 位置更新采用指数移动平均（0.7/0.3 权重），减少单帧噪声
+- `get_workspace_targets()` 接受回调函数而非直接持有 service client，保持 TargetPool 为纯逻辑层
+- TF 查询在锁外执行，避免锁内阻塞
 
 ---
 
@@ -836,21 +907,22 @@ DONE (9)         完成
 
 ### 14.2 转换边界
 
-**RobotManager 内部统一使用 SI 单位（m, rad）**，仅在调用 Piper 服务时做一次转换：
+**RobotManager 内部统一使用 SI 单位（m）**，仅在一个地方做 m→mm 转换：
+
+> 源码: `pick_state_machine.py:_check_in_working_area()`
 
 ```python
-# RobotManager 内部的唯一转换函数
-def m_to_mm(value_m: float) -> float:
-    return value_m * 1000.0
-
-def mm_to_m(value_mm: float) -> float:
-    return value_mm / 1000.0
-
-# 使用示例：调用 /piper/in_working_area
-req.point_in_base = [m_to_mm(x), m_to_mm(y), m_to_mm(z)]
+# 唯一的 m→mm 转换点
+def _check_in_working_area(self, pos_map: Point) -> bool:
+    # 1. TF: map → base_link
+    pos_base = _transform_point(pos_map, tf_map_to_base)
+    # 2. m → mm（唯一转换点）
+    req.point_in_base = [pos_base.x * 1000.0, pos_base.y * 1000.0, pos_base.z * 1000.0]
+    # 3. 调用 /piper/in_working_area
+    return resp.in_area
 ```
 
-不要在业务逻辑中散落转换代码。
+`lift_height` (config, 200.0mm) 和 `pick_speed` 直接透传给 Piper action，不经过转换。
 
 ### 14.3 坐标系
 
@@ -876,57 +948,53 @@ map                                    (全局，HDL定位)
 
 ### 15.1 状态反馈话题
 
+> 消息定义: `src/robot_manager/msg/RobotManagerStatus.msg`
+
 ```yaml
-/robot_manager/status:
-  类型: 自定义 RobotManagerStatus.msg (待定义)
+~/status:                           # 实际话题: /robot_manager_node/status
+  类型: robot_manager/RobotManagerStatus
   频率: 1Hz
   内容:
-    state: uint8              # 当前状态枚举
-    state_name: string        # "PLANNING", "NAVIGATING", ...
-    targets_total: uint32     # TargetPool 中总目标数
-    targets_picked: uint32    # 已抓取数
-    targets_failed: uint32    # 失败数
-    targets_remaining: uint32 # 剩余可抓数
-    current_target: string    # 当前目标类别
-    consecutive_failures: uint8
-    nav_time_ms: float32      # 最近导航耗时
-    pick_time_ms: float32     # 最近抓取耗时
-    error_message: string     # 错误信息（ERROR 状态时）
+    header: std_msgs/Header
+    state: uint8                    # 当前状态枚举 (0-9)
+    state_name: string              # "IDLE", "PLANNING", "NAVIGATING", ...
+    targets_total: uint32           # TargetPool 中总目标数
+    targets_picked: uint32          # 已抓取数
+    targets_failed: uint32          # 失败数
+    targets_remaining: uint32       # 剩余可抓数 (ACTIVE 状态)
+    current_target_category: string # 当前目标类别
+    consecutive_failures: uint8     # max(nav_failures, pick_failures)
+    last_nav_time_ms: float32       # 最近导航耗时
+    last_pick_time_ms: float32      # 最近抓取耗时
+    error_message: string           # 错误信息（ERROR 状态时）
 ```
 
 ### 15.2 启动健康检查
 
-RobotManager 启动时必须验证所有依赖可用：
+> 源码: `robot_manager_node.py:_startup_check()`
+
+调用 `~/start` 服务时执行，失败则拒绝启动并返回错误信息：
 
 ```python
-def _startup_check(self) -> bool:
-    checks = [
-        ("TF map→base_link", self._check_tf_available),
-        ("Perception topic", self._check_topic_active,
-            "/object_tracker_node/tracked_objects"),
-        ("/piper/observe", self._check_service_available),
-        ("/piper/pick", self._check_action_available),
-        ("/piper/place", self._check_action_available),
-        ("/piper/go_ready", self._check_service_available),
-        ("/piper/in_working_area", self._check_service_available),
-    ]
-    for name, check_fn, *args in checks:
-        if not check_fn(*args):
-            self.get_logger().error(f"Startup check failed: {name}")
-            return False
-    return True
+def _startup_check(self):
+    """返回 (ok: bool, message: str)"""
+    # 1. TF map→base_link 可用（5s 超时）
+    # 2. /piper/observe, /piper/go_ready, /piper/in_working_area 服务可用（2s 超时）
+    # 3. /piper/pick, /piper/place action server 可用（2s 超时）
+    # 4. ApproachNavigator 已设置
 ```
 
 ### 15.3 中止机制
 
 ```yaml
-/robot_manager/abort:
+~/abort:                              # 实际话题: /robot_manager_node/abort
   类型: std_srvs/Trigger
   行为:
-    1. Cancel 当前 ApproachNavigator
-    2. Cancel 当前 Piper pick/place action
-    3. 收臂到安全位 (go_zero)
-    4. 状态 → IDLE
+    1. 设置 abort_event (threading.Event)
+    2. Cancel ApproachNavigator (navigator.cancel())
+    3. Cancel 活跃的 Piper pick/place goal_handle
+    4. Worker thread 检测到 abort → best-effort stow arm
+    5. 状态 → IDLE
 ```
 
 ---
@@ -990,18 +1058,21 @@ src/
 │       ├── piper_grasp_node.yaml
 │       └── collision_config.yaml
 │
-└── robot_manager/                     # ❌ 待实现
-    ├── robot_manager/
+└── robot_manager/                     # ✅ 已实现
+    ├── robot_manager/                 # Python 模块（安装到 site-packages）
     │   ├── __init__.py
-    │   ├── robot_manager_node.py      # ROS2 节点入口
-    │   ├── pick_state_machine.py      # Pick 任务状态机
-    │   └── target_pool.py             # 目标管理
+    │   ├── target_pool.py             # TargetPool + TargetRecord (~180行)
+    │   └── pick_state_machine.py      # PickStateMachine + PickState (~300行)
+    ├── src/
+    │   └── robot_manager_node.py      # ROS2 节点入口 + main() (~230行)
     ├── msg/
     │   └── RobotManagerStatus.msg     # 状态反馈消息
     ├── config/
-    │   └── robot_manager.yaml
-    └── launch/
-        └── robot_manager.launch.py
+    │   └── robot_manager.yaml         # 20+ 参数
+    ├── launch/
+    │   └── robot_manager.launch.py
+    ├── CMakeLists.txt                 # ament_cmake + rosidl_generate_interfaces
+    └── package.xml
 ```
 
 ---
@@ -1016,24 +1087,33 @@ src/
 - [x] Navigation: ApproachNavigator 三阶段导航
 - [x] 消息定义: perception msg/srv + piper_msgs
 
-### Phase 2: Robot Manager + Pick 任务（待实现）
+### Phase 2: Robot Manager + Pick 任务 ✅ 已完成
 
-- [ ] 创建 robot_manager 包 + RobotManagerStatus.msg
-- [ ] 实现 TargetPool（map坐标目标管理，含暂停/恢复机制）
-- [ ] 实现 PickStateMachine（10 个状态，含 STOWING/DEPLOYING）
-- [ ] 实现启动健康检查
-- [ ] 实现 abort 服务
-- [ ] 集成 ApproachNavigator（导航阶段）
-- [ ] 集成 PiperGraspNode（抓取阶段）
-- [ ] 集成 /object_tracker_node/tracked_objects（唯一感知输入）
-- [ ] 端到端集成测试
+- [x] 创建 robot_manager 包 + RobotManagerStatus.msg
+- [x] 实现 TargetPool（线程安全、map坐标目标管理、暂停/恢复、指数移动平均位置更新）
+- [x] 实现 PickStateMachine（10 个状态、handler 表驱动、Piper service/action 异步调用封装）
+- [x] 实现 RobotManagerNode（MultiThreadedExecutor、daemon worker thread、ReentrantCallbackGroup）
+- [x] 实现启动健康检查（TF + services + actions + navigator）
+- [x] 实现 abort 服务（cancel goal + cancel nav + stow arm）
+- [x] 集成 ApproachNavigator（MultiThreadedExecutor 共享）
+- [x] 集成 PiperGraspNode（service/action clients）
+- [x] 集成 /object_tracker_node/tracked_objects（唯一感知输入）
+
+### Phase 3: 端到端集成测试（待执行）
+
+- [ ] 启动完整系统（SLAM + Perception + PiperGrasp + RobotManager）
+- [ ] 验证健康检查通过
+- [ ] 验证完整 pick 流程（PLANNING → ... → COMPLETED）
+- [ ] 验证 abort 中断恢复
+- [ ] 验证连续失败自动重试和退出
+- [ ] 长时间运行稳定性测试
 
 ---
 
 ## 18. 配置参数
 
 ```yaml
-robot_manager:
+robot_manager_node:
   ros__parameters:
     # --- 感知输入（唯一来源）---
     tracked_objects_topic: "/object_tracker_node/tracked_objects"
@@ -1078,6 +1158,7 @@ robot_manager:
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 9.0 | 2026-03-02 | **robot_manager 包实现完毕**。更新全文"待实现"→"已实现"；新增 §8.4 进程/线程模型、§8.5 handler 表驱动、§8.6 状态转移详表；修正 PickState 枚举顺序(ERROR=8,COMPLETED=9)；TargetPool 更新为线程安全实现(threading.Lock + 指数移动平均)；STOWING 改用 go_ready 替代 go_zero；status msg 字段名与实际 .msg 对齐；Phase 2 标记完成，新增 Phase 3 集成测试 |
 | 8.0 | 2026-03-02 | 包名从 pick_mission 恢复为 robot_manager，为后续任务类型拓展留空间；ROS2 命名空间统一为 /robot_manager/*；节点/消息/配置文件同步更名；新增可拓展性设计原则说明 |
 | 7.1 | 2026-03-02 | 修正坐标系错误：导航参数(base_link)和机械臂工作区(piper_link_base)是不同坐标系，移除错误的跨坐标系数值对比；强化模块解耦原则；工作区图表标注正确坐标系 |
 | 7.0 | 2026-03-02 | 深度审查修订：修复感知链路描述(Topic remap)；新增 STOWING/DEPLOYING 状态；TargetPool 暂停/恢复；ObjectTrackerNode 独立流水线；统一感知输入；ERROR 自动恢复；abort 机制和健康检查；监控诊断；帧计数稳定化；集中单位转换 |

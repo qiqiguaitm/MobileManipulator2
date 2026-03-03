@@ -83,9 +83,10 @@ public:
         declare_parameter("sc_dist_thres", 0.15);
         declare_parameter("sc_max_radius", 20.0);
         declare_parameter("mapviz_filter_size", 0.05);
+        declare_parameter("icp_fitness_threshold", 0.3);
 
         // 获取参数
-        save_directory_ = get_parameter("save_directory").as_string();
+        std::string base_save_dir = get_parameter("save_directory").as_string();
         keyframe_meter_gap_ = get_parameter("keyframe_meter_gap").as_double();
         keyframe_deg_gap_ = get_parameter("keyframe_deg_gap").as_double();
         double sc_dist_thres = get_parameter("sc_dist_thres").as_double();
@@ -93,6 +94,20 @@ public:
         double mapviz_filter_size = get_parameter("mapviz_filter_size").as_double();
 
         keyframe_rad_gap_ = keyframe_deg_gap_ * M_PI / 180.0;
+
+        // 在 save_directory 下创建时间戳子目录，每次建图数据独立保存
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf;
+        localtime_r(&t, &tm_buf);
+        char ts_buf[32];
+        std::strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm_buf);
+
+        // 确保 base 目录以 / 结尾
+        if (!base_save_dir.empty() && base_save_dir.back() != '/') {
+            base_save_dir += '/';
+        }
+        save_directory_ = base_save_dir + std::string(ts_buf) + "/";
 
         // 初始化路径
         pg_kitti_format_ = save_directory_ + "optimized_poses.txt";
@@ -102,8 +117,14 @@ public:
         // 创建目录
         std::system(("mkdir -p " + pg_scans_directory_).c_str());
 
+        // 创建 latest 软链接指向本次建图目录
+        std::string latest_link = base_save_dir + "latest";
+        std::system(("rm -f " + latest_link).c_str());
+        std::system(("ln -s " + save_directory_ + " " + latest_link).c_str());
+
         // 打开文件
-        pg_time_save_stream_.open(save_directory_ + "times.txt", std::fstream::out);
+        std::string times_path = save_directory_ + "times.txt";
+        pg_time_save_stream_.open(times_path, std::fstream::out);
         pg_time_save_stream_.precision(std::numeric_limits<double>::max_digits10);
 
         // 初始化ISAM2
@@ -167,6 +188,12 @@ public:
         if (thread_isam_.joinable()) thread_isam_.join();
         if (thread_viz_map_.joinable()) thread_viz_map_.join();
         if (thread_viz_path_.joinable()) thread_viz_path_.join();
+
+        // 确保最终优化结果被保存
+        if (gtsam_graph_made_ && !keyframe_poses_updated_.empty()) {
+            RCLCPP_INFO(get_logger(), "Saving final optimized poses (%zu keyframes)...", keyframe_poses_updated_.size());
+            saveOptimizedPoses();
+        }
 
         if (isam_) delete isam_;
         pg_time_save_stream_.close();
@@ -359,20 +386,20 @@ private:
         target_msg.header.stamp = now();
         pub_loop_submap_local_->publish(target_msg);
 
-        // ICP配准
+        // ICP配准 (室内环境优化参数)
         pcl::IterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(150);
+        icp.setMaxCorrespondenceDistance(2.0);  // 室内环境2m合理值 (原150m过大)
         icp.setMaximumIterations(100);
         icp.setTransformationEpsilon(1e-6);
         icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setRANSACIterations(0);
+        icp.setRANSACIterations(100);  // 启用RANSAC过滤离群点 (原0=禁用)
 
         icp.setInputSource(curr_cloud);
         icp.setInputTarget(target_cloud);
         pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
         icp.align(*unused_result);
 
-        float fitness_threshold = 0.3;
+        float fitness_threshold = get_parameter("icp_fitness_threshold").as_double();
         if (!icp.hasConverged() || icp.getFitnessScore() > fitness_threshold) {
             RCLCPP_INFO(get_logger(), "[SC loop] ICP failed (%.3f > %.3f)",
                        icp.getFitnessScore(), fitness_threshold);
@@ -605,8 +632,13 @@ private:
         }
     }
 
-    // 保存优化后的位姿
+    // 保存优化后的位姿 (写入前备份旧文件)
     void saveOptimizedPoses() {
+        // 备份已有文件，避免截断覆盖丢失数据
+        if (std::ifstream(pg_kitti_format_).good()) {
+            std::string bak = pg_kitti_format_ + ".bak";
+            std::rename(pg_kitti_format_.c_str(), bak.c_str());
+        }
         std::fstream stream(pg_kitti_format_, std::fstream::out);
         for (const auto& pose : keyframe_poses_updated_) {
             gtsam::Pose3 p = pose6DtoGTSAMPose3(pose);

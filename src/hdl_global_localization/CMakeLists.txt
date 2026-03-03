@@ -44,6 +44,7 @@ add_library(${PROJECT_NAME}_lib SHARED
   src/hdl_global_localization/ransac/ransac_pose_estimation.cpp
   src/hdl_global_localization/engines/global_localization_bbs.cpp
   src/hdl_global_localization/engines/global_localization_fpfh_ransac.cpp
+  src/hdl_global_localization/engines/global_localization_sc.cpp
   src/hdl_global_localization_node.cpp
 )
 ament_target_dependencies(${PROJECT_NAME}_lib
@@ -71,6 +72,14 @@ rclcpp_components_register_node(${PROJECT_NAME}_lib
   PLUGIN "${PROJECT_NAME}::GlobalLocalizationNode"
   EXECUTABLE ${PROJECT_NAME}_node
 )
+
+# SC database builder tool
+add_executable(build_sc_database src/build_sc_database.cpp)
+ament_target_dependencies(build_sc_database rclcpp pcl_ros)
+target_include_directories(build_sc_database PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+install(TARGETS build_sc_database DESTINATION lib/${PROJECT_NAME})
 
 install(
   TARGETS
