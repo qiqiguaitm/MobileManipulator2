@@ -193,7 +193,7 @@ class MultiCameraPerceptionNode(Node):
         self.default_prompt = self.get_parameter('default_prompt').value
 
         # 检测服务
-        self.declare_parameter('detector_type', 'dinox')  # dinox | sam3
+        self.declare_parameter('detector_type', 'sam3')  # dinox | sam3
         self.declare_parameter('detector_url', 'http://192.168.112.14:10086')
         self.declare_parameter('sam3_url', 'http://192.168.112.14:8081')
         self.declare_parameter('detector_timeout', 3.0)
@@ -208,7 +208,7 @@ class MultiCameraPerceptionNode(Node):
 
         # 深度优化服务
         self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8082')
-        self.declare_parameter('enable_depth_optimizer', False)
+        self.declare_parameter('enable_depth_optimizer', True)
         self.depth_optimizer_url = self.get_parameter('depth_optimizer_url').value
         self.enable_depth_optimizer = self.get_parameter('enable_depth_optimizer').value
 
@@ -221,7 +221,7 @@ class MultiCameraPerceptionNode(Node):
         self.distance_offset_default = self.get_parameter('distance_offset').value
 
         # 自动检测配置
-        self.declare_parameter('auto_detect_rate', 10.0)  # 默认 10Hz
+        self.declare_parameter('auto_detect_rate', 6.0)  # 默认 6Hz
         self.auto_detect_rate = self.get_parameter('auto_detect_rate').value
 
         # 时间同步参数
@@ -1038,7 +1038,8 @@ class MultiCameraPerceptionNode(Node):
         try:
             depth_mm = (optimized_depth * 1000).astype(np.uint16)
             depth_msg = self._bridge.cv2_to_imgmsg(depth_mm, encoding='16UC1')
-            depth_msg.header.stamp = data['timestamp']
+            # 使用系统时间戳，避免与其他节点时间不同步
+            depth_msg.header.stamp = self.get_clock().now().to_msg()
             depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
             if camera_name in self.pubs:
                 self.pubs[camera_name]['depth'].publish(depth_msg)

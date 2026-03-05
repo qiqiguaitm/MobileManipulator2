@@ -130,7 +130,7 @@ class PerceptionGraspNode(Node):
 
         # === 实时模式配置 ===
         realtime_cfg = self.config.get('trigger', {}).get('realtime_mode', {})
-        self._realtime_enabled = realtime_cfg.get('enabled', True)
+        self._realtime_enabled = realtime_cfg.get('enabled', False)
         self._realtime_rate = realtime_cfg.get('rate', 1.0)  # 默认1Hz以降低计算负载
         self._realtime_prompt = realtime_cfg.get('default_prompt', 'pen.box.phone.bottle.toy')
         self._realtime_enable_cdm = self.config.get('services', {}).get('cdm', {}).get('enabled', True)

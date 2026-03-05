@@ -167,14 +167,6 @@ def generate_launch_description():
         arguments=['0', '0', '0', '0', '0', '0', 'lidar_link', 'rslidar'],
     )
 
-    # 基础 TF (确保 base_link 存在)
-    base_tf_node = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='map_to_base_link',
-        arguments=['0', '0', '0', '0', '0', '0', 'map', 'base_link'],
-    )
-
     return LaunchDescription([
         # Arguments
         perf_mode_arg,
@@ -190,8 +182,7 @@ def generate_launch_description():
         lidar_max_range_arg,
         rviz_arg,
 
-        # Nodes
-        base_tf_node,              # 基础 TF (map -> base_link)
+        # Nodes (注意: map->base_link 由导航节点发布，禁止感知覆盖)
         lidar_tf_node,             # LiDAR TF (lidar_link -> rslidar)
         scene_perception_3d_node,  # 检测节点
         perception_rviz_node,      # 可视化节点

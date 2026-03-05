@@ -88,6 +88,12 @@ def generate_launch_description():
         description='Target coordinate frame'
     )
 
+    # 检测器类型
+    detector_type_arg = DeclareLaunchArgument(
+        'detector_type', default_value='sam3',
+        description='Detector type: sam3 or dinox'
+    )
+
     # ==================== Included Launches ====================
     
     # 包含相机驱动启动（条件：use_camera_driver:=true）
@@ -148,7 +154,10 @@ def generate_launch_description():
             
             # 坐标系
             {'target_frame': LaunchConfiguration('target_frame')},
-            
+
+            # 检测器类型
+            {'detector_type': LaunchConfiguration('detector_type')},
+
             # 外参目录
             {'extrinsics_dir': config_dir},
         ],
@@ -175,6 +184,7 @@ def generate_launch_description():
         enable_lidar_arg,
         lidar_topic_arg,
         target_frame_arg,
+        detector_type_arg,
 
         # 1. 条件启动相机驱动（默认不启动，避免冲突）
         camera_driver_launch,

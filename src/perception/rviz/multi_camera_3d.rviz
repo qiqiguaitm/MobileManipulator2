@@ -18,7 +18,7 @@ Panels:
         - /LiDAR1
         - /2D Images1
       Splitter Ratio: 0.5
-    Tree Height: 500
+    Tree Height: 278
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Views
@@ -26,10 +26,6 @@ Panels:
       - /Current View1
     Name: Views
     Splitter Ratio: 0.5
-Preferences:
-  PromptSaveOnExit: true
-Toolbars:
-  toolButtonStyle: 2
 Visualization Manager:
   Class: ""
   Displays:
@@ -39,7 +35,7 @@ Visualization Manager:
       Color: 160; 160; 164
       Enabled: true
       Line Style:
-        Line Width: 0.03
+        Line Width: 0.029999999329447746
         Value: Lines
       Name: Grid
       Normal Cell Count: 0
@@ -53,33 +49,130 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
-      Filter (blacklist): ""
-      Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        arm_base:
+          Value: true
         base_link:
+          Value: true
+        body:
+          Value: true
+        box_link:
+          Value: true
+        calibration/chassis_camera_optical:
+          Value: true
+        calibration/chassis_camera_physical:
+          Value: true
+        calibration/lidar:
+          Value: true
+        calibration/top_camera_optical:
+          Value: true
+        calibration/top_camera_physical:
           Value: true
         camera/chassis_link:
           Value: true
+        camera/hand_link:
+          Value: true
         camera/top_link:
           Value: true
+        camera_init:
+          Value: true
+        chassis_camera_link:
+          Value: true
+        chassis_color_frame:
+          Value: true
+        chassis_color_optical_frame:
+          Value: true
+        chassis_depth_frame:
+          Value: true
+        chassis_depth_optical_frame:
+          Value: true
+        chassis_link:
+          Value: true
+        hand_camera_link:
+          Value: true
         lidar_link:
+          Value: true
+        lifting_link:
+          Value: true
+        link1:
+          Value: true
+        link2:
+          Value: true
+        link3:
+          Value: true
+        link4:
+          Value: true
+        link5:
+          Value: true
+        link6:
+          Value: true
+        link7:
+          Value: true
+        link8:
+          Value: true
+        map:
+          Value: true
+        odom:
           Value: true
         rslidar:
           Value: true
         top_camera_link:
           Value: true
-        chassis_camera_link:
+        top_color_frame:
           Value: true
-      Marker Alpha: 1
-      Marker Scale: 0.3
+        top_color_optical_frame:
+          Value: true
+        top_depth_frame:
+          Value: true
+        top_depth_optical_frame:
+          Value: true
+        top_link:
+          Value: true
+      Marker Scale: 0.30000001192092896
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
-        {}
+        map:
+          odom:
+            camera_init:
+              body:
+                base_link:
+                  box_link:
+                    arm_base:
+                      link1:
+                        link2:
+                          link3:
+                            link4:
+                              link5:
+                                link6:
+                                  hand_camera_link:
+                                    camera/hand_link:
+                                      {}
+                                  link7:
+                                    {}
+                                  link8:
+                                    {}
+                    lifting_link:
+                      top_camera_link:
+                        camera/top_link:
+                          {}
+                  calibration/lidar:
+                    calibration/chassis_camera_physical:
+                      calibration/chassis_camera_optical:
+                        {}
+                    calibration/top_camera_physical:
+                      calibration/top_camera_optical:
+                        {}
+                  lidar_link:
+                    chassis_camera_link:
+                      camera/chassis_link:
+                        {}
+                    rslidar:
+                      {}
       Update Interval: 0
       Value: true
     - Class: rviz_common/Group
@@ -99,16 +192,19 @@ Visualization Manager:
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
+          Max Intensity: 4096
           Min Color: 0; 0; 0
+          Min Intensity: 0
           Name: Top RGB-D PointCloud
           Position Transformer: XYZ
           Selectable: true
           Size (Pixels): 3
-          Size (m): 0.01
+          Size (m): 0.009999999776482582
           Style: Flat Squares
           Topic:
             Depth: 5
             Durability Policy: Volatile
+            Filter size: 10
             History Policy: Keep Last
             Reliability Policy: Reliable
             Value: /multi_camera_rviz/top/rgb_pointcloud
@@ -119,7 +215,8 @@ Visualization Manager:
           Enabled: true
           Name: Top Object Markers
           Namespaces:
-            {}
+            top_distance_labels: true
+            top_object_bbox: true
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -146,16 +243,19 @@ Visualization Manager:
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
+          Max Intensity: 4096
           Min Color: 0; 0; 0
+          Min Intensity: 0
           Name: Chassis RGB-D PointCloud
           Position Transformer: XYZ
           Selectable: true
           Size (Pixels): 3
-          Size (m): 0.01
+          Size (m): 0.009999999776482582
           Style: Flat Squares
           Topic:
             Depth: 5
             Durability Policy: Volatile
+            Filter size: 10
             History Policy: Keep Last
             Reliability Policy: Reliable
             Value: /multi_camera_rviz/chassis/rgb_pointcloud
@@ -166,7 +266,8 @@ Visualization Manager:
           Enabled: true
           Name: Chassis Object Markers
           Namespaces:
-            {}
+            chassis_distance_labels: true
+            chassis_object_bbox: true
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -182,7 +283,8 @@ Visualization Manager:
           Enabled: true
           Name: Fused Object Markers
           Namespaces:
-            {}
+            fused_distance_labels: true
+            fused_object_bbox: true
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -209,23 +311,26 @@ Visualization Manager:
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
+          Max Intensity: 4096
           Min Color: 0; 0; 0
+          Min Intensity: 0
           Name: LiDAR PointCloud
           Position Transformer: XYZ
           Selectable: true
           Size (Pixels): 2
-          Size (m): 0.03
+          Size (m): 0.029999999329447746
           Style: Flat Squares
           Topic:
             Depth: 5
             Durability Policy: Volatile
+            Filter size: 10
             History Policy: Keep Last
             Reliability Policy: Reliable
             Value: /multi_camera_rviz/lidar_colored
           Use Fixed Frame: true
           Use rainbow: true
           Value: true
-      Enabled: true
+      Enabled: false
       Name: LiDAR
     - Class: rviz_common/Group
       Displays:
@@ -262,13 +367,8 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Default Light: true
     Fixed Frame: base_link
     Frame Rate: 30
-    Name: root
-    Scene Alpha: 0.9
-    Scene Manager: OpenGL
-    Render Engine: Ogre
   Name: root
   Tools:
     - Class: rviz_default_plugins/Interact
@@ -287,7 +387,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Orbit
       Distance: 5
       Enable Stereo Rendering:
-        Stereo Eye Separation: 0.06
+        Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
@@ -296,22 +396,30 @@ Visualization Manager:
         Y: 0
         Z: 0
       Focal Shape Fixed Size: true
-      Focal Shape Size: 0.05
+      Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
-      Near Clip Distance: 0.01
+      Near Clip Distance: 0.009999999776482582
       Pitch: 0.5
       Target Frame: base_link
       Value: Orbit (rviz)
-      Yaw: 0.8
-    Saved: null
+      Yaw: 0.800000011920929
+    Saved: ~
 Window Geometry:
+  Chassis Detection Image:
+    collapsed: false
   Displays:
     collapsed: false
   Height: 1016
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000004000000000000016a000003a2fc0200000009fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003d000003a2000000c900fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261000000010000010f000003a2fc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073010000003d000003a2000000a400fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000007380000003efc0100000002fb0000000800540069006d0065010000000000000738000002eb00fffffffb0000000800540069006d00650100000000000004500000000000000000000004c7000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
-  Width: 1848
-  X: 72
+  QMainWindow State: 000000ff00000000fd0000000100000000000001560000039efc0200000005fb000000260054006f007000200044006500740065006300740069006f006e00200049006d006100670065010000003d000000f80000002800fffffffb0000002e004300680061007300730069007300200044006500740065006300740069006f006e00200049006d006100670065010000013b000000f90000002800fffffffb000000100044006900730070006c006100790073010000023a000001a1000000c900fffffffb0000001200530065006c0065006300740069006f006e00000002a1000000840000005c00fffffffb0000000a00560069006500770073000000030b000000d0000000a400ffffff000005de0000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Selection:
+    collapsed: false
+  Top Detection Image:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 1850
+  X: 70
   Y: 27

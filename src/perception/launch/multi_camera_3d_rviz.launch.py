@@ -85,7 +85,7 @@ def generate_launch_description():
 
     # 检测参数
     auto_detect_rate_arg = DeclareLaunchArgument(
-        'auto_detect_rate', default_value='5.0',
+        'auto_detect_rate', default_value='6.0',
         description='Auto detection rate in Hz (0=disable)'
     )
     
@@ -241,15 +241,7 @@ def generate_launch_description():
         arguments=['-d', os.path.join(rviz_dir, 'multi_camera_3d.rviz')],
         output='screen',
     )
-    
-    # 基础 TF (确保坐标系存在)
-    base_tf_node = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='map_to_base_link',
-        arguments=['0', '0', '0', '0', '0', '0', 'map', 'base_link'],
-    )
-    
+
     # LiDAR TF (lidar_link -> rslidar)
     lidar_tf_node = Node(
         package='tf2_ros',
@@ -275,8 +267,7 @@ def generate_launch_description():
         extrinsics_suffix_arg,
         enable_depth_optimizer_arg,
 
-        # TF 基础
-        base_tf_node,
+        # TF 基础 (注意: map->base_link 由导航节点发布，禁止感知覆盖)
         lidar_tf_node,
         
         # 条件启动相机驱动（默认不启动）
