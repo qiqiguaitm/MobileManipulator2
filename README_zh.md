@@ -19,7 +19,7 @@
 
 ## 演示
 
-<video src="demo/robot_grasp_anni.mp4" controls width="100%"></video>
+![演示](demo/robot_grasp_anni.gif)
 
 | 机器人模型（URDF） | 系统启动 |
 |---|---|

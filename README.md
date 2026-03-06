@@ -20,7 +20,7 @@
 
 ## Demo
 
-<video src="demo/robot_grasp_anni.mp4" controls width="100%"></video>
+![Demo](demo/robot_grasp_anni.gif)
 
 | Robot Model (URDF) | System Startup |
 |---|---|
