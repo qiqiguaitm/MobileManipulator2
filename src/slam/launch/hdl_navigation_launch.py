@@ -28,6 +28,11 @@ DEFAULT_MAP_DIR = '/home/didi/workspace/MobileManipulator2/maps/sc_pgo'
 
 def generate_launch_description():
     declare_rviz = DeclareLaunchArgument('enable_rviz', default_value='true')
+    declare_rviz_delay = DeclareLaunchArgument(
+        'rviz_delay',
+        default_value='5.0',
+        description='Delay seconds before starting RViz to wait for map TF',
+    )
     declare_map_dir = DeclareLaunchArgument(
         'map_dir',
         default_value=DEFAULT_MAP_DIR,
@@ -119,18 +124,37 @@ def generate_launch_description():
     )
 
     # 机器人模型
+    # 直接订阅 /joint_states (grasp发布)，无数据时用静态 fallback
     urdf_path = os.path.join(robot_desc_pkg, 'urdf', 'mobile_manipulator2_description.urdf')
     with open(urdf_path, 'r') as f:
         robot_description = f.read()
+
+    # Robot State Publisher - 直接订阅 /joint_states
+    # 当 grasp 未运行时，通过 relay 切换到静态 fallback
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
         output='screen',
         parameters=[{'robot_description': robot_description}],
-        remappings=[('/joint_states', '/joint_states_static')],
+        remappings=[('/joint_states', '/joint_states_combined')],
     )
-    joint_state_publisher = Node(
+
+    # 智能 JointState Relay - 监听 grasp 数据，超时时自动切换到静态 fallback
+    joint_state_relay_node = Node(
+        package='slam',
+        executable='joint_state_relay.py',
+        name='joint_state_relay',
+        parameters=[{
+            'realtime_topic': '/joint_states',
+            'static_topic': '/joint_states_static',
+            'output_topic': '/joint_states_combined',
+            'timeout_sec': 0.3,
+        }],
+    )
+
+    # 静态 JointState - 机械臂折叠姿态 (fallback)
+    joint_state_static = Node(
         package='slam',
         executable='joint_state_static.py',
         name='joint_state_static',
@@ -201,9 +225,9 @@ def generate_launch_description():
             'init_ori_y': 0.0,
             'init_ori_z': 0.0,
             'auto_relocalization': True,         # 启用自动重定位
-            'auto_reloc_delay_ms': 3000,         # globalmap 收到后等待3秒
-            'auto_reloc_conf_threshold': 0.4,    # SC 距离阈值
-            'auto_reloc_ndt_candidates': 10,     # NDT 验证候选数（覆盖多个空间簇）
+            'auto_reloc_delay_ms': 5000,         # globalmap 收到后等待5秒 (让scan稳定)
+            'auto_reloc_conf_threshold': 0.25,   # 降低阈值以允许通过SC候选点
+            'auto_reloc_ndt_candidates': 15,     # NDT 验证候选数 (10→15, 全局采样更多位姿)
             'use_global_localization': True,
         }],
         remappings=[
@@ -281,7 +305,7 @@ def generate_launch_description():
     #   lidar 距地面 ~6cm，rslidar 系下地面 ≈ z=-0.06m, 设 0.0 过滤地面回波
     # max_height: 1.36m (检测人、桌椅等)
     # transform_tolerance: 0.1s (系统时间统一后，无需大容错)
-    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': 0.0, 'max_height': 1.36,
+    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': -0.08, 'max_height': 1.36,
                         'angle_min': -1.5708, 'angle_max': 1.5708, 'angle_increment': 0.00872, 'scan_time': 0.1,
                         'range_min': 0.2, 'range_max': 10.0, 'use_inf': True}
     pointcloud_to_laserscan_aligned = Node(
@@ -312,11 +336,16 @@ def generate_launch_description():
         ],
     )
 
-    rviz_node = Node(
+    rviz_node = TimerAction(
+        period=LaunchConfiguration('rviz_delay'),
         condition=IfCondition(LaunchConfiguration('enable_rviz')),
-        package='rviz2',
-        executable='rviz2',
-        arguments=['-d', os.path.join(slam_pkg, 'rviz', 'hdl_navigation.rviz')],
+        actions=[
+            Node(
+                package='rviz2',
+                executable='rviz2',
+                arguments=['-d', os.path.join(slam_pkg, 'rviz', 'hdl_navigation.rviz')],
+            )
+        ],
     )
 
     body_to_base_link_tf = Node(
@@ -328,11 +357,11 @@ def generate_launch_description():
     )
 
     launch_entities = [
-        declare_rviz, declare_map_dir, declare_map, declare_use_sim_time, declare_launch_chassis, declare_use_odom_fusion,
+        declare_rviz, declare_rviz_delay, declare_map_dir, declare_map, declare_use_sim_time, declare_launch_chassis, declare_use_odom_fusion,
         declare_use_raw_laserscan, declare_cloud_delay, declare_use_odom_fused,
         lidar_launch, imu_launch, fastlio_launch,
         odom_frame_converter_node, odom_fusion_node, odom_relay_node,
-        robot_state_publisher, joint_state_publisher,
+        robot_state_publisher, joint_state_relay_node, joint_state_static,
         delayed_cloud_relay_node, globalmap_node, hdl_global_node, hdl_local_node,
         tf_republisher_node,
         body_to_base_link_tf,

@@ -15,6 +15,7 @@ from typing import Optional, Callable
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, PoseStamped, Twist
+from nav_msgs.msg import Odometry
 import tf2_ros
 
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
@@ -57,6 +58,7 @@ class ApproachNavigator(Node):
         self.stage = NavStage.IDLE              # 当前阶段
         self._stage_lock = threading.Lock()      # 状态锁
         self._cancel_requested = False           # 取消标志
+        self._initial_depth = None              # 用户确认时的初始深度
 
         # 目标信息
         self.target_map_position: Optional[Point] = None    # 目标位置 (map 坐标系)
@@ -70,12 +72,32 @@ class ApproachNavigator(Node):
         self.nav = BasicNavigator()
 
         # 深度传感器 (替代 LiDAR)
-        self.depth_sensor = DepthSensor(self, self.config)
+        self.depth_sensor = DepthSensor(self, self.config, self.tf_buffer)
 
         # 速度发布器
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
+        # 里程计 (用于阶段3实际行驶距离测量，替代指令速度积分)
+        self._odom_lock = threading.Lock()
+        self._odom_x: Optional[float] = None
+        self._odom_y: Optional[float] = None
+        self.create_subscription(Odometry, '/odom', self._odom_callback, 10)
+
         self._log_config()
+
+    def _odom_callback(self, msg: Odometry):
+        with self._odom_lock:
+            self._odom_x = msg.pose.pose.position.x
+            self._odom_y = msg.pose.pose.position.y
+
+    def _get_odom_traveled(self, start_x: float, start_y: float) -> float:
+        """返回从起点到当前 odom 位置的直线距离"""
+        with self._odom_lock:
+            if self._odom_x is None:
+                return 0.0
+            dx = self._odom_x - start_x
+            dy = self._odom_y - start_y
+        return math.sqrt(dx * dx + dy * dy)
 
     def _log_config(self):
         """输出配置信息"""
@@ -85,13 +107,36 @@ class ApproachNavigator(Node):
         self.get_logger().info(f"  深度话题: {self.config.depth_topic}")
 
     # =========================================================================
+    # 公共接口 (供外部调用)
+    # =========================================================================
+
+    def get_current_depth(self) -> Optional[float]:
+        """获取当前障碍物距离 (到机器人前沿)"""
+        return self.depth_sensor.get_target_depth()
+
+    def set_initial_depth(self, depth: float):
+        """设置阶段3初始深度（用户确认时的深度）"""
+        self._initial_depth = depth
+
+    def get_initial_depth(self) -> Optional[float]:
+        """获取阶段3初始深度，如果没有则获取当前深度"""
+        if self._initial_depth is not None:
+            return self._initial_depth
+        return self.get_current_depth()
+
+    def clear_initial_depth(self):
+        """清除初始深度"""
+        self._initial_depth = None
+
+    # =========================================================================
     # 主接口
     # =========================================================================
 
     def approach_to_target(
         self,
         target_position: Point,
-        status_callback: Callable[[NavStage, str], None] = None
+        status_callback: Callable[[NavStage, str], None] = None,
+        skip_stages: set = None
     ) -> ApproachResult:
         """直接接近目标位置 (简化接口)
 
@@ -101,10 +146,15 @@ class ApproachNavigator(Node):
         Args:
             target_position: 目标物体在 map 坐标系中的位置
             status_callback: 阶段状态回调
+            skip_stages: 要跳过的阶段集合，如 {1}, {1,2}, {2,3} 等
 
         Returns:
             ApproachResult: 导航结果
         """
+        # 处理 skip_stages 默认值
+        if skip_stages is None:
+            skip_stages = set()
+
         # 获取当前机器人位置
         robot_pos, robot_yaw = self._get_robot_pose()
         if robot_pos is None:
@@ -119,32 +169,58 @@ class ApproachNavigator(Node):
             robot_front_offset=self.config.robot_front_offset
         )
 
-        if approach_pose is None:
-            # 已经在目标附近，直接执行阶段2和3
-            self.get_logger().info("已在目标附近，跳过阶段1")
+        # 如果跳过阶段1且需要接近位姿，报错
+        if 1 in skip_stages and approach_pose is not None:
+            self.get_logger().warn("跳过阶段1但需要导航到接近点，将继续导航")
+            skip_stages = skip_stages - {1}  # 移除阶段1跳过标记
+
+        if approach_pose is None or 1 in skip_stages:
+            # 已经在目标附近或跳过阶段1，直接执行阶段2和3
+            if approach_pose is None:
+                self.get_logger().info("已在目标附近，跳过阶段1")
+            else:
+                self.get_logger().info("跳过阶段1")
             self.target_map_position = target_position
             self._update_target_yaw()
 
-            # 执行阶段2: 对齐
-            success, msg = self._do_alignment()
-            if not success:
-                return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
+            def _notify(stage: NavStage, msg: str):
+                with self._stage_lock:
+                    self.stage = stage
+                if status_callback:
+                    status_callback(stage, msg)
 
-            # 执行阶段3: 精确接近
-            success, msg, final_dist = self._do_final_approach()
-            if not success:
-                return ApproachResult(False, "APPROACH_FAILED", msg, stage=3)
+            # 执行阶段2: 对齐 (除非跳过)
+            if 2 not in skip_stages:
+                _notify(NavStage.ALIGNING, "对准目标方向...")
+                success, msg = self._do_alignment()
+                if not success:
+                    return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
+                time.sleep(1.0)
+            else:
+                self.get_logger().info("跳过阶段2")
+
+            # 执行阶段3: 精确接近 (除非跳过)
+            # _notify 同步调用 status_callback，callback 中的 input() 会阻塞直到用户确认
+            if 3 not in skip_stages:
+                _notify(NavStage.FINAL_APPROACH, "精确接近中...")
+                success, msg, final_dist = self._do_final_approach()
+                if not success:
+                    return ApproachResult(False, "APPROACH_FAILED", msg, stage=3)
+            else:
+                self.get_logger().info("跳过阶段3")
+                final_dist = 0.0
 
             return ApproachResult(True, final_distance=final_dist)
 
         # 执行完整三阶段导航
-        return self.approach_to_pose(approach_pose, target_position, status_callback)
+        return self.approach_to_pose(approach_pose, target_position, status_callback, skip_stages)
 
     def approach_to_pose(
         self,
         approach_pose: PoseStamped,
         target_position: Optional[Point] = None,
-        status_callback: Callable[[NavStage, str], None] = None
+        status_callback: Callable[[NavStage, str], None] = None,
+        skip_stages: set = None
     ) -> ApproachResult:
         """执行三阶段导航到接近位姿
 
@@ -152,10 +228,15 @@ class ApproachNavigator(Node):
             approach_pose: 预计算的接近位姿 (map 坐标系)
             target_position: 目标物体位置，用于阶段2/3。None 则从 approach_pose 反推
             status_callback: 阶段状态回调，参数为 (NavStage, 消息字符串)
+            skip_stages: 要跳过的阶段集合，如 {1}, {1,2}, {2,3} 等
 
         Returns:
             ApproachResult: 导航结果
         """
+        # 处理 skip_stages 默认值
+        if skip_stages is None:
+            skip_stages = set()
+
         self._cancel_requested = False
 
         # 计算目标位置 (如果未提供)
@@ -172,43 +253,69 @@ class ApproachNavigator(Node):
             self.get_logger().info(f"{stage.name}: {msg}")
 
         # ========== 阶段1: Nav2 导航 ==========
-        notify(NavStage.NAVIGATING, "导航到接近点...")
-        result1 = self._do_navigation(approach_pose)
+        if 1 in skip_stages:
+            self.get_logger().info("跳过阶段1 (Nav2 导航)")
+            notify(NavStage.NAVIGATING, "跳过阶段1")
+            result1 = True
+        else:
+            notify(NavStage.NAVIGATING, "导航到接近点...")
+            result1 = self._do_navigation(approach_pose)
 
-        if self._cancel_requested:
-            notify(NavStage.FAILED, "用户取消")
-            return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=1)
+            if self._cancel_requested:
+                notify(NavStage.FAILED, "用户取消")
+                return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=1)
 
-        if not result1:
-            notify(NavStage.FAILED, "导航失败")
-            return ApproachResult(False, "NAV_FAILED", "Nav2 导航失败", stage=1)
+            if not result1:
+                notify(NavStage.FAILED, "导航失败")
+                return ApproachResult(False, "NAV_FAILED", "Nav2 导航失败", stage=1)
 
-        # 更新目标航向
-        self._update_target_yaw()
+            # 更新目标航向
+            self._update_target_yaw()
+
+            # 阶段1完成后等待车辆停稳
+            self.get_logger().info("Nav2 到达，等待车辆停稳...")
+            time.sleep(0.5)  # 等待0.5秒
 
         # ========== 阶段2: 对齐 ==========
-        notify(NavStage.ALIGNING, "对准目标方向...")
-        success, msg = self._do_alignment()
+        if 2 in skip_stages:
+            self.get_logger().info("跳过阶段2 (对齐)")
+            notify(NavStage.ALIGNING, "跳过阶段2")
+            success = True
+            msg = "skipped"
+        else:
+            notify(NavStage.ALIGNING, "对准目标方向...")
+            success, msg = self._do_alignment()
 
-        if self._cancel_requested:
-            notify(NavStage.FAILED, "用户取消")
-            return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=2)
+            if self._cancel_requested:
+                notify(NavStage.FAILED, "用户取消")
+                return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=2)
 
-        if not success:
-            notify(NavStage.FAILED, f"对齐失败: {msg}")
-            return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
+            if not success:
+                notify(NavStage.FAILED, f"对齐失败: {msg}")
+                return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
+
+            # 阶段2完成后等待车辆停稳
+            self.get_logger().info("对齐完成，等待车辆停稳...")
+            time.sleep(1.0)  # 等待1秒让车子停稳
 
         # ========== 阶段3: 精确接近 ==========
-        notify(NavStage.FINAL_APPROACH, "精确接近中...")
-        success, msg, final_dist = self._do_final_approach()
+        if 3 in skip_stages:
+            self.get_logger().info("跳过阶段3 (精确接近)")
+            notify(NavStage.FINAL_APPROACH, "跳过阶段3")
+            final_dist = 0.0
+            success = True
+            msg = "skipped"
+        else:
+            notify(NavStage.FINAL_APPROACH, "精确接近中...")
+            success, msg, final_dist = self._do_final_approach()
 
-        if self._cancel_requested:
-            notify(NavStage.FAILED, "用户取消")
-            return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=3)
+            if self._cancel_requested:
+                notify(NavStage.FAILED, "用户取消")
+                return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=3)
 
-        if not success:
-            notify(NavStage.FAILED, f"接近失败: {msg}")
-            return ApproachResult(False, "APPROACH_FAILED", msg, stage=3)
+            if not success:
+                notify(NavStage.FAILED, f"接近失败: {msg}")
+                return ApproachResult(False, "APPROACH_FAILED", msg, stage=3)
 
         notify(NavStage.ARRIVED, f"已到达，距离: {final_dist:.3f}m")
         return ApproachResult(True, final_distance=final_dist)
@@ -364,7 +471,6 @@ class ApproachNavigator(Node):
         self.get_logger().info(f"开始精确接近，目标距离: {self.config.final_approach_distance}m")
         self.get_logger().info(f"  robot_front_offset: {self.config.robot_front_offset}m")
         self.get_logger().info(f"  内参: {'已加载' if self.depth_sensor.has_intrinsics else '未加载'}")
-        self.get_logger().info(f"  外参: {'已加载' if self.depth_sensor.has_extrinsics else '未加载'}")
 
         # 速度平滑参数
         dt = 1.0 / self.config.control_rate
@@ -372,10 +478,20 @@ class ApproachNavigator(Node):
         max_accel = 0.15     # 最大加速率 m/s²
         max_decel = 0.3      # 最大减速率 m/s²
 
+        # 记录 odom 起始位置，用于实际行驶距离测量
+        with self._odom_lock:
+            odom_start_x = self._odom_x
+            odom_start_y = self._odom_y
+        use_odom = odom_start_x is not None
+        if use_odom:
+            self.get_logger().info("阶段3: 使用里程计测量实际行驶距离")
+        else:
+            self.get_logger().warn("阶段3: 里程计不可用，回退到指令速度积分")
+
         # 开环控制：target_distance 是障碍物到机器人初始位置的距离
         # 如果检测到更近的物体，更新target；否则开环
         target_distance: float = None           # 目标距离 (相对初始位置)
-        total_traveled: float = 0.0             # 累计行驶距离 (速度积分)
+        total_traveled: float = 0.0             # 累计行驶距离
 
         while rclpy.ok() and not self._cancel_requested:
             # 超时检查
@@ -383,20 +499,32 @@ class ApproachNavigator(Node):
                 self._stop_robot()
                 return False, "接近超时", 0.0
 
-            # 获取最近障碍物 (base_link 坐标系)
+            # 获取最近障碍物深度
             obstacle_x = self.depth_sensor.get_target_depth()
 
-            # 累积行驶距离 (速度 × 时间)
-            total_traveled += current_speed * dt
+            # 累计行驶距离: 优先用 odom 位置差，不可用时回退到指令速度积分
+            if use_odom:
+                total_traveled = self._get_odom_traveled(odom_start_x, odom_start_y)
+            else:
+                total_traveled += current_speed * dt
 
             # ========== 距离估算 ==========
+            # 注意: obstacle_x 已经是到机器人前沿的距离（相机在机器人最前端）
             if target_distance is None:
-                # 等待首次点云检测
-                if obstacle_x is not None:
-                    raw_clearance = obstacle_x - self.config.robot_front_offset
-                    target_distance = raw_clearance  # 初始目标距离
+                # 使用用户确认时的初始深度
+                initial_depth = self.get_initial_depth()
+                if initial_depth is not None:
+                    target_distance = initial_depth  # 使用用户确认时的深度
                     total_traveled = 0.0
-                    front_clearance = raw_clearance
+                    front_clearance = initial_depth
+                    self.get_logger().info(
+                        f"[初始化] target={target_distance:.3f}m (用户确认深度)"
+                    )
+                elif obstacle_x is not None:
+                    # 如果没有初始深度，用当前深度
+                    target_distance = obstacle_x  # 直接用障碍物到相机的距离
+                    total_traveled = 0.0
+                    front_clearance = obstacle_x
                     self.get_logger().info(
                         f"[初始化] target={target_distance:.3f}m"
                     )
@@ -410,7 +538,8 @@ class ApproachNavigator(Node):
             else:
                 # 检查是否检测到更近的障碍物
                 if obstacle_x is not None:
-                    current_clearance = obstacle_x - self.config.robot_front_offset
+                    # obstacle_x 已经是到机器人前沿的距离
+                    current_clearance = obstacle_x
                     # 转换为相对初始位置的距离
                     obstacle_from_start = current_clearance + total_traveled
 

@@ -159,40 +159,31 @@ def generate_launch_description():
     piper_ctrl_node = None
 
     # ==================== Robot State Publisher (URDF) ====================
+    # NOTE: 禁用 robot_state_publisher！因为导航系统 (make navi-fusion) 已经使用
+    # mobile_manipulator2_description.urdf 发布了完整的机械臂 TF (arm_base, link1-8)。
+    # 如果同时启动两个 RSP，会导致 TF 冲突：arm_base/link1-link8 被竞争发布，
+    # 导致 RViz 机器人模型异常、夹爪 TF 错误无法抓取。
+    # 夹爪 (gripper_base) 的 TF 单独通过 static_transform_publisher 发布。
     robot_state_publisher_node = None
     joint_state_publisher_node = None
     robot_description = None
 
-    if _is_package_available('piper_description'):
-        piper_description_share = get_package_share_directory('piper_description')
-        xacro_file = os.path.join(piper_description_share, 'urdf', 'piper_description.xacro')
-        if os.path.exists(xacro_file):
-            robot_description_config = xacro.process_file(xacro_file)
-            robot_description = robot_description_config.toxml()
-            robot_state_publisher_node = Node(
-                package='robot_state_publisher',
-                executable='robot_state_publisher',
-                name='robot_state_publisher',
-                output='screen',
-                parameters=[{
-                    'robot_description': robot_description,
-                    'publish_frequency': 50.0
-                }]
-            )
-
-            # Fake joint state publisher for testing without hardware
-            # (equivalent to ROS1 piper_grasp_rviz.launch use_fake_joints:=true)
-            joint_state_publisher_node = Node(
-                condition=IfCondition(LaunchConfiguration('use_fake_joints')),
-                package='joint_state_publisher',
-                executable='joint_state_publisher',
-                name='joint_state_publisher',
-                output='screen',
-                parameters=[{
-                    'rate': 10,
-                    'source_list': [],  # No external sources, publish default values
-                }]
-            )
+    # Gripper base to link8 static transform (fixed joint from piper_description.xacro)
+    # <joint name="joint6_to_gripper_base" type="fixed">
+    #   <origin xyz="0 0 0" rpy="0 0 0"/>
+    #   <parent link="link8"/>
+    #   <child link="gripper_base"/>
+    # </joint>
+    gripper_base_tf_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='link8_to_gripper_base',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--qx', '0', '--qy', '0', '--qz', '0', '--qw', '1',
+            '--frame-id', 'link8', '--child-frame-id', 'gripper_base',
+        ],
+    )
 
     # ==================== Perception Nodes ====================
     perception_nodes = []
@@ -213,8 +204,8 @@ def generate_launch_description():
             parameters=[
                 perception_grasp_config if os.path.exists(perception_grasp_config) else {},
                 {
-                    'trigger.realtime_mode.enabled': True,  # 自动检测模式
-                    'trigger.realtime_mode.rate': 1.0,      # 检测频率 1Hz
+                    'trigger.realtime_mode.enabled': False,  # 关闭自动检测，只在 observe 调用时检测
+                    'trigger.realtime_mode.rate': 1.0,       # 检测频率 1Hz
                 },
             ],
         )
@@ -318,8 +309,9 @@ def generate_launch_description():
     ])
 
     # Add robot state publisher (URDF)
-    if robot_state_publisher_node is not None:
-        ld.add_action(robot_state_publisher_node)
+    # Add gripper base static transform (link8 -> gripper_base)
+    # This is needed because mobile_manipulator2_description.urdf doesn't include gripper
+    ld.add_action(gripper_base_tf_node)
 
     # Add fake joint state publisher (when use_fake_joints:=true)
     if joint_state_publisher_node is not None:

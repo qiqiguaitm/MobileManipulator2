@@ -528,13 +528,21 @@ private:
             return;
           }
 
-          // NDT 验证: 对每个 SC 候选做 NDT 精配准，选 inlier_fraction 最高的
+          // NDT 验证: 多信号组合评分选最优候选
+          // SC距离=地点识别信号, inlier=几何验证, NDT漂移=局部极值检测
+          double best_score = -1.0;
           double best_inlier = -1.0;
           int best_candidate = -1;
           Eigen::Isometry3f best_pose = Eigen::Isometry3f::Identity();
 
           RCLCPP_INFO(this->get_logger(), "Auto-reloc: %zu candidates, NDT-validating each...",
                       result->poses.size());
+
+          // 构建 KD-tree 一次，所有候选共用
+          pcl::KdTreeFLANN<PointT> kdtree;
+          kdtree.setInputCloud(globalmap_);
+          double max_corr_dist = this->get_parameter("status_max_correspondence_dist").as_double();
+          double max_corr_dist_sq = max_corr_dist * max_corr_dist;
 
           for (size_t i = 0; i < result->poses.size(); i++) {
             const auto& p = result->poses[i];
@@ -556,15 +564,12 @@ private:
             }
 
             // 计算 inlier_fraction
-            double max_corr_dist = this->get_parameter("status_max_correspondence_dist").as_double();
             int inlier_count = 0;
             pcl::PointCloud<PointT>::Ptr aligned_ptr(new pcl::PointCloud<PointT>(aligned));
-            pcl::KdTreeFLANN<PointT> kdtree;
-            kdtree.setInputCloud(globalmap_);
             for (const auto& pt : aligned_ptr->points) {
               std::vector<int> nn_idx(1);
               std::vector<float> nn_dist(1);
-              if (kdtree.nearestKSearch(pt, 1, nn_idx, nn_dist) > 0 && nn_dist[0] < max_corr_dist * max_corr_dist) {
+              if (kdtree.nearestKSearch(pt, 1, nn_idx, nn_dist) > 0 && nn_dist[0] < max_corr_dist_sq) {
                 inlier_count++;
               }
             }
@@ -573,12 +578,28 @@ private:
             Eigen::Matrix4f ndt_result = registration_->getFinalTransformation();
             float ndt_score = registration_->getFitnessScore();
 
+            // 计算 NDT 漂移: NDT 精配准把位姿移动了多远 (2D)
+            Eigen::Vector2f sc_pos_2d(candidate_pose.translation().x(), candidate_pose.translation().y());
+            Eigen::Vector2f ndt_pos_2d(ndt_result(0, 3), ndt_result(1, 3));
+            double drift = (ndt_pos_2d - sc_pos_2d).norm();
+
+            // 组合评分 (4信号融合):
+            //   sc_confidence  : SC距离越小=地点识别越可信
+            //   inlier_fraction: 几何对齐质量 (点云匹配比例)
+            //   ndt_quality    : NDT适配度，1/(1+fitness)，惩罚均方距离大的候选
+            //   drift_factor   : NDT漂移>1m时指数衰减，防止跑到错误局部极值
+            double sc_confidence = 1.0 - sc_dist;
+            double ndt_quality = 1.0 / (1.0 + ndt_score);   // [0,1]，fitness越小越好
+            double drift_factor = std::exp(-std::max(0.0, drift - 1.0) / 2.0);
+            double combined_score = sc_confidence * inlier_fraction * ndt_quality * drift_factor;
+
             RCLCPP_INFO(this->get_logger(),
-              "  Candidate[%zu]: sc_dist=%.3f, ndt_score=%.4f, inlier=%.2f, pos=(%.2f, %.2f)",
-              i, sc_dist, ndt_score, inlier_fraction,
+              "  Candidate[%zu]: sc_dist=%.3f, ndt_fit=%.3f, ndt_q=%.2f, inlier=%.2f, drift=%.2f, score=%.4f, pos=(%.2f, %.2f)",
+              i, sc_dist, ndt_score, ndt_quality, inlier_fraction, drift, combined_score,
               ndt_result(0, 3), ndt_result(1, 3));
 
-            if (inlier_fraction > best_inlier) {
+            if (combined_score > best_score) {
+              best_score = combined_score;
               best_inlier = inlier_fraction;
               best_candidate = i;
               best_pose = Eigen::Isometry3f::Identity();
@@ -587,12 +608,18 @@ private:
             }
           }
 
-          // 最低 inlier_fraction 阈值
-          const double MIN_INLIER_FRACTION = 0.3;
-          if (best_candidate < 0 || best_inlier < MIN_INLIER_FRACTION) {
+          // 双重验证阈值: inlier + combined_score
+          const double MIN_INLIER_FRACTION = 0.5;
+          double min_score = this->get_parameter("auto_reloc_conf_threshold").as_double();
+
+          if (best_candidate < 0 || best_inlier < MIN_INLIER_FRACTION || best_score < min_score) {
+            std::string reason;
+            if (best_candidate < 0) reason = "no candidate";
+            else if (best_inlier < MIN_INLIER_FRACTION) reason = "inlier=" + std::to_string(best_inlier).substr(0,4) + "<" + std::to_string(MIN_INLIER_FRACTION).substr(0,4);
+            else reason = "score=" + std::to_string(best_score).substr(0,6) + "<" + std::to_string(min_score).substr(0,6);
+
             RCLCPP_WARN(this->get_logger(),
-              "Auto-reloc: NDT validation failed (best_inlier=%.2f < %.2f), falling back to manual",
-              best_inlier, MIN_INLIER_FRACTION);
+              "Auto-reloc: failed (%s), please set initialpose in RViz", reason.c_str());
             relocalizing_ = false;
             return;
           }
@@ -608,8 +635,8 @@ private:
             this->get_parameter("cool_time_duration").as_double()));
 
           RCLCPP_INFO(this->get_logger(),
-            "Auto-reloc: SUCCESS! candidate[%d], inlier=%.2f, pos=(%.2f, %.2f, %.2f)",
-            best_candidate, best_inlier,
+            "Auto-reloc: SUCCESS! candidate[%d], score=%.4f, inlier=%.2f, pos=(%.2f, %.2f, %.2f)",
+            best_candidate, best_score, best_inlier,
             best_pose.translation().x(), best_pose.translation().y(), best_pose.translation().z());
 
         } catch (const std::exception& e) {
@@ -811,6 +838,8 @@ private:
 
   // 自动重定位
   std::atomic_bool auto_reloc_triggered_{false};
+  std::atomic_int auto_reloc_attempts_{0};
+  int auto_reloc_max_attempts_{5};
   rclcpp::TimerBase::SharedPtr auto_reloc_timer_;
 };
 

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-robot_manager_full.launch.py — 全系统启动
+cleaner_manager_full.launch.py — 全系统启动
 
 启动顺序 (带延时保证依赖就绪):
   [0s]  Navigation (SLAM + Nav2 + 传感器 + TF + 底盘)
   [0s]  Camera driver (Top + Chassis + Hand)
-  [8s]  Piper grasp node (CAN arm control)
+  [8s]  Piper grasp node (CAN0 arm control)
   [10s] Perception (multi_camera + object_tracker)
-  [15s] Robot Manager (编排层)
-  [17s] RViz (可选)
+  [15s] RViz (可选)
 
 前提:
   - CAN 已 bringup (make can-bringup-auto)
@@ -44,7 +43,7 @@ def generate_launch_description():
     perception_dir = _pkg_dir('perception')
     piper_grasp_dir = _pkg_dir('piper_grasp')
     camera_driver_dir = _pkg_dir('camera_driver')
-    robot_manager_dir = _pkg_dir('robot_manager')
+    cleaner_manager_dir = _pkg_dir('cleaner_manager')
 
     # ==================== Arguments ====================
     args = [
@@ -84,12 +83,13 @@ def generate_launch_description():
             'top_enable': 'true',
             'hand_enable': 'true',
             'chassis_enable': 'true',
+            'config_file': "''",  # 防止 realsense2_camera 尝试加载 helios16p.yaml
         }.items()
     )
 
     # ==================== [8s] Piper Grasp Node ====================
     piper_node = TimerAction(period=8.0, actions=[
-        LogInfo(msg='[robot_manager_full] Starting piper_grasp_node...'),
+        LogInfo(msg='[STAGE 1/4] 机械臂: 启动 Piper Grasp...'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(piper_grasp_dir, 'launch', 'piper_grasp.launch.py')
@@ -105,7 +105,7 @@ def generate_launch_description():
 
     # ==================== [10s] Perception (multi_camera + tracker) ====================
     perception_launch = TimerAction(period=10.0, actions=[
-        LogInfo(msg='[robot_manager_full] Starting perception...'),
+        LogInfo(msg='[STAGE 2/4] 感知: 启动多相机感知 (SAM3)...'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(perception_dir, 'launch', 'multi_camera_perception.launch.py')
@@ -120,22 +120,10 @@ def generate_launch_description():
         ),
     ])
 
-    # ==================== [15s] Robot Manager ====================
-    rm_config = os.path.join(robot_manager_dir, 'config', 'robot_manager.yaml')
-    robot_manager_node = TimerAction(period=15.0, actions=[
-        LogInfo(msg='[robot_manager_full] Starting robot_manager_node...'),
-        Node(
-            package='robot_manager',
-            executable='robot_manager_node',
-            name='robot_manager_node',
-            output='screen',
-            parameters=[rm_config],
-        ),
-    ])
-
-    # ==================== [17s] RViz ====================
-    rviz_config = os.path.join(robot_manager_dir, 'config', 'robot_manager.rviz')
-    rviz_node = TimerAction(period=17.0, actions=[
+    # ==================== [15s] RViz ====================
+    rviz_config = os.path.join(cleaner_manager_dir, 'config', 'cleaner_manager.rviz')
+    rviz_node = TimerAction(period=15.0, actions=[
+        LogInfo(msg='[STAGE 3/4] 可视化: 启动 RViz...'),
         Node(
             condition=IfCondition(LaunchConfiguration('rviz')),
             package='rviz2',
@@ -148,11 +136,14 @@ def generate_launch_description():
 
     # ==================== Build ====================
     ld = LaunchDescription(args)
-    ld.add_action(LogInfo(msg='[robot_manager_full] Starting full system...'))
+    ld.add_action(LogInfo(msg='========================================'))
+    ld.add_action(LogInfo(msg='[FULL-MANUAL] 感知导航抓取全流程启动'))
+    ld.add_action(LogInfo(msg='========================================'))
+    ld.add_action(LogInfo(msg='[STAGE 0/4] 导航: 启动 SLAM + Nav2 + 底盘...'))
+    ld.add_action(LogInfo(msg='[STAGE 0/4] 相机: 启动 Top + Hand + Chassis 相机...'))
     ld.add_action(nav_launch)
     ld.add_action(camera_launch)
     ld.add_action(piper_node)
     ld.add_action(perception_launch)
-    ld.add_action(robot_manager_node)
     ld.add_action(rviz_node)
     return ld

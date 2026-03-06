@@ -1,69 +1,62 @@
 #!/usr/bin/env python3
 """
-深度传感器处理模块 - 分离架构
+深度传感器处理模块
 
-感知线程 (15Hz): 深度图 → 点云 → RANSAC去地面 → 聚类 → 更新结果
-控制线程 (50Hz): 只读取最新结果，不做计算
+相机坐标系 (D435 标准):
+  - x: right  (右为正)
+  - y: down   (向下为正, 地面 y ≈ +0.15m, 空中 y < 0)
+  - z: forward (前向深度)
 
-支持:
-  1. 深度图投影到3D点云
-  2. 外参变换到 base_link 坐标系
-  3. RANSAC 地面拟合去除
-  4. 简单聚类找物体
-  5. 返回最近障碍物
+相机离地约 15cm → 地面在 y ≈ +0.15m
+
+感知线程 (30Hz): 深度图 → 点云 → ROI过滤 → RANSAC去地面 → 聚类 → 更新结果
+控制线程:        只读最新结果, 不做计算
 """
 
 import time
 import threading
-import yaml
+from collections import deque
 from typing import Optional, Tuple, List
-from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from geometry_msgs.msg import TransformStamped
 from cv_bridge import CvBridge
+import tf2_ros
+from tf2_ros import StaticTransformBroadcaster
 
 from .config import ApproachConfig
 
 
 class DepthSensor:
-    """深度传感器处理器 - 分离架构
+    """深度传感器处理器"""
 
-    感知线程 (15Hz):
-      深度图 → 点云 → RANSAC去地面 → 聚类 → 更新结果
-
-    控制线程调用:
-      get_nearest_obstacle() - 直接返回最新结果，无计算
-    """
-
-    def __init__(self, node: Node, config: ApproachConfig):
-        """初始化深度传感器
-
-        Args:
-            node: ROS2 节点实例
-            config: 配置对象
-        """
+    def __init__(self, node: Node, config: ApproachConfig,
+                 tf_buffer: tf2_ros.Buffer = None):
         self._node = node
         self._config = config
+        self._tf_buffer = tf_buffer
         self._running = True
 
-        # ========== 深度数据 (订阅回调写入) ==========
+        # ========== 深度数据 (回调写入) ==========
         self._depth_lock = threading.Lock()
         self._latest_depth: Optional[np.ndarray] = None
         self._depth_timestamp: float = 0.0
         self._bridge = CvBridge()
 
-        # ========== 感知结果 (感知线程写入，控制线程读取) ==========
+        # ========== 感知结果 (感知线程写入, 控制线程读取) ==========
         self._result_lock = threading.Lock()
         self._nearest_obstacle: Optional[Tuple[float, float, float]] = None
         self._obstacle_points: Optional[np.ndarray] = None
+        self._front_points: Optional[np.ndarray] = None
+        self._ground_points: Optional[np.ndarray] = None
         self._clusters: List[np.ndarray] = []
         self._result_timestamp: float = 0.0
+        self._processing_time_ms: float = 0.0
 
         # ========== 相机内参 ==========
         self._fx: float = 0.0
@@ -71,12 +64,27 @@ class DepthSensor:
         self._cx: float = 0.0
         self._cy: float = 0.0
         self._has_intrinsics = False
+        self._camera_frame_id: str = 'camera_optical_frame'  # 由 CameraInfo 更新
 
-        # ========== 相机外参 (optical_frame -> base_link) ==========
-        self._R_cam_to_base: Optional[np.ndarray] = None
-        self._t_cam_to_base: Optional[np.ndarray] = None
-        self._has_extrinsics = False
-        self._load_extrinsics()
+        # ========== 点云生成缓存 (避免每帧重建 meshgrid) ==========
+        self._grid_cache_key: Optional[Tuple] = None
+        self._u_flat_cache: Optional[np.ndarray] = None
+        self._v_flat_cache: Optional[np.ndarray] = None
+
+        # ========== 感知日志控制 ==========
+        self._log_enabled: bool = True   # 可在 input() 期间关闭，避免淹没终端
+
+        # ========== 聚类后端检测 ==========
+        self._use_sklearn = False
+        try:
+            from sklearn.cluster import DBSCAN  # noqa: F401
+            self._use_sklearn = True
+            node.get_logger().info("sklearn DBSCAN 可用 → 高性能聚类")
+        except ImportError:
+            node.get_logger().warn(
+                "sklearn 不可用, 使用 KDTree-BFS 聚类\n"
+                "  建议安装: pip install scikit-learn"
+            )
 
         # ========== ROS 订阅 ==========
         sensor_qos = QoSProfile(
@@ -86,77 +94,70 @@ class DepthSensor:
         )
 
         self._sub = node.create_subscription(
-            Image,
-            config.depth_topic,
-            self._depth_callback,
-            sensor_qos
+            Image, config.depth_topic, self._depth_callback, sensor_qos
         )
 
         info_topic = config.depth_topic.replace('/image_raw', '/camera_info')
         self._info_sub = node.create_subscription(
-            CameraInfo,
-            info_topic,
-            self._camera_info_callback,
-            sensor_qos
+            CameraInfo, info_topic, self._camera_info_callback, sensor_qos
         )
+
+        # ========== 调试点云发布 ==========
+        self._debug_front_pub    = node.create_publisher(PointCloud2, '~/debug_front_cloud', 1)
+        self._debug_obstacle_pub = node.create_publisher(PointCloud2, '~/debug_obstacle_cloud', 1)
+        self._debug_ground_pub   = node.create_publisher(PointCloud2, '~/debug_ground_cloud', 1)
+        self._debug_cluster_pub  = node.create_publisher(PointCloud2, '~/debug_cluster_cloud', 1)
+
+        # ========== 桥接相机驱动 TF 孤岛到机器人 TF 树 ==========
+        # RealSense 驱动以 chassis_link 为根发布 TF，但机器人 URDF 用 chassis_camera_link
+        # 发布静态 TF: chassis_link → chassis_camera_link (identity)
+        # 完整链: chassis_color_optical_frame → chassis_color_frame → chassis_link
+        #          → chassis_camera_link → lidar_link → base_link
+        self._static_tf_pub = StaticTransformBroadcaster(node)
+        bridge = TransformStamped()
+        bridge.header.stamp = node.get_clock().now().to_msg()
+        bridge.header.frame_id = 'chassis_camera_link'
+        bridge.child_frame_id  = 'chassis_link'
+        bridge.transform.rotation.w = 1.0
+        self._static_tf_pub.sendTransform(bridge)
 
         # ========== 启动感知线程 ==========
         self._perception_thread = threading.Thread(
-            target=self._perception_loop,
-            daemon=True,
-            name="depth_perception"
+            target=self._perception_loop, daemon=True, name="depth_perception"
         )
         self._perception_thread.start()
 
         self._node.get_logger().info(
-            f"深度传感器初始化完成 (分离架构):\n"
-            f"  感知线程: 25Hz, 降采样4x\n"
-            f"  地面过滤: 高度预过滤 + RANSAC (支持相机倾斜)\n"
-            f"  检测宽度: ±{config.depth_detect_width}m\n"
-            f"  外参: {'已加载' if self._has_extrinsics else '未加载'}"
+            f"深度传感器初始化:\n"
+            f"  坐标系: x=右 y=下(地面y≈+{config.depth_ground_max_height}m) z=前\n"
+            f"  ROI y范围: [{config.depth_obstacle_min_height}, {config.depth_obstacle_max_height}]m\n"
+            f"  降采样: {config.depth_downsample}x  感知频率: 30Hz"
         )
 
     def shutdown(self):
-        """关闭感知线程"""
         self._running = False
+        if self._perception_thread.is_alive():
+            self._perception_thread.join(timeout=1.0)
 
     # =========================================================================
-    # 感知线程
+    # 感知线程 (30Hz)
     # =========================================================================
 
     def _perception_loop(self):
-        """感知线程主循环 (25Hz)
-
-        处理流程:
-        1. 获取最新深度图
-        2. 转换为点云
-        3. RANSAC 去除地面
-        4. 聚类
-        5. 找最近障碍物
-        6. 更新共享结果
-        """
-        perception_rate = 25  # Hz
-        interval = 1.0 / perception_rate
-
+        interval = 1.0 / 30.0
         while self._running and rclpy.ok():
-            start_time = time.time()
-
+            t0 = time.time()
             try:
                 self._do_perception()
             except Exception as e:
-                self._node.get_logger().error(
-                    f"感知线程错误: {e}",
-                    throttle_duration_sec=2.0
-                )
-
-            # 保持固定频率
-            elapsed = time.time() - start_time
-            sleep_time = interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                self._node.get_logger().error(f"感知线程错误: {e}", throttle_duration_sec=1.0)
+            dt = time.time() - t0
+            if dt < interval:
+                time.sleep(interval - dt)
 
     def _do_perception(self):
-        """执行一次完整的感知处理"""
+        t0 = time.time()
+
         # 1. 获取深度图
         with self._depth_lock:
             if self._latest_depth is None:
@@ -168,388 +169,546 @@ class DepthSensor:
         if not self._has_intrinsics:
             return
 
-        # 2. 深度图转点云 (降采样4倍，加速处理)
-        points = self._depth_to_pointcloud(depth_image, downsample=4)
+        t1 = time.time()
+
+        # 2. 深度图 → 相机坐标系点云
+        points = self._depth_to_pointcloud(depth_image, self._config.depth_downsample)
         if points is None or len(points) < 100:
+            self._clear_results()
             return
 
-        # 3. 过滤前方区域
-        x_base = points[:, 0]
-        y_base = points[:, 1]
-        z_base = points[:, 2]
+        t2 = time.time()
 
-        # 前方区域基本过滤
-        front_mask = (x_base > 0.1) & (x_base < self._config.depth_max_valid) & \
-                     (np.abs(y_base) < self._config.depth_detect_width) & \
-                     (z_base > -0.5) & (z_base < self._config.depth_obstacle_max_height)
-
-        front_points = points[front_mask]
+        # 3. ROI 过滤
+        # y 向下为正: 地面 y ≈ +0.15m (相机离地15cm)
+        # min_height=-0.50 (物体最高50cm超出相机), max_height=+0.22 (含地面供RANSAC)
+        xc, yc, zc = points[:, 0], points[:, 1], points[:, 2]
+        roi_mask = (
+            (zc > self._config.depth_min_valid) &
+            (zc < self._config.depth_max_valid) &
+            (np.abs(xc) < self._config.depth_detect_width) &
+            (yc > self._config.depth_obstacle_min_height) &
+            (yc < self._config.depth_obstacle_max_height)
+        )
+        front_points = points[roi_mask]
         if len(front_points) < 50:
-            with self._result_lock:
-                self._nearest_obstacle = None
-                self._obstacle_points = None
-                self._clusters = []
+            self._clear_results()
             return
 
-        # 4. 两阶段地面去除：高度预过滤 + RANSAC精确拟合
-        obstacle_points = self._remove_ground(front_points)
-        if len(obstacle_points) < 20:
-            with self._result_lock:
-                self._nearest_obstacle = None
-                self._obstacle_points = obstacle_points
-                self._clusters = []
+        t3 = time.time()
+
+        # 3.5 去除孤立噪点 (RealSense 飞点 / 深度不连续处错误点)
+        front_points = self._remove_outliers(front_points)
+        if len(front_points) < 50:
+            self._clear_results()
             return
+
+        # 4. RANSAC 地面去除
+        obstacle_points, ground_points = self._remove_ground(front_points)
+
+        t4 = time.time()
 
         # 5. 聚类
-        clusters = self._simple_clustering(obstacle_points)
+        clusters = self._cluster(obstacle_points)
 
-        # 6. 找最近点
-        nearest_point = None
-        if clusters:
-            nearest_dist = float('inf')
-            for cluster in clusters:
-                min_x = np.min(cluster[:, 0])
-                if min_x < nearest_dist:
-                    nearest_dist = min_x
-                    min_idx = np.argmin(cluster[:, 0])
-                    nearest_point = cluster[min_idx]
-        elif len(obstacle_points) > 0:
-            # 无聚类时用最近点
-            min_idx = np.argmin(obstacle_points[:, 0])
-            nearest_point = obstacle_points[min_idx]
+        t5 = time.time()
 
-        # 7. 更新共享结果
+        # 6. 最近障碍物 (前沿 min-z 作为距离)
+        nearest = self._find_nearest(clusters, obstacle_points)
+
+        t6 = time.time()
+
+        # 7. 更新结果
         with self._result_lock:
-            if nearest_point is not None:
-                self._nearest_obstacle = (
-                    float(nearest_point[0]),
-                    float(nearest_point[1]),
-                    float(nearest_point[2])
-                )
-            else:
-                self._nearest_obstacle = None
-            self._obstacle_points = obstacle_points
-            self._clusters = clusters
+            self._front_points    = front_points
+            self._obstacle_points = obstacle_points if len(obstacle_points) > 0 else None
+            self._ground_points   = ground_points   if len(ground_points)   > 0 else None
+            self._clusters        = clusters
+            self._nearest_obstacle = nearest
             self._result_timestamp = time.time()
+            self._processing_time_ms = (time.time() - t0) * 1000
 
-    # =========================================================================
-    # 公共接口 (控制线程调用，只读取结果)
-    # =========================================================================
+        # 8. 发布调试点云 (只在有订阅者时发布, 避免序列化开销)
+        self._publish_debug_clouds(front_points, obstacle_points, ground_points, clusters)
 
-    def get_nearest_obstacle(self) -> Optional[Tuple[float, float, float]]:
-        """获取最近障碍物信息 (只读取，无计算)
+        t7 = time.time()
+        total_ms = (t7 - t0) * 1000
 
-        Returns:
-            (x, y, z): 最近障碍物在 base_link 坐标系中的位置
-            x: 前向距离, y: 侧向距离 (左正右负), z: 高度
-            如果无有效数据返回 None
-        """
+        if self._log_enabled and nearest is not None:
+            self._node.get_logger().info(
+                f"感知: front={len(front_points)} obs={len(obstacle_points)} "
+                f"ground={len(ground_points)} clusters={len(clusters)} "
+                f"nearest_z={nearest[2]:.3f}m  总{total_ms:.0f}ms "
+                f"[pc={1000*(t2-t1):.0f} roi={1000*(t3-t2):.0f} "
+                f"gnd={1000*(t4-t3):.0f} cls={1000*(t5-t4):.0f} "
+                f"pub={1000*(t7-t6):.0f}]ms",
+                throttle_duration_sec=1.0
+            )
+
+    def _clear_results(self):
         with self._result_lock:
-            # 检查结果是否过期 (200ms)
-            if time.time() - self._result_timestamp > 0.2:
-                return None
-            return self._nearest_obstacle
+            self._nearest_obstacle = None
+            self._obstacle_points  = None
+            self._front_points     = None
+            self._ground_points    = None
+            self._clusters         = []
 
-    def get_target_depth(self) -> Optional[float]:
-        """获取前方最近障碍物深度
+    # =========================================================================
+    # 点云生成
+    # =========================================================================
 
-        Returns:
-            float: 最近障碍物到 base_link 原点的前向距离 (米)
-        """
-        result = self.get_nearest_obstacle()
-        if result is None:
+    def _depth_to_pointcloud(self, depth_image: np.ndarray,
+                             downsample: int = 4) -> Optional[np.ndarray]:
+        """深度图 → 相机坐标系点云, 缓存 u/v 网格避免每帧重建"""
+        if not self._has_intrinsics:
             return None
-        return result[0]
 
-    def get_obstacle_points(self, max_points: int = 5000) -> Optional[np.ndarray]:
-        """获取障碍物点云 (用于调试/可视化)
+        h, w = depth_image.shape[:2]
+        cache_key = (h, w, downsample)
 
-        Returns:
-            np.ndarray: (N, 3) 点云，在 base_link 坐标系
+        if self._grid_cache_key != cache_key:
+            v_arr = np.arange(0, h, downsample)
+            u_arr = np.arange(0, w, downsample)
+            u_grid, v_grid = np.meshgrid(u_arr, v_arr)
+            self._u_flat_cache = u_grid.ravel()
+            self._v_flat_cache = v_grid.ravel()
+            self._grid_cache_key = cache_key
+
+        d_flat = depth_image[::downsample, ::downsample].ravel()
+
+        valid = (d_flat > self._config.depth_min_valid) & \
+                (d_flat < self._config.depth_max_valid)
+        if not np.any(valid):
+            return None
+
+        d = d_flat[valid]
+        u = self._u_flat_cache[valid]
+        v = self._v_flat_cache[valid]
+
+        x = (u - self._cx) * d / self._fx
+        y = (v - self._cy) * d / self._fy   # y 向下为正
+        z = d
+
+        return np.column_stack([x, y, z])
+
+    # =========================================================================
+    # 地面去除 (RANSAC)
+    # =========================================================================
+
+    def _remove_ground(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """RANSAC 拟合地面平面并去除
+
+        y 向下为正, 地面在 y ≈ +ground_max_height (+0.15m).
+        potential_ground: y >= ground_max - 0.05 (接近地面高度的点)
+        前提: ROI 上限 depth_obstacle_max_height > depth_ground_max_height
         """
-        with self._result_lock:
-            if self._obstacle_points is None:
-                return None
-            points = self._obstacle_points.copy()
+        empty = np.empty((0, 3), dtype=np.float32)
+        if len(points) < 50:
+            return points, empty
 
-        if len(points) > max_points:
-            indices = np.random.choice(len(points), max_points, replace=False)
-            points = points[indices]
+        ground_max = abs(self._config.depth_ground_max_height)  # 确保正值
+        margin = 0.05  # 5cm 容差
+        yc = points[:, 1]
 
-        return points
+        potential_ground_mask = yc >= (ground_max - margin)
+        potential_ground = points[potential_ground_mask]
 
-    def get_clusters(self) -> List[np.ndarray]:
-        """获取聚类结果 (用于调试)
+        if len(potential_ground) < 30:
+            # 地面点不足 (ROI 上限可能设置不够高), 全当障碍物
+            return points, empty
 
-        Returns:
-            List[np.ndarray]: 聚类列表
+        # RANSAC 输入上限 2000 点，避免大场景下性能下降
+        if len(potential_ground) > 2000:
+            idx = np.random.choice(len(potential_ground), 2000, replace=False)
+            ransac_input = potential_ground[idx]
+        else:
+            ransac_input = potential_ground
+
+        # RANSAC 拟合水平面，直接返回法向量+截距，不需要 SVD 二次拟合
+        normal, d_plane = self._ransac_ground(ransac_input)
+
+        # 将平面参数应用到全量地面候选点
+        if normal is not None:
+            dists = np.abs(potential_ground @ normal - d_plane)
+            inliers = dists < 0.03
+        else:
+            inliers = None
+
+        if inliers is None:
+            # RANSAC 失败: 回退到简单高度阈值
+            ground_mask = yc >= ground_max
+            return points[~ground_mask], points[ground_mask]
+
+        ground_points   = potential_ground[inliers]
+        near_non_ground = potential_ground[~inliers]
+        far_points      = points[~potential_ground_mask]
+
+        if len(near_non_ground) > 0 and len(far_points) > 0:
+            obstacle_points = np.vstack([far_points, near_non_ground])
+        elif len(far_points) > 0:
+            obstacle_points = far_points
+        else:
+            obstacle_points = near_non_ground
+
+        return obstacle_points, ground_points
+
+    def _remove_outliers(self, points: np.ndarray,
+                         radius: float = 0.05,
+                         min_neighbors: int = 3) -> np.ndarray:
+        """去除孤立噪点 (半径异常值去除)
+
+        对每个点统计 radius 球内邻居数，不足 min_neighbors 的视为噪点。
+        有效去除 RealSense 飞点 (flying pixels) 和深度不连续处的错误点。
         """
-        with self._result_lock:
-            return [c.copy() for c in self._clusters]
+        if len(points) <= min_neighbors:
+            return points
+        try:
+            from scipy.spatial import cKDTree
+            # return_length=True 只返回数量，比返回索引快很多
+            counts = cKDTree(points).query_ball_point(points, radius, return_length=True)
+            # counts 包含点自身，所以用 > 而不是 >=
+            return points[counts > min_neighbors]
+        except ImportError:
+            return points
 
-    @property
-    def has_data(self) -> bool:
-        """检查是否有深度数据"""
-        with self._depth_lock:
-            return self._latest_depth is not None
+    def _ransac_ground(self, points: np.ndarray,
+                       distance_threshold: float = 0.03,
+                       max_iterations: int = 50,
+                       min_inlier_ratio: float = 0.3):
+        """RANSAC 拟合水平面, 返回 (normal, d) 或 (None, None)"""
+        n = len(points)
+        if n < 10:
+            return None, None
 
-    @property
-    def has_intrinsics(self) -> bool:
-        """检查是否有相机内参"""
-        return self._has_intrinsics
+        best_normal = None
+        best_d      = 0.0
+        best_count  = 0
 
-    @property
-    def has_extrinsics(self) -> bool:
-        """检查是否有相机外参"""
-        return self._has_extrinsics
+        for _ in range(max_iterations):
+            idx = np.random.choice(n, 3, replace=False)
+            p1, p2, p3 = points[idx]
+            normal = np.cross(p2 - p1, p3 - p1)
+            norm = np.linalg.norm(normal)
+            if norm < 1e-6:
+                continue
+            normal /= norm
+
+            if abs(normal[1]) < 0.7:
+                continue
+
+            d     = float(np.dot(normal, p1))
+            count = int(np.sum(np.abs(points @ normal - d) < distance_threshold))
+
+            if count > best_count:
+                best_count  = count
+                best_normal = normal.copy()
+                best_d      = d
+
+        if best_normal is None or best_count < n * min_inlier_ratio:
+            return None, None
+        return best_normal, best_d
+
+    # =========================================================================
+    # 聚类
+    # =========================================================================
+
+    def _cluster(self, points: np.ndarray,
+                 tolerance: float = 0.05,
+                 min_size: int = 100,
+                 max_size: int = 10000) -> List[np.ndarray]:
+        if len(points) < min_size:
+            return []
+        if self._use_sklearn:
+            return self._cluster_dbscan(points, tolerance, min_size, max_size)
+        try:
+            from scipy.spatial import cKDTree  # noqa: F401
+            return self._cluster_kdtree(points, tolerance, min_size, max_size)
+        except ImportError:
+            return []
+
+    def _cluster_dbscan(self, points: np.ndarray, tolerance: float,
+                        min_size: int, max_size: int) -> List[np.ndarray]:
+        """sklearn DBSCAN (最快, C++ 实现)"""
+        from sklearn.cluster import DBSCAN
+        labels = DBSCAN(
+            eps=tolerance, min_samples=min_size,
+            algorithm='ball_tree', n_jobs=1
+        ).fit_predict(points)
+
+        clusters = []
+        for label in np.unique(labels):
+            if label == -1:
+                continue
+            mask = labels == label
+            cnt  = int(np.sum(mask))
+            if min_size <= cnt <= max_size:
+                clusters.append(points[mask])
+        return clusters
+
+    def _cluster_kdtree(self, points: np.ndarray, tolerance: float,
+                        min_size: int, max_size: int) -> List[np.ndarray]:
+        """KDTree BFS 聚类 (scipy), deque 保证 O(n) BFS"""
+        from scipy.spatial import cKDTree
+        tree      = cKDTree(points)
+        processed = np.zeros(len(points), dtype=bool)
+        clusters  = []
+
+        for i in range(len(points)):
+            if processed[i]:
+                continue
+            cluster_idx: list = []
+            q = deque([i])
+            processed[i] = True
+
+            while q:
+                idx = q.popleft()
+                cluster_idx.append(idx)
+                if len(cluster_idx) > max_size:
+                    break
+                for nb in tree.query_ball_point(points[idx], tolerance):
+                    if not processed[nb]:
+                        processed[nb] = True
+                        q.append(nb)
+
+            if min_size <= len(cluster_idx) <= max_size:
+                clusters.append(points[cluster_idx])
+
+        return clusters
+
+    # =========================================================================
+    # 最近障碍物
+    # =========================================================================
+
+    def _find_nearest(self, clusters: List[np.ndarray],
+                      fallback_points: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        """找最近障碍物并返回 (centroid_x, centroid_y, front_z)
+
+        - 按聚类前沿 min-z 排序找最近聚类 (正确反映实际距离)
+        - x/y 用质心 (用于侧向对齐), z 用前沿最小值 (到相机的真实距离)
+        """
+        if clusters:
+            nearest  = min(clusters, key=lambda c: float(np.min(c[:, 2])))
+            centroid = np.mean(nearest, axis=0)
+            front_z  = float(np.min(nearest[:, 2]))
+            return (float(centroid[0]), float(centroid[1]), front_z)
+
+        if len(fallback_points) > 0:
+            idx = int(np.argmin(fallback_points[:, 2]))
+            p   = fallback_points[idx]
+            return (float(p[0]), float(p[1]), float(p[2]))
+
+        return None
 
     # =========================================================================
     # ROS 回调
     # =========================================================================
 
     def _depth_callback(self, msg: Image):
-        """深度图回调"""
         try:
-            depth_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-
+            img = self._bridge.imgmsg_to_cv2(
+                msg, desired_encoding='passthrough'
+            ).astype(np.float32)
+            if msg.encoding == '16UC1':
+                img /= 1000.0
             with self._depth_lock:
-                self._latest_depth = depth_image.astype(np.float32)
-                if msg.encoding == '16UC1':
-                    self._latest_depth = self._latest_depth / 1000.0
+                self._latest_depth    = img
                 self._depth_timestamp = time.time()
-
         except Exception as e:
             self._node.get_logger().error(f"深度回调错误: {e}")
 
     def _camera_info_callback(self, msg: CameraInfo):
-        """相机内参回调"""
         if not self._has_intrinsics:
-            self._fx = msg.k[0]
-            self._fy = msg.k[4]
-            self._cx = msg.k[2]
-            self._cy = msg.k[5]
-            self._has_intrinsics = True
+            self._fx, self._fy      = msg.k[0], msg.k[4]
+            self._cx, self._cy      = msg.k[2], msg.k[5]
+            self._camera_frame_id   = msg.header.frame_id  # 从消息取真实 frame_id
+            self._has_intrinsics    = True
             self._node.get_logger().info(
-                f"相机内参: fx={self._fx:.1f}, fy={self._fy:.1f}, "
-                f"cx={self._cx:.1f}, cy={self._cy:.1f}"
+                f"相机内参: fx={self._fx:.1f} fy={self._fy:.1f} "
+                f"cx={self._cx:.1f} cy={self._cy:.1f}  "
+                f"frame_id={self._camera_frame_id}"
             )
 
     # =========================================================================
-    # 内部算法
+    # 调试点云发布
     # =========================================================================
 
-    def _load_extrinsics(self):
-        """从标定文件加载外参"""
+    def _transform_to_base_link(self, points: np.ndarray) -> Optional[Tuple[np.ndarray, str]]:
+        """将点云从相机坐标系变换到 base_link，返回 (transformed_points, frame_id)。
+        若 TF 不可用则原样返回相机坐标系的点。"""
+        if self._tf_buffer is None or not self._has_intrinsics:
+            return points, self._camera_frame_id
         try:
-            path = Path(self._config.extrinsics_file)
-            if not path.exists():
-                self._node.get_logger().warn(f"外参文件不存在: {path}")
-                return
-
-            with open(path, 'r') as f:
-                data = yaml.safe_load(f)
-
-            transform = data['transform']
-            trans = transform['translation']
-            rot = transform['rotation']
-
-            t_file = np.array([trans['x'], trans['y'], trans['z']])
-            q_file = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
-            R_file = Rotation.from_quat(q_file).as_matrix()
-
-            # 求逆变换: P_base = R^T * P_optical - R^T * t
-            self._R_cam_to_base = R_file.T
-            self._t_cam_to_base = -R_file.T @ t_file
-
-            self._has_extrinsics = True
-            self._node.get_logger().info(
-                f"外参已加载: t=[{self._t_cam_to_base[0]:.3f}, "
-                f"{self._t_cam_to_base[1]:.3f}, {self._t_cam_to_base[2]:.3f}]"
+            t = self._tf_buffer.lookup_transform(
+                self._config.base_frame,
+                self._camera_frame_id,
+                rclpy.time.Time()
             )
+            tr = t.transform.translation
+            q  = t.transform.rotation
+            qx, qy, qz, qw = q.x, q.y, q.z, q.w
+            # 四元数 → 旋转矩阵
+            R = np.array([
+                [1-2*(qy*qy+qz*qz),   2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
+                [  2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz),   2*(qy*qz-qw*qx)],
+                [  2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy)],
+            ], dtype=np.float32)
+            t_vec = np.array([tr.x, tr.y, tr.z], dtype=np.float32)
+            transformed = (R @ points.T).T + t_vec
+            return transformed, self._config.base_frame
+        except Exception:
+            return points, self._camera_frame_id
 
-        except Exception as e:
-            self._node.get_logger().error(f"加载外参失败: {e}")
+    # 聚类调试用颜色表 (最多支持 12 个聚类, 循环使用)
+    _CLUSTER_COLORS = [
+        (255, 200,   0), (  0, 180, 255), (255,  80, 200), (  0, 255, 180),
+        (255, 120,   0), ( 80, 120, 255), (200, 255,   0), (255,   0, 100),
+        (  0, 220, 100), (180,   0, 255), (255, 180, 100), (100, 255, 100),
+    ]
 
-    def _depth_to_pointcloud(self, depth_image: np.ndarray, downsample: int = 1) -> Optional[np.ndarray]:
-        """深度图转点云 (base_link 坐标系)"""
-        if not self._has_intrinsics:
-            return None
+    def _publish_debug_clouds(self, front: np.ndarray,
+                              obstacle: np.ndarray,
+                              ground: np.ndarray,
+                              clusters: List[np.ndarray]):
+        # 只在有订阅者时才序列化发布，避免无谓的 DDS 开销
+        has_front    = self._debug_front_pub.get_subscription_count() > 0
+        has_obstacle = self._debug_obstacle_pub.get_subscription_count() > 0
+        has_ground   = self._debug_ground_pub.get_subscription_count() > 0
+        has_cluster  = self._debug_cluster_pub.get_subscription_count() > 0
 
-        h, w = depth_image.shape[:2]
+        if not (has_front or has_obstacle or has_ground or has_cluster):
+            return
 
-        if downsample > 1:
-            depth_ds = depth_image[::downsample, ::downsample]
-            v_indices = np.arange(0, h, downsample)
-            u_indices = np.arange(0, w, downsample)
+        stamp = self._node.get_clock().now().to_msg()
+
+        if has_front and len(front) > 0:
+            pts, frame = self._transform_to_base_link(front)
+            self._publish_cloud(self._debug_front_pub,    pts, stamp, frame, (200, 200, 200))
+        if has_obstacle and len(obstacle) > 0:
+            pts, frame = self._transform_to_base_link(obstacle)
+            self._publish_cloud(self._debug_obstacle_pub, pts, stamp, frame, (255,  50,  50))
+        if has_ground and len(ground) > 0:
+            pts, frame = self._transform_to_base_link(ground)
+            self._publish_cloud(self._debug_ground_pub,   pts, stamp, frame, ( 50, 255,  50))
+        if has_cluster and clusters:
+            # 合并所有聚类，每个聚类染不同颜色
+            parts = []
+            for i, cluster in enumerate(clusters):
+                r, g, b = self._CLUSTER_COLORS[i % len(self._CLUSTER_COLORS)]
+                rgb_val = np.uint32((r << 16) | (g << 8) | b)
+                pts = cluster.astype(np.float32)
+                chunk = np.empty(len(pts),
+                                 dtype=[('x','f4'),('y','f4'),('z','f4'),('rgb','u4')])
+                chunk['x'] = pts[:, 0]
+                chunk['y'] = pts[:, 1]
+                chunk['z'] = pts[:, 2]
+                chunk['rgb'] = rgb_val
+                parts.append(chunk)
+            merged = np.concatenate(parts)
+            # 转换到 base_link
+            xyz = np.column_stack([merged['x'], merged['y'], merged['z']])
+            xyz_t, frame = self._transform_to_base_link(xyz)
+            merged['x'] = xyz_t[:, 0]
+            merged['y'] = xyz_t[:, 1]
+            merged['z'] = xyz_t[:, 2]
+            msg = PointCloud2()
+            msg.header.stamp    = stamp
+            msg.header.frame_id = frame
+            msg.height   = 1
+            msg.width    = len(merged)
+            msg.is_dense = True
+            msg.is_bigendian = False
+            msg.fields = [
+                PointField(name='x',   offset=0,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='y',   offset=4,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='rgb', offset=12, datatype=PointField.UINT32,  count=1),
+            ]
+            msg.point_step = 16
+            msg.row_step   = 16 * len(merged)
+            msg.data       = merged.tobytes()
+            self._debug_cluster_pub.publish(msg)
+
+    def _publish_cloud(self, pub, points: np.ndarray, stamp, frame_id: str,
+                       color: Tuple[int, int, int] = None):
+        if len(points) == 0:
+            return
+
+        pts = points.astype(np.float32)
+        msg = PointCloud2()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = frame_id
+        msg.height          = 1
+        msg.width           = len(pts)
+        msg.is_bigendian    = False
+        msg.is_dense        = True
+
+        if color:
+            # 标准 ROS RGB 打包: (R<<16)|(G<<8)|B 存为 uint32
+            r, g, b   = color
+            rgb_val   = np.uint32((r << 16) | (g << 8) | b)
+            msg.fields = [
+                PointField(name='x',   offset=0,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='y',   offset=4,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
+                PointField(name='rgb', offset=12, datatype=PointField.UINT32,  count=1),
+            ]
+            msg.point_step = 16
+            data = np.empty(len(pts),
+                            dtype=[('x','f4'), ('y','f4'), ('z','f4'), ('rgb','u4')])
+            data['x']   = pts[:, 0]
+            data['y']   = pts[:, 1]
+            data['z']   = pts[:, 2]
+            data['rgb'] = rgb_val
+            msg.data = data.tobytes()
         else:
-            depth_ds = depth_image
-            v_indices = np.arange(h)
-            u_indices = np.arange(w)
+            msg.fields = [
+                PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            ]
+            msg.point_step = 12
+            msg.data = pts.tobytes()
 
-        u_grid, v_grid = np.meshgrid(u_indices, v_indices)
-        u_flat = u_grid.flatten()
-        v_flat = v_grid.flatten()
-        d_flat = depth_ds.flatten()
+        msg.row_step = msg.point_step * msg.width
+        pub.publish(msg)
 
-        valid_mask = (d_flat > self._config.depth_min_valid) & \
-                     (d_flat < self._config.depth_max_valid)
+    # =========================================================================
+    # 公共接口 (线程安全)
+    # =========================================================================
 
-        if not np.any(valid_mask):
-            return None
+    def get_nearest_obstacle(self) -> Optional[Tuple[float, float, float]]:
+        """获取最近障碍物 (centroid_x, centroid_y, front_z)
 
-        u_valid = u_flat[valid_mask]
-        v_valid = v_flat[valid_mask]
-        d_valid = d_flat[valid_mask]
-
-        # 投影到相机坐标系
-        x_cam = (u_valid - self._cx) * d_valid / self._fx
-        y_cam = (v_valid - self._cy) * d_valid / self._fy
-        z_cam = d_valid
-        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
-
-        # 变换到 base_link
-        if self._has_extrinsics:
-            points_base = (self._R_cam_to_base @ points_cam.T).T + self._t_cam_to_base
-        else:
-            points_base = np.stack([z_cam, -x_cam, -y_cam], axis=1)
-
-        return points_base
-
-    def _remove_ground(self, points: np.ndarray) -> np.ndarray:
-        """RANSAC地面去除，保留低矮障碍物（如躺倒的瓶子）
-
-        基于实测数据:
-        - 地面z值: 约 -0.156m (主要在 -0.20 ~ -0.15m)
-        - 躺倒瓶子: z约 -0.10m ~ -0.07m (需要保留)
-        - 站立障碍物: z > -0.05m
-
-        策略: 主要依赖RANSAC判断平面，而不是简单高度阈值
-
-        Args:
-            points: (N, 3) 点云 in base_link
-
-        Returns:
-            去除地面后的障碍物点云
+        超时设为 1.5s，允许感知线程在重负载下仍能提供有效数据
         """
-        if len(points) < 20:
-            return points
+        with self._result_lock:
+            if time.time() - self._result_timestamp > 1.5:
+                return None
+            return self._nearest_obstacle
 
-        z_base = points[:, 2]
+    def get_target_depth(self) -> Optional[float]:
+        """获取到最近障碍物前沿的距离 (相机 z 轴, 即到底盘相机的距离)"""
+        obs = self.get_nearest_obstacle()
+        return obs[2] if obs else None
 
-        # 阶段1: 高度预过滤
-        # 明显的高处物体直接保留 (z > 0m 肯定不是地面)
-        high_threshold = 0.0
-        high_mask = z_base > high_threshold
-        high_points = points[high_mask]
+    def get_obstacle_points(self, max_points: int = 5000) -> Optional[np.ndarray]:
+        with self._result_lock:
+            if self._obstacle_points is None:
+                return None
+            pts = self._obstacle_points.copy()
+        if len(pts) > max_points:
+            pts = pts[np.random.choice(len(pts), max_points, replace=False)]
+        return pts
 
-        # 低处点需要RANSAC判断 (包括地面和低矮障碍物)
-        low_mask = z_base <= high_threshold
-        low_points = points[low_mask]
+    @property
+    def has_data(self) -> bool:
+        with self._depth_lock:
+            return self._latest_depth is not None
 
-        if len(low_points) < 20:
-            return high_points if len(high_points) > 0 else points
+    @property
+    def has_intrinsics(self) -> bool:
+        return self._has_intrinsics
 
-        # 阶段2: RANSAC拟合地面平面
-        ground_inliers = self._ransac_fit_ground(low_points)
-
-        if ground_inliers is not None:
-            # 去除地面点，保留非地面点（包括低矮障碍物）
-            non_ground_low = low_points[~ground_inliers]
-        else:
-            # RANSAC失败，用保守高度阈值 (只去除最低的点)
-            non_ground_low = low_points[low_points[:, 2] > -0.14]
-
-        # 合并
-        if len(high_points) > 0 and len(non_ground_low) > 0:
-            return np.vstack([high_points, non_ground_low])
-        elif len(high_points) > 0:
-            return high_points
-        else:
-            return non_ground_low
-
-    def _ransac_fit_ground(self, points: np.ndarray,
-                           distance_threshold: float = 0.02,
-                           max_iterations: int = 100,
-                           min_inlier_ratio: float = 0.2) -> np.ndarray:
-        """RANSAC拟合地面平面
-
-        考虑相机可能有俯仰角，放宽法向量约束。
-
-        Args:
-            points: 低处点云
-            distance_threshold: 点到平面距离阈值
-            max_iterations: 最大迭代次数
-            min_inlier_ratio: 最小内点比例
-
-        Returns:
-            地面点的布尔掩码，失败返回None
-        """
-        n_points = len(points)
-        if n_points < 10:
-            return None
-
-        best_inliers = None
-        best_count = 0
-
-        for _ in range(max_iterations):
-            # 随机选3个点
-            idx = np.random.choice(n_points, 3, replace=False)
-            p1, p2, p3 = points[idx]
-
-            # 计算平面法向量
-            v1 = p2 - p1
-            v2 = p3 - p1
-            normal = np.cross(v1, v2)
-            norm = np.linalg.norm(normal)
-            if norm < 1e-6:
-                continue
-            normal = normal / norm
-
-            # 确保法向量朝上 (z分量为正)
-            if normal[2] < 0:
-                normal = -normal
-
-            # 法向量约束：考虑相机俯仰，允许±30度倾斜
-            # cos(30°) ≈ 0.866，放宽到0.7允许更大倾斜
-            if normal[2] < 0.7:
-                continue
-
-            # 计算所有点到平面的距离
-            d = np.dot(normal, p1)
-            distances = np.abs(np.dot(points, normal) - d)
-            inliers = distances < distance_threshold
-            count = np.sum(inliers)
-
-            if count > best_count:
-                best_count = count
-                best_inliers = inliers
-
-        # 检查内点比例是否足够
-        if best_inliers is None or best_count < n_points * min_inlier_ratio:
-            return None
-
-        return best_inliers
-
-    def _simple_clustering(self, points: np.ndarray,
-                            distance_threshold: float = 0.15,
-                            min_points: int = 20) -> List[np.ndarray]:
-        """简单欧式聚类 (基于X距离分段)"""
-        if len(points) < min_points:
-            return []
-
-        sorted_idx = np.argsort(points[:, 0])
-        sorted_points = points[sorted_idx]
-
-        clusters = []
-        cluster_start = 0
-
-        for i in range(1, len(sorted_points)):
-            if sorted_points[i, 0] - sorted_points[i-1, 0] > distance_threshold:
-                if i - cluster_start >= min_points:
-                    clusters.append(sorted_points[cluster_start:i])
-                cluster_start = i
-
-        if len(sorted_points) - cluster_start >= min_points:
-            clusters.append(sorted_points[cluster_start:])
-
-        return clusters
+    def set_logging_enabled(self, enabled: bool):
+        """控制感知线程日志输出 (input() 期间可关闭, 避免淹没终端)"""
+        self._log_enabled = enabled

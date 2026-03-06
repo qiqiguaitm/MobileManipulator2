@@ -132,6 +132,17 @@ class OdomFusionSync(Node):
             dy = wheel_pose[1] - self.wheel_last_pose[1]
             dyaw = self._normalize_angle(wheel_pose[2] - self.wheel_last_pose[2])
 
+            # 物理合理性检查: 50Hz@0.3m/s → 单步最大 ~6mm，0.1m 已极其宽松
+            MAX_DELTA_XY = 0.1   # 单步最大位移 (m)
+            MAX_DELTA_YAW = 0.5  # 单步最大转角 (rad)
+            if abs(dx) > MAX_DELTA_XY or abs(dy) > MAX_DELTA_XY or abs(dyaw) > MAX_DELTA_YAW:
+                self.get_logger().warn(
+                    f'wheel_odom outlier rejected: dx={dx:.3f}, dy={dy:.3f}, dyaw={dyaw:.3f}',
+                    throttle_duration_sec=5.0)
+                self.wheel_last_pose = wheel_pose.copy()
+                self.wheel_last_time = t
+                return
+
             self.current_pose[0] += dx
             self.current_pose[1] += dy
             self.current_pose[2] = self._normalize_angle(self.current_pose[2] + dyaw)
@@ -150,6 +161,13 @@ class OdomFusionSync(Node):
             twist[2] = self.wz_alpha * self.last_twist[2] + (1 - self.wz_alpha) * twist[2]
             if abs(twist[2]) < self.wz_deadzone:
                 twist[2] = 0.0
+
+            # 速度硬上限保护 (防止 EMA 残留异常值)
+            MAX_VEL = 1.0  # m/s (实际最大 0.3)
+            MAX_WZ = 2.0   # rad/s (实际最大 0.8)
+            twist[0] = np.clip(twist[0], -MAX_VEL, MAX_VEL)
+            twist[1] = np.clip(twist[1], -MAX_VEL, MAX_VEL)
+            twist[2] = np.clip(twist[2], -MAX_WZ, MAX_WZ)
             self.last_twist = twist.copy()
 
             self.wheel_last_pose = wheel_pose.copy()
@@ -158,7 +176,8 @@ class OdomFusionSync(Node):
 
     def _publish_odom(self, stamp, twist):
         out = Odometry()
-        out.header.stamp = stamp
+        # 使用系统时间戳，避免与其他节点时间不同步
+        out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = self.output_frame
         out.child_frame_id = self.output_child_frame
         out.pose.pose.position.x = self.current_pose[0]

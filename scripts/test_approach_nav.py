@@ -3,7 +3,7 @@
 三阶段导航测试脚本
 
 测试流程:
-1. 调用感知服务检测物体
+1. 订阅感知话题获取融合检测结果
 2. 将物体位置从 base_link 转换到 map 坐标系
 3. 显示检测到的物体列表
 4. 用户选择目标物体
@@ -21,12 +21,13 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Point, TransformStamped
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PointStamped
 
-from perception.srv import DetectObjects
+from perception.msg import Object3DArray
 from perception.msg import Object3D
 
 from approach_navigator.navigator import ApproachNavigator
@@ -46,48 +47,68 @@ class TestApproachNav(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # 感知服务客户端
-        self.detect_client = self.create_client(
-            DetectObjects,
-            '/multi_camera_perception/detect'
+        # 存储最新检测结果
+        self.latest_objects: list = []
+        self.objects_lock = __import__('threading').Lock()
+
+        # 订阅感知融合话题
+        self.perception_sub = self.create_subscription(
+            Object3DArray,
+            '/multi_camera_perception/fused/objects_3d',
+            self._on_objects_received,
+            qos_profile_sensor_data
         )
 
-        # 等待服务可用
-        self.get_logger().info("等待感知服务...")
-        if not self.detect_client.wait_for_service(timeout_sec=10.0):
-            self.get_logger().error("感知服务不可用!")
-            raise RuntimeError("感知服务不可用")
+        self.get_logger().info("已订阅 /multi_camera_perception/fused/objects_3d")
+        self.get_logger().info("等待感知数据...")
 
-        self.get_logger().info("感知服务已连接")
+    def _on_objects_received(self, msg: Object3DArray):
+        """接收感知话题数据"""
+        with self.objects_lock:
+            # 根据 prompt 过滤类别
+            prompt_parts = self.prompt.lower().split('.')
+            filtered_objects = []
+            for obj in msg.objects:
+                if obj.category.lower() in prompt_parts:
+                    filtered_objects.append(obj)
 
-    def detect_objects(self) -> list:
-        """调用感知服务检测物体
+            self.latest_objects = filtered_objects
+
+    def get_objects(self, timeout: float = 5.0) -> list:
+        """获取当前检测到的物体
+
+        Args:
+            timeout: 等待新数据超时时间(秒)
 
         Returns:
             list[Object3D]: 检测到的物体列表
         """
-        self.get_logger().info(f"检测物体: {self.prompt}")
+        import time
+        from rclpy.executors import MultiThreadedExecutor
+        import threading
 
-        request = DetectObjects.Request()
-        request.prompt = self.prompt
-        request.enable_lidar = False
-        request.camera_id = "all"
+        # 使用多线程 executor 来 spin 节点接收消息
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(self)
 
-        future = self.detect_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
 
-        if future.result() is None:
-            self.get_logger().error("检测服务调用超时")
-            return []
+        start_time = time.time()
 
-        response = future.result()
-        if not response.success:
-            self.get_logger().error(f"检测失败: {response.error_message}")
-            return []
+        # 等待至少有一些数据
+        while rclpy.ok():
+            with self.objects_lock:
+                if self.latest_objects:
+                    return self.latest_objects
 
-        objects = response.result.objects
-        self.get_logger().info(f"检测到 {len(objects)} 个物体")
-        return objects
+            if time.time() - start_time > timeout:
+                self.get_logger().warn("等待感知数据超时")
+                return []
+
+            time.sleep(0.1)
+
+        return []
 
     def transform_to_map(self, position: Point, source_frame: str = "base_link") -> Point:
         """将位置从 source_frame 转换到 map 坐标系
@@ -231,13 +252,21 @@ class TestApproachNav(Node):
             self.get_logger().warn(f"获取机器人位置失败: {e}")
             return None
 
-    def run_navigation(self, target_obj: Object3D, map_position: Point):
+    def run_navigation(self, target_obj: Object3D, map_position: Point, auto_select: bool = False, skip_stages: set = None):
         """执行三阶段导航
 
         Args:
             target_obj: 目标物体信息
             map_position: map 坐标系中的目标位置
+            auto_select: 是否自动模式
+            skip_stages: 要跳过的阶段集合，如 {1}, {1,2}, {2,3} 等
         """
+        # 处理 skip_stages 默认值
+        if skip_stages is None:
+            skip_stages = set()
+
+        if skip_stages:
+            print(f"将跳过阶段: {sorted(skip_stages)}")
         import threading
 
         print("\n" + "=" * 70)
@@ -273,7 +302,10 @@ class TestApproachNav(Node):
             print("警告: TF 等待超时，继续尝试...")
 
         # 状态回调
+        stage3_confirmed = False
+
         def status_callback(stage: NavStage, msg: str):
+            nonlocal stage3_confirmed
             stage_names = {
                 NavStage.IDLE: "空闲",
                 NavStage.NAVIGATING: "阶段1: Nav2 导航",
@@ -285,10 +317,48 @@ class TestApproachNav(Node):
             stage_name = stage_names.get(stage, stage.name)
             print(f"[{stage_name}] {msg}")
 
+            # 阶段3开始时：显示距离，等用户确认后再执行
+            if stage == NavStage.FINAL_APPROACH and not stage3_confirmed:
+                stage3_confirmed = True
+                import time
+                time.sleep(0.5)
+
+                # 获取并显示当前障碍物距离
+                depth = None
+                try:
+                    depth = navigator.get_current_depth()
+                    if depth is not None:
+                        navigator.set_initial_depth(depth)
+                except Exception as e:
+                    print(f"\n获取深度失败: {e}")
+
+                print("\n" + "=" * 70)
+                if depth is not None:
+                    print(f"  当前障碍物距离: {depth:.3f} m")
+                else:
+                    print("  当前障碍物距离: 无数据")
+
+                if not auto_select:
+                    navigator.depth_sensor.set_logging_enabled(False)
+                    confirm = input("确认执行阶段3 (精确接近)? (y/n): ").strip().lower()
+                    navigator.depth_sensor.set_logging_enabled(True)
+                    print("=" * 70)
+                    if confirm != 'y':
+                        print("取消阶段3，停止机器人")
+                        try:
+                            from geometry_msgs.msg import Twist
+                            navigator.cmd_vel_pub.publish(Twist())
+                        except Exception:
+                            pass
+                else:
+                    print("[自动模式] 继续执行阶段3...")
+                    print("=" * 70)
+
         # 执行导航
         result = navigator.approach_to_target(
             target_position=map_position,
-            status_callback=status_callback
+            status_callback=status_callback,
+            skip_stages=skip_stages
         )
 
         # 显示结果
@@ -330,8 +400,9 @@ def main():
         import time
         time.sleep(2.0)
 
-        # 检测物体
-        objects = node.detect_objects()
+        # 等待并获取物体数据
+        print("等待感知数据...")
+        objects = node.get_objects()
         if not objects:
             print("未检测到物体，退出")
             return
@@ -350,15 +421,24 @@ def main():
         print(f"\n选择目标: {target_obj.category}")
         print(f"map 位置: ({map_pos.x:.3f}, {map_pos.y:.3f}, {map_pos.z:.3f})")
 
-        # 确认
+        # 确认并选择各阶段
+        skip_stages = set()
         if not args.auto:
             confirm = input("\n确认开始导航? (y/n): ").strip().lower()
             if confirm != 'y':
                 print("取消导航")
                 return
 
+            print("\n阶段选择 (直接回车=执行, s=跳过):")
+            for num, name in [(1, "Nav2 全局导航"), (2, "精确对齐"), (3, "精确接近")]:
+                c = input(f"  阶段{num} [{name}]: ").strip().lower()
+                if c == 's':
+                    skip_stages.add(num)
+            if skip_stages:
+                print(f"将跳过阶段: {sorted(skip_stages)}")
+
         # 执行导航
-        node.run_navigation(target_obj, map_pos)
+        node.run_navigation(target_obj, map_pos, auto_select=args.auto, skip_stages=skip_stages)
 
     except KeyboardInterrupt:
         print("\n用户中断")

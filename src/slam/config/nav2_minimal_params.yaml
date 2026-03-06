@@ -75,11 +75,12 @@ controller_server:
       plugin: "nav2_mppi_controller::MPPIController"
 
       # ==================== 采样参数 ====================
-      time_steps: 56                     # 轨迹步数
-      model_dt: 0.05                     # 步长 50ms → 规划视野 2.8s
-      batch_size: 1500                   # 采样轨迹数 (Orin 12核 ~15ms/cycle)
-      iteration_count: 2                 # 每周期优化迭代次数 (2轮精化)
-      temperature: 0.3                   # 选择贪婪度: 低=贪婪, 高=探索
+      # 10m×10m 室内优化: 缩短视野、减少采样、更贪婪
+      time_steps: 48                     # 轨迹步数 (56→48, 视野2.4s, 室内够用)
+      model_dt: 0.05                     # 步长 50ms → 规划视野 2.4s
+      batch_size: 1000                   # 采样轨迹数 (1500→1000, 小空间不需过多探索)
+      iteration_count: 2                 # 每周期优化迭代次数
+      temperature: 0.25                  # 选择贪婪度 (0.3→0.25, 更贪婪=更稳定轨迹)
       gamma: 0.015                       # 轨迹代价折扣因子
       motion_model: "DiffDrive"          # 差速运动模型
       visualize: false                   # true 可在 RViz 看候选轨迹 (调试用)
@@ -87,20 +88,21 @@ controller_server:
       retry_attempt_limit: 5
 
       # ==================== 速度约束 ====================
-      # 直接对应原 TEB 参数
-      vx_max: 0.3                        # 最大前进速度 0.3m/s
-      vx_min: -0.15                      # 最大后退速度 0.15m/s
+      # 参照 TEB: max_vel_x=0.3, max_vel_theta=0.5, acc_lim_x=0.5
+      # MPPI 无显式加速度限制，通过降低 wz_max + 收紧噪声 std 隐式约束
+      vx_max: 0.3                        # 最大前进速度 0.3m/s (与TEB一致)
+      vx_min: -0.3                       # 最大后退速度 = 前进速度, 遇障碍快速后退脱困
       vy_max: 0.0                        # 差速机器人无横向速度
-      wz_max: 0.8                        # 最大角速度 0.8rad/s (0.5太慢，转弯采样范围不够)
+      wz_max: 0.6                        # 最大角速度 (TEB=0.5, +0.1给MPPI采样余量)
 
       # ==================== 采样噪声 ====================
-      # 控制轨迹探索范围，相对于速度极值的标准差
-      vx_std: 0.2                        # 线速度噪声 (67% of vx_max)
+      # 收紧噪声 = 隐式加速度约束 (MPPI无acc_lim，靠噪声控制平滑度)
+      vx_std: 0.15                       # 线速度噪声 (0.2→0.15, 50%of vx_max, 更精细)
       vy_std: 0.0                        # 差速无横向
-      wz_std: 0.6                        # 角速度噪声 (75% of wz_max=0.8)
+      wz_std: 0.4                        # 角速度噪声 (0.6→0.4, 67%of wz_max, 转弯更平滑)
 
       # ==================== 路径修剪 ====================
-      prune_distance: 1.7               # 丢弃已通过的全局路径段
+      prune_distance: 1.2               # 丢弃已通过路径段 (1.7→1.2, 小房间路径短)
       transform_tolerance: 0.1
 
       TrajectoryVisualizer:
@@ -126,16 +128,17 @@ controller_server:
         cost_power: 1
         cost_weight: 4.0                 # 违反约束的惩罚
 
-      # --- 障碍物避让 (替代 TEB min_obstacle_dist) ---
+      # --- 障碍物避让 (替代 TEB min_obstacle_dist=0.05) ---
+      # 室内加强: 障碍物密度高，需要更大安全距离
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 1.5            # 斥力权重 (远离障碍物的倾向)
+        repulsion_weight: 2.5            # 斥力权重 (1.5→2.5, 室内远离障碍物)
         critical_weight: 20.0            # 极近距离时的惩罚权重
         consider_footprint: true         # 用矩形足迹碰撞检测，非圆形近似
         collision_cost: 10000.0          # 碰撞代价 (直接淘汰该轨迹)
-        collision_margin_distance: 0.02  # 足迹边缘安全余量 2cm (足迹本身已含4cm相机余量)
-        near_goal_distance: 0.5          # 接近目标时放宽障碍物约束
+        collision_margin_distance: 0.08  # 足迹安全余量 (0.05→0.08, 再次剐蹭后加大)
+        near_goal_distance: 0.3          # 接近目标放宽距离 (0.5→0.3, 室内窄区到位前也要避障)
 
       # --- Costmap 代价 (感知膨胀层) ---
       CostCritic:
@@ -145,7 +148,7 @@ controller_server:
         critical_cost: 300.0             # 高代价区域阈值
         consider_footprint: true         # 矩形足迹检查
         collision_cost: 1000000.0        # costmap 致命代价
-        near_goal_distance: 1.0          # 接近目标时降低代价敏感度
+        near_goal_distance: 0.8          # 接近目标降敏 (1.0→0.8, 室内晚一点才放松)
 
       # --- 到达目标 ---
       GoalCritic:
@@ -158,7 +161,7 @@ controller_server:
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.0
+        cost_weight: 3.5                 # 3.0→3.5, 室内到位朝向更精确
         threshold_to_consider: 0.5       # 距目标 <0.5m 时调整朝向
 
       # --- 路径跟随 (替代 TEB global_plan 跟踪) ---
@@ -187,16 +190,16 @@ controller_server:
         cost_weight: 2.0
         offset_from_furthest: 4
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.57      # 最大允许偏航 90° (原57°太小，目标在侧方时所有轨迹被罚死)
-        mode: 0                          # 0=前进优先
+        max_angle_to_furthest: 1.57      # 最大允许偏航 90°
+        mode: 1                          # 0→1, 允许前进/后退双向评估，不再罚死后退轨迹
 
       # --- 前进偏好 (差速机器人核心) ---
-      # 替代 TEB weight_kinematics_forward_drive
+      # 替代 TEB weight_kinematics_forward_drive=50 (相对尺度不同)
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.0                 # 从5.0降到3.0，避免和PathFollow/PathAngle冲突致死锁
-        threshold_to_consider: 0.5       # 接近目标时允许后退微调
+        cost_weight: 1.5                 # 2.5→1.5, 差速车后退代价低，室内常需后退调姿
+        threshold_to_consider: 0.6       # 0.4→0.6, 更早允许后退
 
 # ==================== [备用] 局部规划器: TEB ====================
 # 切换方法: 注释上方 FollowPath 整块 (L72-L197)，取消注释下方 FollowPath 块
@@ -301,7 +304,7 @@ local_costmap:
       update_frequency: 8.0               # ROS1: 8.0
       publish_frequency: 0.5              # ROS1: 0.5
       rolling_window: true
-      width: 4                            # ROS1: 4.0 (4m x 4m 局部地图)
+      width: 4                            # 恢复4m，3m导致recovery行为"Pose Goes Off Grid"
       height: 4
       resolution: 0.05                    # ROS1: 0.05
       # 矩形足迹: 0.809m x 0.62m (前边缘=相机+4cm余量 0.434m)
@@ -380,9 +383,19 @@ global_costmap:
 behavior_server:
   ros__parameters:
     use_sim_time: false
+    local_frame: odom
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.5
+    # 共享运动约束 (spin/backup 共用, 与 MPPI wz_max 同步)
+    max_rotational_vel: 0.6             # 与 MPPI wz_max 一致 (0.8→0.6)
+    min_rotational_vel: 0.15
+    rotational_acc_lim: 1.2             # 角加速度 (1.6→1.2, 参照TEB acc_lim_theta=1.0)
+    simulate_ahead_time: 1.5            # 碰撞预检 (2.0→1.5, 减少off-grid风险)
+    # backup 线速度约束 (修复 "no acceleration or deceleration limits set" 警告)
+    max_linear_vel: 0.2                  # 后退最大速度
+    min_linear_vel: 0.05                 # 后退最小速度
+    linear_acc_lim: 0.5                  # 线加速度 (参照TEB acc_lim_x=0.5)
     behavior_plugins: ["spin", "backup", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"

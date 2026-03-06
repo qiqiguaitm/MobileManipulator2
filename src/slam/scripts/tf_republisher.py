@@ -135,12 +135,22 @@ class TFRepublisher(Node):
         prev.rotation = yaw_to_quaternion(smoothed_yaw)
 
     def timer_callback(self):
-        # ROS1 版本逻辑：没有 HDL TF 时，什么都不发布（不要发 identity transform）
+        # HDL 未初始化时：发布 identity TF 让 RViz 能显示地图，用户可手动设 initialpose
         if self.latest_transform is None:
             if not self._waiting_logged:
-                self.get_logger().warn('Waiting for HDL map->odom (not publishing)')
+                self.get_logger().warn('Waiting for HDL map->odom, publishing identity TF for RViz')
                 self._waiting_logged = True
-            return  # 没有 TF 就闭嘴，不要发垃圾 identity transform
+            now = self.get_clock().now()
+            from rclpy.duration import Duration
+            ahead_ns = int(self.stamp_ahead_sec * 1e9)
+            out = TransformStamped()
+            out.header.stamp = (now + Duration(nanoseconds=ahead_ns)).to_msg()
+            out.header.frame_id = self.source_frame
+            out.child_frame_id = self.child_frame
+            # identity transform: 位置(0,0,0) + 旋转(0,0,0,1)
+            out.transform.rotation.w = 1.0
+            self.tf_broadcaster.sendTransform(out)
+            return
 
         if not self._logged_once:
             self.get_logger().info('TF Republisher: Active, republishing map->odom from HDL')

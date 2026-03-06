@@ -30,7 +30,7 @@ class ApproachConfig:
 
     # ========== 阶段3: 精确接近 ==========
     final_approach_speed: float = 0.12      # 最大前进速度 (米/秒)
-    final_approach_distance: float = 0.05   # 目标停止距离：前边缘到目标 (米)
+    final_approach_distance: float = 0.08   # 目标停止距离：前边缘到目标 + 3cm安全余量 (米)
     emergency_stop_distance: float = 0.03   # 紧急刹车距离 (米)
     speed_decel_rate: float = 0.5           # 最大减速率 (米/秒²)
     final_approach_timeout: float = 15.0    # 精确接近超时 (秒)
@@ -42,21 +42,19 @@ class ApproachConfig:
     depth_data_timeout: float = 0.5         # 深度数据超时判定 (秒)
 
     # ========== 点云处理参数 ==========
+    # 相机坐标系: y 向下为正, 相机离地约 15cm → 地面在 y ≈ +0.15m
+    # 空中物体 y < 0 (负), 地面 y ≈ +0.15, 地面以下 y > 0.15
     depth_downsample: int = 4               # 深度图降采样因子 (4=每4像素取1个)
-    depth_ground_max_height: float = 0.10   # 地面最高高度 (米)，低于此为地面点
-    depth_obstacle_min_height: float = 0.10 # 障碍物最低高度 (米)，需高于地面噪声
-    depth_obstacle_max_height: float = 1.5  # 障碍物最高高度 (米)
+    depth_ground_max_height: float = 0.15   # 地面高度: +15cm (相机离地15cm, y向下为正)
+    depth_obstacle_min_height: float = -0.50 # ROI上方截止: -50cm (y向上为负, 排除过高处)
+    depth_obstacle_max_height: float = 0.22  # ROI下方截止: +22cm (包含地面y=0.15, 供RANSAC)
     depth_detect_width: float = 0.4         # 前方检测宽度 (米)，左右各此值
 
-    # ========== 外参标定文件 ==========
-    extrinsics_file: str = "/home/didi/workspace/MobileManipulator2/src/perception/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
-
     # ========== 机器人几何参数 ==========
-    # 来源: 外参标定 extrinsics_chassis_camera_optical_frame_to_base_link.yaml
-    # 计算: T_base_to_optical = T_optical_to_base^(-1), 得到 x=0.394m
-    # 前边缘 = 相机光学中心 + 4cm余量 (相机外壳 + 安全)
-    camera_forward_offset: float = 0.394    # 相机光学中心相对 base_link 前向偏移 (米)
-    robot_front_offset: float = 0.40       # base_link 到机器人前边缘距离 (米)
+    # robot_front_offset: 用于导航计算接近点 (total_offset = robot_front_offset + approach_distance)
+    # 相机距离: Phase 3 精确接近直接使用相机测量距离，不加 offset
+    camera_forward_offset: float = 0.0       # 已废弃，保留仅用于兼容
+    robot_front_offset: float = 0.5         # base_link 到机器人前边缘
 
     # ========== 控制参数 ==========
     control_rate: float = 50.0              # 控制循环频率 (Hz)
@@ -106,8 +104,6 @@ def load_config_from_node(node) -> ApproachConfig:
         ('depth_obstacle_min_height', config.depth_obstacle_min_height),
         ('depth_obstacle_max_height', config.depth_obstacle_max_height),
         ('depth_detect_width', config.depth_detect_width),
-        # 外参
-        ('extrinsics_file', config.extrinsics_file),
         # 机器人几何
         ('camera_forward_offset', config.camera_forward_offset),
         ('robot_front_offset', config.robot_front_offset),
@@ -145,7 +141,6 @@ def load_config_from_node(node) -> ApproachConfig:
     config.depth_obstacle_min_height = node.get_parameter('depth_obstacle_min_height').value
     config.depth_obstacle_max_height = node.get_parameter('depth_obstacle_max_height').value
     config.depth_detect_width = node.get_parameter('depth_detect_width').value
-    config.extrinsics_file = node.get_parameter('extrinsics_file').value
     config.camera_forward_offset = node.get_parameter('camera_forward_offset').value
     config.robot_front_offset = node.get_parameter('robot_front_offset').value
     config.control_rate = node.get_parameter('control_rate').value

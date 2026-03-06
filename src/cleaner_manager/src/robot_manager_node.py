@@ -22,12 +22,12 @@ from std_srvs.srv import Trigger
 from perception.msg import TrackedObject3DArray
 from piper_msgs.srv import Observe, GoReady, InWorkingArea, GetStatus
 from piper_msgs.action import PiperPick, PiperPlace
-from robot_manager.msg import RobotManagerStatus
+from cleaner_manager.msg import RobotManagerStatus
 
 from approach_navigator import ApproachNavigator
-from robot_manager.target_pool import TargetPool
+from cleaner_manager.target_pool import TargetPool
 
-from robot_manager.pick_state_machine import (
+from cleaner_manager.pick_state_machine import (
     PickStateMachine, PickConfig, PickState, PICK_STATE_NAMES
 )
 

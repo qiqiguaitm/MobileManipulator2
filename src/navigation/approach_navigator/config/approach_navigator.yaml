@@ -24,7 +24,7 @@ approach_navigator:
     # 阶段3: 精确接近
     # ============================================================
     final_approach_speed: 0.10        # 最大前进速度 (米/秒)
-    final_approach_distance: 0.08     # 目标距离：前边缘到目标 (米)
+    final_approach_distance: 0.08     # 目标距离：前边缘到目标 + 3cm安全余量 (米)
     emergency_stop_distance: 0.03     # 紧急刹车距离 (米)
     speed_decel_rate: 0.5             # 最大减速率 (米/秒²)
     final_approach_timeout: 15.0      # 精确接近超时 (秒)
@@ -43,33 +43,21 @@ approach_navigator:
     # 降采样: 减少计算量，4 表示每 4 个像素取 1 个
     depth_downsample: 4
 
-    # 地面过滤: base_link 坐标系中 z < 此值为地面
-    depth_ground_max_height: 0.15     # 地面最高高度 (米)
-
-    # 障碍物过滤: 只保留此高度范围内的点
-    depth_obstacle_min_height: 0.15   # 障碍物最低高度 (米)，需高于地面噪声
-    depth_obstacle_max_height: 1.5    # 障碍物最高高度 (米)
+    # 相机坐标系: y 向下为正, 相机离地约 15cm → 地面在 y ≈ +0.15m
+    # ROI 上限必须 > depth_ground_max_height, 才能让地面点进入 RANSAC 去除
+    depth_ground_max_height: 0.15      # 地面高度: +15cm (相机离地15cm, y向下为正)
+    depth_obstacle_min_height: -0.50   # ROI 上方截止: -50cm (排除50cm以上高处, y向上为负)
+    depth_obstacle_max_height: 0.22    # ROI 下方截止: +22cm (包含地面+7cm余量, 供RANSAC使用)
 
     # 检测范围: 前方 |y| < 此值的范围
     depth_detect_width: 0.4           # 检测宽度 (米)，左右各此值
 
     # ============================================================
-    # 外参标定文件
-    # ============================================================
-    extrinsics_file: "/home/didi/workspace/MobileManipulator2/src/perception/config/extrinsics_chassis_camera_optical_frame_to_base_link.yaml"
-
-    # ============================================================
     # 机器人几何参数
-    # 来源: 外参标定文件计算
     # ============================================================
-    # 计算方法: 对外参变换求逆，得到相机在 base_link 中的位置
-    #   T_base_to_optical = T_optical_to_base^(-1)
-    #   结果: x=0.394m + 4cm安全余量 = 0.434m
-    camera_forward_offset: 0.394      # 相机光学中心相对 base_link 前向偏移 (米)
-
-    # 机器人前边缘 = 相机光学中心 + 4cm余量 (相机外壳 + 安全)
-    #   nav2 footprint: "[[-0.375, -0.31], [-0.375, 0.31], [0.434, 0.31], [0.434, -0.31]]"
-    robot_front_offset: 0.434         # base_link 到机器人前边缘距离 (米)
+    # robot_front_offset: 导航计算接近点用 (total_offset = robot_front_offset + approach_distance)
+    # 相机距离: Phase 3 精确接近直接使用相机测量距离，不加 offset
+    robot_front_offset: 0.5         # base_link 到机器人前边缘 (用于导航)
 
     # ============================================================
     # 控制参数

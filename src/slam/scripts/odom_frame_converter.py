@@ -39,7 +39,8 @@ class OdomFrameConverter(Node):
 
     def callback(self, msg):
         out_msg = Odometry()
-        out_msg.header = msg.header
+        # 使用系统时间戳，避免与其他节点时间不同步
+        out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = self.target_frame
         out_msg.child_frame_id = self.target_child_frame
         out_msg.pose = msg.pose

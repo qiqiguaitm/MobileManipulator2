@@ -16,8 +16,9 @@ ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
 .PHONY: help \
         navigation navi nav navi-fusion nav-fusion navi-approach \
         percept-nav \
-        robot-manager robot-manager-no-rviz robot-manager-node \
-        build build-all build-drivers build-slam build-nav build-perception build-robot-manager \
+        cleaner-manager cleaner-manager-no-rviz cleaner-manager-node \
+        full-manual \
+        build build-all build-drivers build-slam build-nav build-perception build-cleaner-manager \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
         percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-full-sam3-stereo-hand percept-full-sam3-stereo-hand-nocdm percept-stop \
@@ -56,11 +57,12 @@ help:
 	@echo "感知导航命令:"
 	@echo "  make percept-nav      - 一键启动 (导航+相机+感知+接近导航)"
 	@echo ""
-	@echo "全系统命令 (Robot Manager):"
-	@echo "  make robot-manager         - 全系统启动 (导航+相机+机械臂+感知+管理+RViz)"
-	@echo "  make robot-manager-no-rviz - 全系统启动 (无RViz)"
-	@echo "  make robot-manager-node    - 仅启动管理节点 (需其他模块已运行)"
-	@echo "  make build-robot-manager   - 构建 robot_manager 包"
+	@echo "全系统命令 (Cleaner Manager):"
+	@echo "  make cleaner-manager         - 全系统启动 (导航+相机+机械臂+感知+管理+RViz)"
+	@echo "  make cleaner-manager-no-rviz - 全系统启动 (无RViz)"
+	@echo "  make cleaner-manager-node    - 仅启动管理节点 (需其他模块已运行)"
+	@echo "  make full-manual            - 感知导航抓取全流程 (仿ROS1 start_amr.sh full)"
+	@echo "  make build-cleaner-manager  - 构建 cleaner_manager 包"
 	@echo ""
 	@echo "构建命令:"
 	@echo "  make build          - 构建所有包"
@@ -145,13 +147,13 @@ percept-nav:
 	@bash $(SCRIPTS_DIR)/start_percept_nav.sh
 
 # ============================================
-# 全系统命令 (Robot Manager)
+# 全系统命令 (Cleaner Manager)
 # ============================================
 
-# 全系统启动: 导航 + 相机 + 机械臂 + 感知 + Robot Manager + RViz
-robot-manager:
-	@echo "[ROBOT-MANAGER] 全系统启动..."
-	@$(ROS_SETUP) && ros2 launch robot_manager robot_manager_full.launch.py \
+# 全系统启动: 导航 + 相机 + 机械臂 + 感知 + Cleaner Manager + RViz
+cleaner-manager:
+	@echo "[CLEANER-MANAGER] 全系统启动..."
+	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
 		rviz:=true \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
@@ -160,9 +162,9 @@ robot-manager:
 		enable_depth_optimizer:=true
 
 # 全系统启动 (无RViz)
-robot-manager-no-rviz:
-	@echo "[ROBOT-MANAGER] 全系统启动 (无RViz)..."
-	@$(ROS_SETUP) && ros2 launch robot_manager robot_manager_full.launch.py \
+cleaner-manager-no-rviz:
+	@echo "[CLEANER-MANAGER] 全系统启动 (无RViz)..."
+	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
 		rviz:=false \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
@@ -170,16 +172,27 @@ robot-manager-no-rviz:
 		extrinsics_suffix:=_stereo_hand \
 		enable_depth_optimizer:=true
 
-# 仅启动 robot_manager_node (需其他模块已运行)
-robot-manager-node:
-	@echo "[ROBOT-MANAGER] 启动管理节点..."
-	@$(ROS_SETUP) && ros2 launch robot_manager robot_manager.launch.py
+# 仅启动 cleaner_manager_node (需其他模块已运行)
+cleaner-manager-node:
+	@echo "[CLEANER-MANAGER] 启动管理节点..."
+	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager.launch.py
 
-# 构建 robot_manager 包
-build-robot-manager:
-	@echo "[BUILD] 构建 robot_manager..."
-	@cd $(WS_DIR) && $(ROS_SETUP) && colcon build --packages-select robot_manager
-	@echo "[OK] robot_manager 构建完成"
+# 构建 cleaner_manager 包
+build-cleaner-manager:
+	@echo "[BUILD] 构建 cleaner_manager..."
+	@cd $(WS_DIR) && $(ROS_SETUP) && colcon build --packages-select cleaner_manager
+	@echo "[OK] cleaner_manager 构建完成"
+
+# 全手动模式: 感知 + 导航 + 抓取全流程 (仿 ROS1 start_amr.sh full)
+full-manual:
+	@echo "[FULL-MANUAL] 启动全流程 (导航+相机+感知+机械臂+抓取)..."
+	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
+		rviz:=true \
+		use_odom_fusion:=true \
+		launch_chassis:=true \
+		detector_type:=sam3 \
+		extrinsics_suffix:=_stereo_hand \
+		enable_depth_optimizer:=true
 
 # ============================================
 # 构建命令
@@ -427,30 +440,30 @@ percept-full:
 
 # 一键启动 - 使用 SAM3 检测器, CDM已禁用
 percept-full-sam3:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --no-cdm
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3
 
 # 一键启动 - 使用新标定外参（测试用）
 percept-full-new:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --new-extrinsics
 
-# 测试新标定外参 (2系数固定内参, 2026-02-28), CDM已禁用
+# 测试新标定外参 (2系数固定内参, 2026-02-28), CDM已启用
 percept-full-sam3-new:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_new --no-cdm
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_new
 
 percept-full-sam3-new-nocdm:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_new --no-cdm
 
-# 立体手链外参 (chassis→hand→flange→base, 2026-03-02), CDM已禁用
+# 立体手链外参 (chassis→hand→flange→base, 2026-03-02), CDM已启用
 percept-full-sam3-stereo-hand:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_stereo_hand --no-cdm
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_stereo_hand
 
 # 同上（保留别名，兼容旧脚本）
 percept-full-sam3-stereo-hand-nocdm:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_stereo_hand --no-cdm
 
-# 临时测试 - 使用最早的旧外参 (_back), CDM已禁用
+# 临时测试 - 使用最早的旧外参 (_back), CDM已启用
 percept-full-sam3-back:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_back --no-cdm
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --extrinsics-suffix=_back
 
 # 停止感知节点（Python节点用pkill，[x]技巧避免自杀）
 percept-stop:

@@ -17,6 +17,8 @@ class OdomRelay(Node):
         self.get_logger().info('OdomRelay: /odom -> /odom/fused')
 
     def callback(self, msg):
+        # 使用系统时间戳，避免与其他节点时间不同步
+        msg.header.stamp = self.get_clock().now().to_msg()
         self.pub.publish(msg)
 
 

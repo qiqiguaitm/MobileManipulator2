@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(robot_manager)
+project(cleaner_manager)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -24,10 +24,10 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(_py_dir "lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages")
 
 install(FILES
-  robot_manager/__init__.py
-  robot_manager/target_pool.py
-  robot_manager/pick_state_machine.py
-  DESTINATION "${_py_dir}/robot_manager"
+  cleaner_manager/__init__.py
+  cleaner_manager/target_pool.py
+  cleaner_manager/pick_state_machine.py
+  DESTINATION "${_py_dir}/cleaner_manager"
 )
 
 install(PROGRAMS

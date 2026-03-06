@@ -148,6 +148,9 @@ def generate_launch_description():
             'align_depth.enable': align_depth_enable,
             'pointcloud.enable': pointcloud_enable,
             'publish_tf': publish_tf,
+            # 飞点过滤: 空间滤波消除深度边缘伪像，时序滤波降低帧间噪声
+            'spatial_filter.enable': 'true',
+            'temporal_filter.enable': 'true',
         }
 
     # ========== Top Camera (starts immediately) ==========
@@ -193,6 +196,9 @@ def generate_launch_description():
                 'align_depth.enable': cfg.get('align_depth_enable', 'true'),
                 'pointcloud.enable': cfg.get('pointcloud_enable', 'false'),
                 'publish_tf': cfg.get('publish_tf', 'true'),
+                # 飞点过滤: 空间滤波消除深度边缘伪像，时序滤波降低帧间噪声
+                'spatial_filter.enable': 'true',
+                'temporal_filter.enable': 'true',
             }
 
         delay = float(cfg.get('camera_delay', '3.0'))

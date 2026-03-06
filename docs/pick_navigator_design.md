@@ -71,7 +71,7 @@
            │                             │
            ▼                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                      ROBOT MANAGER (✅ 已实现)                               │
+│                      CLEARNER MANAGER (✅ 已实现)                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  状态机: IDLE → PLANNING → STOWING → NAVIGATING → DEPLOYING →              │
@@ -613,20 +613,19 @@ while not abort_event.is_set():
 │      ├─ 排除: picked=True, attempt_count≥3                            │
 │      └─ 选择: 距机器人最近的作为导航目标                                 │
 │                                                                         │
-│  [2] STOWING - 收臂                                                    │
-│      └─ 调用: /piper/go_ready(speed=30, open_gripper=False)            │
+│             │
 │                                                                         │
-│  [3] NAVIGATING - 三阶段导航                                            │
+│  [2] NAVIGATING - 三阶段导航                                            │
 │      ├─ 暂停 TargetPool 更新（避免导航中位置漂移污染）                    │
 │      ├─ 调用: ApproachNavigator.approach_to_target(target.position_map)│
 │      ├─ Stage1: Nav2 → 距目标 0.45m                                   │
 │      ├─ Stage2: PD 旋转 → 朝向目标 ±5°                                │
 │      └─ Stage3: 深度闭环前进 → 前边缘距障碍 0.08m                      │
 │                                                                         │
-│  [4] DEPLOYING - 展臂                                                  │
+│  [3] DEPLOYING - 展臂                                                  │
 │      └─ 调用: /piper/go_ready（到观察位 x=317, y=15, z=248）           │
 │                                                                         │
-│  [5] SCANNING - 工作区扫描                                              │
+│  [4] SCANNING - 工作区扫描                                              │
 │      ├─ 恢复 TargetPool 更新                                           │
 │      ├─ 等待感知稳定（连续 3 帧物体数量不变，最长 3s 超时）              │
 │      ├─ 从 /object_tracker_node/tracked_objects 获取当前目标            │
@@ -635,7 +634,7 @@ while not abort_event.is_set():
 │      ├─ 按距离排序，生成抓取队列                                         │
 │      └─ 若工作区无目标 → 回 PLANNING（选下一个导航目标）                 │
 │                                                                         │
-│  [6] PICKING - 批量抓取（循环）                                         │
+│  [5] PICKING - 批量抓取（循环）                                         │
 │      ├─ 从队列取下一个目标的 category                                   │
 │      ├─ 调用: /piper/observe (prompt=category)                         │
 │      │   └─ 返回: point3d_base, angle_base, gripper_width (mm)         │
@@ -645,9 +644,11 @@ while not abort_event.is_set():
 │      ├─ 调用: /piper/place (use_default_place=true)                    │
 │      ├─ 成功: target_pool.mark_picked(position_map)                    │
 │      ├─ 失败: target_pool.mark_failed(position_map)                    │
-│      └─ 队列非空则继续，否则回到 PLANNING                               │
+│      └─ 队列非空则继续，否则回到 PLANNING
+|  [6] STOWING - 收臂                                                     │
+│      └─ 调用: /piper/go_ready(speed=30, open_gripper=False)             │
 │                                                                         │
-│  [7] 循环 [1]-[6]，直到没有可抓目标 → COMPLETED                         │
+│  [7] 循环 [1]-[6]，直到没有可抓目标 → COMPLETED                           │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```

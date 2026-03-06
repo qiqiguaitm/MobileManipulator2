@@ -490,27 +490,43 @@ class PiperAPI:
         if not self.is_connected:
             return -1, [0, 0, 0, 0, 0, 0]
 
-        try:
-            msg = self.piper.GetArmEndPoseMsgs()
+        # 重试机制：最多重试3次获取最新位置
+        last_pos = None
+        for retry in range(3):
+            try:
+                msg = self.piper.GetArmEndPoseMsgs()
 
-            # Flange position
-            pos = [
-                msg.end_pose.X_axis / self.FACTOR,
-                msg.end_pose.Y_axis / self.FACTOR,
-                msg.end_pose.Z_axis / self.FACTOR,
-                msg.end_pose.RX_axis / self.FACTOR,
-                msg.end_pose.RY_axis / self.FACTOR,
-                msg.end_pose.RZ_axis / self.FACTOR,
-            ]
+                # Flange position
+                pos = [
+                    msg.end_pose.X_axis / self.FACTOR,
+                    msg.end_pose.Y_axis / self.FACTOR,
+                    msg.end_pose.Z_axis / self.FACTOR,
+                    msg.end_pose.RX_axis / self.FACTOR,
+                    msg.end_pose.RY_axis / self.FACTOR,
+                    msg.end_pose.RZ_axis / self.FACTOR,
+                ]
 
-            if return_gripper_center:
-                pos = self._flange_to_gripper_center(pos)
+                # 如果位置变化了，说明获取到了新数据
+                if last_pos is not None:
+                    diff = sum(abs(pos[i] - last_pos[i]) for i in range(3))
+                    if diff > 0.5:  # 位置有变化
+                        break
 
-            return 0, pos
+                last_pos = pos
+                if retry < 2:
+                    time.sleep(0.01)  # 短暂等待后重试
+            except Exception:
+                break
 
-        except Exception as e:
-            print(f"[PiperAPI] ⚠ Get position error: {e}")
+        if last_pos is None:
             return -1, [0, 0, 0, 0, 0, 0]
+
+        pos = last_pos
+
+        if return_gripper_center:
+            pos = self._flange_to_gripper_center(pos)
+
+        return 0, pos
 
     # ==================== Coordinate Transform ====================
 

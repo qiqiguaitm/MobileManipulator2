@@ -44,10 +44,10 @@ piper_ros:
       yaw: 180                   # Yaw (degrees)
     place:                       # default place position (flange/end-effector coords)
       x: -86                      # flange X (mm)
-      y: -150                    # flange Y (mm)
+      y: 150                     # flange Y (mm), positive = left side (mirrored from right)
       z: 300                     # flange Z (mm)
-      # Quaternion [x, y, z, w] - from robot_piper.py (accurate orientation)
-      quat: [0.8740,0.4486,-0.1396,0.1232]
+      # Quaternion [x, y, z, w] - mirrored to left side (qx, qz negated)
+      quat: [-0.8740,0.4486,0.1396,0.1232]
     zero:
       joints: [0, 0, 0, 0, 0, 0]
 

@@ -432,7 +432,7 @@ class PickStateMachine:
         except Exception:
             return False
 
-        from robot_manager.target_pool import _transform_point
+        from cleaner_manager.target_pool import _transform_point
         pos_base = _transform_point(pos_map, tf)
 
         client = self._node.in_working_area_client

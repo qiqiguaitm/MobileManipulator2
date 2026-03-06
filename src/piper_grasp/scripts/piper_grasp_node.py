@@ -92,6 +92,7 @@ class PiperGraspNode(Node):
 
         # Threading locks
         self._arm_lock = threading.Lock()
+
         self._observe_lock = threading.Lock()
         self._action_lock = threading.Lock()
         self._action_busy = False
@@ -1666,17 +1667,41 @@ class PiperGraspNode(Node):
             _, gc_pos = self.arm.get_position(return_gripper_center=True)
             gripper_mm = self._get_gripper_mm()
 
-            # Joint angles
+            # Joint angles from feedback
             DEG_TO_RAD = 0.001 * math.pi / 180.0
             joint_msg = self.arm.piper.GetArmJointMsgs()
-            joints_rad = [
-                joint_msg.joint_state.joint_1 * DEG_TO_RAD,
-                joint_msg.joint_state.joint_2 * DEG_TO_RAD,
-                joint_msg.joint_state.joint_3 * DEG_TO_RAD,
-                joint_msg.joint_state.joint_4 * DEG_TO_RAD,
-                joint_msg.joint_state.joint_5 * DEG_TO_RAD,
-                joint_msg.joint_state.joint_6 * DEG_TO_RAD,
+            joints = [
+                joint_msg.joint_state.joint_1,
+                joint_msg.joint_state.joint_2,
+                joint_msg.joint_state.joint_3,
+                joint_msg.joint_state.joint_4,
+                joint_msg.joint_state.joint_5,
+                joint_msg.joint_state.joint_6,
             ]
+
+            # If all zeros (known SDK bug after JointCtrl(0,...)), use IK to compute from FK position
+            if all(j == 0 for j in joints):
+                if self.ik_solver is not None:
+                    # Use IK to compute joint angles from FK position
+                    try:
+                        # Get current FK position
+                        _, flange_pos = self.arm.get_position(return_gripper_center=False)
+                        # Convert to SE3 matrix
+                        import numpy as np
+                        from scipy.spatial.transform import Rotation
+                        trans = np.array(flange_pos[:3]) / 1000.0  # mm -> m
+                        rot = Rotation.from_euler('xyz', flange_pos[3:]).as_matrix()
+                        target_pose = np.eye(4)
+                        target_pose[:3, :3] = rot
+                        target_pose[:3, 3] = trans
+                        # Solve IK
+                        sol_q, _, success = self.ik_solver.ik_fun(target_pose, gripper=0)
+                        if success:
+                            joints = [q * 1000 / DEG_TO_RAD for q in sol_q[:6]]  # Convert back to 0.001deg
+                    except Exception as e:
+                        self.get_logger().warn(f'IK computation failed: {e}')
+
+            joints_rad = [j * DEG_TO_RAD for j in joints]
 
             gripper_m = gripper_mm / 1000.0
             joint_7 = gripper_m

@@ -16,7 +16,7 @@ def compute_approach_pose(
     target_position: Point,
     robot_position: Point,
     approach_distance: float = 0.45,
-    robot_front_offset: float = 0.434,
+    robot_front_offset: float = 0.5,
     frame_id: str = "map"
 ) -> Optional[PoseStamped]:
     """计算接近位姿
@@ -28,7 +28,7 @@ def compute_approach_pose(
         target_position: 目标位置 (map 坐标系)
         robot_position: 机器人当前位置 (map 坐标系)
         approach_distance: 接近点到目标的距离 (米)，默认 0.45m
-        robot_front_offset: base_link 到机器人前边缘距离 (米)，默认 0.434m (相机0.394m + 4cm余量)
+        robot_front_offset: base_link 到机器人前边缘距离 (米)，默认 0.5m
         frame_id: 输出位姿的坐标系，默认 "map"
 
     Returns:
