@@ -19,7 +19,11 @@
 
 ## 演示
 
+<div align="center">
+
 ![演示](demo/robot_grasp_anni.gif)
+
+</div>
 
 | 机器人模型（URDF） | 系统启动 |
 |---|---|

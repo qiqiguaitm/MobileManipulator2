@@ -20,7 +20,11 @@
 
 ## Demo
 
+<div align="center">
+
 ![Demo](demo/robot_grasp_anni.gif)
+
+</div>
 
 | Robot Model (URDF) | System Startup |
 |---|---|
