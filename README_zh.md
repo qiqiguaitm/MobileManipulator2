@@ -23,11 +23,11 @@
 
 | 机器人模型（URDF） | 系统启动 |
 |---|---|
-| ![机器人 URDF](demo/robot_urdf.png) | ![系统启动](demo/robot_start.png) |
+| ![机器人 URDF](demo/robot_urdf.jpg) | ![系统启动](demo/robot_start.jpg) |
 
 | 绕障导航 | 抓取操作 |
 |---|---|
-| ![绕障](demo/robot_bypass_obstacles.png) | ![抓取](demo/robot_grasp.png) |
+| ![绕障](demo/robot_bypass_obstacles.jpg) | ![抓取](demo/robot_grasp.jpg) |
 
 ---
 

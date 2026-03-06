@@ -24,11 +24,11 @@
 
 | Robot Model (URDF) | System Startup |
 |---|---|
-| ![Robot URDF](demo/robot_urdf.png) | ![Robot Start](demo/robot_start.png) |
+| ![Robot URDF](demo/robot_urdf.jpg) | ![Robot Start](demo/robot_start.jpg) |
 
 | Obstacle Avoidance | Grasping |
 |---|---|
-| ![Bypass Obstacles](demo/robot_bypass_obstacles.png) | ![Grasp](demo/robot_grasp.png) |
+| ![Bypass Obstacles](demo/robot_bypass_obstacles.jpg) | ![Grasp](demo/robot_grasp.jpg) |
 
 ---
 
