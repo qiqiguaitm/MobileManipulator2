@@ -21,7 +21,9 @@
 
 <div align="center">
 
-![演示](demo/robot_grasp_anni.gif)
+| 抓取演示 | 完整系统演示 |
+|:---:|:---:|
+| ![抓取演示](demo/robot_grasp_anni.gif) | ![完整演示](demo/robot_demo_show.gif) |
 
 </div>
 

@@ -22,7 +22,9 @@
 
 <div align="center">
 
-![Demo](demo/robot_grasp_anni.gif)
+| Grasping Demo | Full System Demo |
+|:---:|:---:|
+| ![Grasping](demo/robot_grasp_anni.gif) | ![Full Demo](demo/robot_demo_show.gif) |
 
 </div>
 
