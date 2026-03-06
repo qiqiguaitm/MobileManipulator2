@@ -17,6 +17,20 @@
 
 ---
 
+## 演示
+
+<video src="demo/robot_grasp_anni.mp4" controls width="100%"></video>
+
+| 机器人模型（URDF） | 系统启动 |
+|---|---|
+| ![机器人 URDF](demo/robot_urdf.png) | ![系统启动](demo/robot_start.png) |
+
+| 绕障导航 | 抓取操作 |
+|---|---|
+| ![绕障](demo/robot_bypass_obstacles.png) | ![抓取](demo/robot_grasp.png) |
+
+---
+
 ## 系统简介
 
 MobileManipulator2 是面向非结构化室内环境的完整自主拣取系统。差速移动底盘搭载六自由度机械臂，结合多模态传感器与分层软件栈，能够根据自然语言提示自主检测、导航、接近并抓取目标物体。

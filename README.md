@@ -18,6 +18,20 @@
 
 ---
 
+## Demo
+
+<video src="demo/robot_grasp_anni.mp4" controls width="100%"></video>
+
+| Robot Model (URDF) | System Startup |
+|---|---|
+| ![Robot URDF](demo/robot_urdf.png) | ![Robot Start](demo/robot_start.png) |
+
+| Obstacle Avoidance | Grasping |
+|---|---|
+| ![Bypass Obstacles](demo/robot_bypass_obstacles.png) | ![Grasp](demo/robot_grasp.png) |
+
+---
+
 ## Overview
 
 MobileManipulator2 is a complete autonomous pick-and-place system designed for unstructured indoor environments. It combines a differential-drive mobile base with a 6-DOF robotic arm, multi-modal sensors, and a layered software stack to autonomously detect, navigate to, and grasp target objects specified by natural language prompts.
