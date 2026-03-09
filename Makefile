@@ -10,6 +10,7 @@ FASTDDS_PROFILE := $(WS_DIR)/config/fastdds_profile.xml
 # ROS_SETUP: 如果 FastDDS 配置存在则使用，否则跳过
 ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
 	(test -f $(FASTDDS_PROFILE) && export FASTRTPS_DEFAULT_PROFILES_FILE=$(FASTDDS_PROFILE) || true) && \
+	export DISPLAY=$${DISPLAY:-:1001} && \
 	source /opt/ros/humble/setup.bash && \
 	source $(WS_DIR)/install/setup.bash
 
@@ -17,11 +18,11 @@ ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
         navigation navi nav navi-fusion nav-fusion navi-approach \
         percept-nav \
         cleaner-manager cleaner-manager-no-rviz cleaner-manager-node \
-        full-manual \
+        full-manual manual-control rviz \
         build build-all build-drivers build-slam build-nav build-perception build-cleaner-manager \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
-        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-full-sam3-stereo-hand percept-full-sam3-stereo-hand-nocdm percept-stop \
+        percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-full-sam3-nocdm percept-full-sam3-no-rviz percept-full-sam3-stereo-hand percept-full-sam3-stereo-hand-nocdm percept-stop \
         status stop clean kill-ros health
 
 help:
@@ -43,7 +44,8 @@ help:
 	@echo "  make percept-3d-rviz  - 3D感知 + RViz"
 	@echo "  make percept-multi-rviz - 双相机感知 + RViz"
 	@echo "  make percept-full     - 一键启动 (相机+感知+RViz, DINOX)"
-	@echo "  make percept-full-sam3- 一键启动 (相机+感知+RViz, SAM3)"
+	@echo "  make percept-full-sam3        - 一键启动 (相机+感知+RViz, SAM3)"
+	@echo "  make percept-full-sam3-no-rviz- 一键启动 (相机+感知, SAM3, 无RViz)"
 	@echo "  make percept-check    - 检查感知依赖"
 	@echo "  make percept-stop     - 停止感知节点"
 	@echo ""
@@ -61,7 +63,9 @@ help:
 	@echo "  make cleaner-manager         - 全系统启动 (导航+相机+机械臂+感知+管理+RViz)"
 	@echo "  make cleaner-manager-no-rviz - 全系统启动 (无RViz)"
 	@echo "  make cleaner-manager-node    - 仅启动管理节点 (需其他模块已运行)"
-	@echo "  make full-manual            - 感知导航抓取全流程 (仿ROS1 start_amr.sh full)"
+	@echo "  make full-manual            - 手动控制全流程 (导航+相机+感知+机械臂+GUI面板)"
+	@echo "  make manual-control         - 仅启动手动控制节点+面板 (需其他模块已运行)"
+	@echo "  make rviz                   - 单独启动 RViz (手动控制配置)"
 	@echo "  make build-cleaner-manager  - 构建 cleaner_manager 包"
 	@echo ""
 	@echo "构建命令:"
@@ -183,16 +187,29 @@ build-cleaner-manager:
 	@cd $(WS_DIR) && $(ROS_SETUP) && colcon build --packages-select cleaner_manager
 	@echo "[OK] cleaner_manager 构建完成"
 
-# 全手动模式: 感知 + 导航 + 抓取全流程 (仿 ROS1 start_amr.sh full)
+# 单独启动 RViz (手动控制配置) — 先开 RViz 再跑 full-manual
+rviz:
+	@echo "[RVIZ] 启动 RViz (cleaner_manager 配置)..."
+	@DISPLAY=$${DISPLAY:-:1001} xhost +local: 2>/dev/null || true
+	@$(ROS_SETUP) && DISPLAY=$${DISPLAY:-:1001} rviz2 -d \
+		$$(ros2 pkg prefix cleaner_manager)/share/cleaner_manager/config/cleaner_manager.rviz
+
+# 全手动模式: 感知 + 导航 + 抓取全流程 (手动控制面板)
 full-manual:
-	@echo "[FULL-MANUAL] 启动全流程 (导航+相机+感知+机械臂+抓取)..."
-	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
-		rviz:=true \
+	@echo "[FULL-MANUAL] 启动手动控制全流程 (导航+相机+感知+机械臂+手动控制面板)..."
+	@DISPLAY=$${DISPLAY:-:1001} xhost +local: 2>/dev/null || true
+	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control_full.launch.py \
+		rviz:=true gui:=true \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
 		detector_type:=sam3 \
 		extrinsics_suffix:=_stereo_hand \
 		enable_depth_optimizer:=true
+
+# 仅手动控制节点+Panel (需其他模块已运行)
+manual-control:
+	@echo "[MANUAL-CONTROL] 启动手动控制节点+面板..."
+	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control.launch.py
 
 # ============================================
 # 构建命令
@@ -438,9 +455,17 @@ percept-multi-rviz:
 percept-full:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz
 
-# 一键启动 - 使用 SAM3 检测器, CDM已禁用
+# 一键启动 - 使用 SAM3 检测器
 percept-full-sam3:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3
+
+# 同上，临时禁用 CDM（调试用）
+percept-full-sam3-nocdm:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --no-cdm
+
+# 一键启动 - SAM3, 无RViz
+percept-full-sam3-no-rviz:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --detector=sam3
 
 # 一键启动 - 使用新标定外参（测试用）
 percept-full-new:
