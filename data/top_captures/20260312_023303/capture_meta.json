@@ -1,0 +1,17 @@
+{
+  "capture_time": "2026-03-12T02:33:03.409600+00:00",
+  "device": {
+    "name": "Intel RealSense D455",
+    "serial_number": "318122302992",
+    "firmware_version": "5.17.0.10",
+    "usb_type_descriptor": "3.2",
+    "product_id": "0B5C"
+  },
+  "settings": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "warmup_frames": 30,
+    "mode": "batch"
+  }
+}

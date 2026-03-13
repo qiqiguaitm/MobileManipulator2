@@ -1,0 +1,44 @@
+camera_id: top_d455
+baseline: 0.0951
+default_resolution: 1280x720
+profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 644.701
+  fy: 643.789
+  cx: 640.302
+  cy: 364.987
+  distortion:
+  - -0.0555
+  - 0.0642
+  - -0.0004
+  - 0.0003
+ir_profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 648.055
+  fy: 648.055
+  cx: 646.892
+  cy: 357.656
+  distortion:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+ir_to_color_extrinsics:
+  rotation:
+  - 0.999994
+  - -0.001381
+  - -0.003238
+  - 0.001374
+  - 0.999997
+  - -0.00201
+  - 0.00324
+  - 0.002006
+  - 0.999993
+  translation:
+  - -0.059183
+  - 5.3e-05
+  - 0.000475

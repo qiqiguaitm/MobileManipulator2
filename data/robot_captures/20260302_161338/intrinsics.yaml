@@ -1,0 +1,44 @@
+camera_id: hand_d435
+baseline: 0.0499
+default_resolution: 1280x720
+profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 910.397
+  fy: 909.553
+  cx: 653.398
+  cy: 380.516
+  distortion:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+ir_profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 648.629
+  fy: 648.629
+  cx: 633.741
+  cy: 363.355
+  distortion:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+ir_to_color_extrinsics:
+  rotation:
+  - 0.999998
+  - 0.002213
+  - -6.2e-05
+  - -0.002212
+  - 0.999994
+  - 0.002682
+  - 6.8e-05
+  - -0.002682
+  - 0.999996
+  translation:
+  - 0.014979
+  - 0.000198
+  - 7.3e-05

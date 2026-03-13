@@ -1,0 +1,75 @@
+{
+  "firmware_version": "S-V1.8-2",
+  "can_port": "can0",
+  "timestamp": 1772439431.239542,
+  "current_joint_positions_rad": [
+    -0.069516,
+    1.52828,
+    -1.510041,
+    -0.012758,
+    1.112403,
+    0.217049
+  ],
+  "joints": {
+    "joint1": {
+      "max_angle_limit_deg": 150.0,
+      "min_angle_limit_deg": -150.0,
+      "max_angle_limit_rad": 2.617994,
+      "min_angle_limit_rad": -2.617994,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    },
+    "joint2": {
+      "max_angle_limit_deg": 180.0,
+      "min_angle_limit_deg": 0.0,
+      "max_angle_limit_rad": 3.141593,
+      "min_angle_limit_rad": 0.0,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    },
+    "joint3": {
+      "max_angle_limit_deg": 0.0,
+      "min_angle_limit_deg": -170.0,
+      "max_angle_limit_rad": 0.0,
+      "min_angle_limit_rad": -2.96706,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    },
+    "joint4": {
+      "max_angle_limit_deg": 100.0,
+      "min_angle_limit_deg": -100.0,
+      "max_angle_limit_rad": 1.745329,
+      "min_angle_limit_rad": -1.745329,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    },
+    "joint5": {
+      "max_angle_limit_deg": 70.0,
+      "min_angle_limit_deg": -70.0,
+      "max_angle_limit_rad": 1.22173,
+      "min_angle_limit_rad": -1.22173,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    },
+    "joint6": {
+      "max_angle_limit_deg": 180.0,
+      "min_angle_limit_deg": -180.0,
+      "max_angle_limit_rad": 3.141593,
+      "min_angle_limit_rad": -3.141593,
+      "max_speed_rad_s": 0.3,
+      "max_acceleration_rad_s2": 0.5,
+      "collision_protection_level": 0
+    }
+  },
+  "end_effector": {
+    "max_linear_vel_m_s": 1.0,
+    "max_angular_vel_rad_s": 0.25,
+    "max_linear_acc_m_s2": 1.5,
+    "max_angular_acc_rad_s2": 0.3
+  }
+}

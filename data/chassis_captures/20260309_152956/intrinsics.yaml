@@ -1,0 +1,44 @@
+camera_id: chassis_d435
+baseline: 0.05
+default_resolution: 1280x720
+profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 904.881
+  fy: 904.402
+  cx: 653.797
+  cy: 371.753
+  distortion:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+ir_profiles:
+- resolution: 1280x720
+  image_width: 1280
+  image_height: 720
+  fx: 652.055
+  fy: 652.055
+  cx: 638.453
+  cy: 367.468
+  distortion:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+ir_to_color_extrinsics:
+  rotation:
+  - 0.999922
+  - -0.01248
+  - 0.000661
+  - 0.012475
+  - 0.999891
+  - 0.00792
+  - -0.00076
+  - -0.007911
+  - 0.999968
+  translation:
+  - 0.014811
+  - -5.4e-05
+  - 0.000256

@@ -1,0 +1,17 @@
+{
+  "capture_time": "2026-03-09T07:30:05.931905+00:00",
+  "device": {
+    "name": "Intel RealSense D435",
+    "serial_number": "337122071540",
+    "firmware_version": "5.15.0.2",
+    "usb_type_descriptor": "3.2",
+    "product_id": "0B07"
+  },
+  "settings": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "warmup_frames": 30,
+    "mode": "batch"
+  }
+}

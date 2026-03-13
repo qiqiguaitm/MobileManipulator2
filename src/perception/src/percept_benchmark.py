@@ -1377,10 +1377,10 @@ def main():
                        help='SAM3 service URL (default: http://192.168.112.14:8081)')
     parser.add_argument('--fs-url', type=str, default='http://192.168.112.14:8084',
                        help='FoundationStereo service URL (default: http://192.168.112.14:8084)')
-    parser.add_argument('--top-dir', type=str, default='/home/didi/capture/output_top',
+    parser.add_argument('--top-dir', type=str, default='/home/didi/workspace/MobileManipulator2/data/top_captures/20260312_023303',
                        help='Top camera capture directory')
     parser.add_argument('--chassis-dir', type=str,
-                       default='/home/didi/capture/data/chassis_captures/20260309_152956',
+                       default='/home/didi/workspace/MobileManipulator2/data/chassis_captures/20260309_152956',
                        help='Chassis camera capture directory')
     parser.add_argument('--text-prompt', type=str, default='pen,box,phone,bottle,toy',
                        help='SAM3 text prompt for parallel mode')
