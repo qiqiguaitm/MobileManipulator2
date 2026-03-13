@@ -1,32 +1,30 @@
 """
 PickStateMachine — blocking state machine for autonomous pick-and-place.
 
+Flow: PLANNING → NAVIGATING → PICKING (展臂→observe→pick→place→收臂) → PLANNING
+
 Runs in a dedicated daemon thread. Communicates with ROS2 services/actions
 via call_async() + polling (never spin_until_future_complete).
 """
 
 import time
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional
+from typing import Optional
 
 from geometry_msgs.msg import Point
-from piper_msgs.srv import Observe, GoReady, InWorkingArea
+from piper_msgs.srv import Observe, GoReady, GoZero
 from piper_msgs.action import PiperPick, PiperPlace
 
 
 class PickState(IntEnum):
     IDLE = 0
     PLANNING = 1
-    STOWING = 2
-    NAVIGATING = 3
-    DEPLOYING = 4
-    SCANNING = 5
-    PICKING = 6
-    PLACING = 7
-    ERROR = 8
-    COMPLETED = 9
+    NAVIGATING = 2
+    PICKING = 3       # 展臂 → observe → pick → place → 收臂
+    ERROR = 4
+    COMPLETED = 5
 
 
 PICK_STATE_NAMES = {s: s.name for s in PickState}
@@ -35,11 +33,9 @@ PICK_STATE_NAMES = {s: s.name for s in PickState}
 @dataclass
 class PickConfig:
     max_picks_per_nav: int = 10
-    scan_stable_frames: int = 3
-    scan_stable_timeout: float = 3.0
     pick_speed: int = 30
     lift_height: float = 200.0
-    observe_prompt: str = "bottle.cup.box"
+    observe_prompt: str = ""  # empty = use piper_grasp_node default_prompt
     observe_timeout: float = 10.0
     pick_timeout: float = 60.0
     place_timeout: float = 30.0
@@ -47,14 +43,13 @@ class PickConfig:
     max_consecutive_failures: int = 3
     error_cooldown: float = 5.0
     max_error_retries: int = 3
+    wait_for_first_target_timeout: float = 15.0
 
 
 @dataclass
 class PickContext:
     """Mutable context shared across state handlers."""
     current_target: object = None           # TargetRecord
-    workspace_targets: List = field(default_factory=list)
-    workspace_idx: int = 0
     consecutive_nav_failures: int = 0
     consecutive_pick_failures: int = 0
     error_retries: int = 0
@@ -70,7 +65,7 @@ class PickStateMachine:
     def __init__(self, node, pool, navigator, config: PickConfig):
         """
         Args:
-            node: RobotManagerNode (provides clients, logger, TF, get_robot_pos)
+            node: CleanerManagerNode (provides clients, logger, TF, get_robot_pos)
             pool: TargetPool
             navigator: ApproachNavigator
             config: PickConfig
@@ -87,12 +82,8 @@ class PickStateMachine:
 
         self._handlers = {
             PickState.PLANNING:   self._do_planning,
-            PickState.STOWING:    self._do_stowing,
             PickState.NAVIGATING: self._do_navigating,
-            PickState.DEPLOYING:  self._do_deploying,
-            PickState.SCANNING:   self._do_scanning,
             PickState.PICKING:    self._do_picking,
-            PickState.PLACING:    self._do_placing,
             PickState.ERROR:      self._do_error,
         }
 
@@ -151,28 +142,58 @@ class PickStateMachine:
     # ------------------------------------------------------------------
 
     def _do_planning(self, abort_event) -> PickState:
-        robot_pos = self._node.get_robot_pos_map()
+        # TF 在导航刚结束后可能短暂中断，重试最多 3s
+        robot_pos = None
+        for _ in range(6):
+            robot_pos = self._node.get_robot_pos_map()
+            if robot_pos is not None:
+                break
+            if abort_event.is_set():
+                return PickState.IDLE
+            time.sleep(0.5)
         if robot_pos is None:
             self._ctx.error_message = "Cannot get robot position"
             return PickState.ERROR
 
         target = self._pool.get_nav_target(robot_pos)
         if target is None:
+            stats = self._pool.stats
+            if stats['active'] > 0 or stats['total'] == 0:
+                self._log.info("No qualified target yet — waiting for perception...")
+                if not self._wait_for_first_target(abort_event):
+                    return PickState.COMPLETED
+                return PickState.PLANNING
             self._log.info("No more targets — done")
             return PickState.COMPLETED
 
         self._ctx.current_target = target
-        self._ctx.workspace_targets = []
-        self._ctx.workspace_idx = 0
         self._log.info(f"Next target: {target.category} @ ({target.position_map.x:.2f}, {target.position_map.y:.2f})")
-        return PickState.STOWING
 
-    def _do_stowing(self, abort_event) -> PickState:
+        # 导航前收臂
         ok = self._safe_stow(abort_event)
         if not ok:
             self._ctx.error_message = "Stow failed"
             return PickState.ERROR
         return PickState.NAVIGATING
+
+    def _wait_for_first_target(self, abort_event) -> bool:
+        """Block until get_nav_target returns a qualified target or timeout."""
+        deadline = time.time() + self._cfg.wait_for_first_target_timeout
+        last_diag = 0.0
+        while time.time() < deadline and not abort_event.is_set():
+            robot_pos = self._node.get_robot_pos_map()
+            if robot_pos is not None and self._pool.get_nav_target(robot_pos) is not None:
+                return True
+            now = time.time()
+            if now - last_diag >= 3.0:
+                diag = self._pool.get_filter_diagnostics(robot_pos)
+                self._log.info(f"等待目标: {diag}")
+                last_diag = now
+            time.sleep(0.5)
+        diag = self._pool.get_filter_diagnostics(
+            self._node.get_robot_pos_map())
+        self._log.warn(f"等待目标超时! {diag}")
+        return False
 
     def _do_navigating(self, abort_event) -> PickState:
         target = self._ctx.current_target
@@ -192,7 +213,8 @@ class PickStateMachine:
 
         if result.success:
             self._ctx.consecutive_nav_failures = 0
-            return PickState.DEPLOYING
+            self._ctx.consecutive_pick_failures = 0
+            return PickState.PICKING
 
         self._log.warn(f"Nav failed: {result.error_message}")
         self._ctx.consecutive_nav_failures += 1
@@ -205,102 +227,97 @@ class PickStateMachine:
         self._pool.mark_failed(target.position_map, f"nav: {result.error_message}")
         return PickState.PLANNING
 
-    def _do_deploying(self, abort_event) -> PickState:
-        ok = self._call_go_ready(self._cfg.pick_speed, open_gripper=True, abort_event=abort_event)
+    def _do_picking(self, abort_event) -> PickState:
+        """完整抓取流程：展臂 → (observe → pick → place)* → 收臂"""
+        target = self._ctx.current_target
+
+        # --- 1. 展臂 ---
+        self._nav._stop_robot()
+        self._log.info("展臂...")
+        time.sleep(0.5)
+        if abort_event.is_set():
+            return PickState.IDLE
+
+        ok = self._call_go_ready(self._cfg.pick_speed, open_gripper=True,
+                                 abort_event=abort_event)
         if not ok:
             self._ctx.error_message = "Deploy (go_ready) failed"
             return PickState.ERROR
-        return PickState.SCANNING
 
-    def _do_scanning(self, abort_event) -> PickState:
         self._pool.resume()
-        self._wait_perception_stable(abort_event)
-        if abort_event.is_set():
-            return PickState.IDLE
 
-        robot_pos = self._node.get_robot_pos_map()
-        if robot_pos is None:
-            self._ctx.error_message = "Cannot get robot position during scan"
-            return PickState.ERROR
+        # --- 2. observe → pick → place 循环 ---
+        picks_done = 0
+        gripper_holding = False  # 安全标志：pick成功后置True，place成功后置False
+        while picks_done < self._cfg.max_picks_per_nav and not abort_event.is_set():
+            self._log.info(f"Observe [{picks_done + 1}]: 手部相机检测...")
+            observe_ok = self._call_observe(self._cfg.observe_prompt, abort_event)
+            if abort_event.is_set():
+                break
 
-        targets = self._pool.get_workspace_targets(
-            in_working_area_fn=self._check_in_working_area,
-            robot_pos_map=robot_pos,
-        )
+            if not observe_ok:
+                if picks_done == 0:
+                    self._log.warn("手部相机未检测到可抓取物体")
+                    if target is not None:
+                        self._pool.mark_failed(target.position_map, "no graspable object")
+                    self._ctx.consecutive_pick_failures += 1
+                else:
+                    self._log.info(f"已抓取 {picks_done} 个，无更多目标")
+                    if target is not None:
+                        self._pool.mark_picked(target.position_map)
+                break
 
-        if not targets:
-            self._log.info("No targets in workspace — replan")
-            return PickState.PLANNING
+            # Pick
+            t0 = time.time()
+            pick_ok = self._call_pick(abort_event)
+            self._ctx.last_pick_time_ms = (time.time() - t0) * 1000.0
+            if abort_event.is_set():
+                break
 
-        self._ctx.workspace_targets = targets[:self._cfg.max_picks_per_nav]
-        self._ctx.workspace_idx = 0
-        self._log.info(f"Found {len(self._ctx.workspace_targets)} workspace targets")
-        return PickState.PICKING
+            if not pick_ok:
+                self._log.warn("Pick failed")
+                self._ctx.consecutive_pick_failures += 1
+                if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
+                    break
+                continue  # 重试 observe
 
-    def _do_picking(self, abort_event) -> PickState:
-        targets = self._ctx.workspace_targets
-        idx = self._ctx.workspace_idx
-
-        if idx >= len(targets):
-            self._log.info("Workspace queue exhausted — replan")
-            return PickState.PLANNING
-
-        target = targets[idx]
-        self._ctx.current_target = target
-        self._log.info(f"Picking [{idx+1}/{len(targets)}]: {target.category}")
-
-        # Observe
-        observe_ok = self._call_observe(self._cfg.observe_prompt, abort_event)
-        if abort_event.is_set():
-            return PickState.IDLE
-        if not observe_ok:
-            self._log.warn("Observe failed — skip target")
-            self._pool.mark_failed(target.position_map, "observe failed")
-            self._ctx.workspace_idx += 1
-            self._ctx.consecutive_pick_failures += 1
-            if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
-                self._ctx.error_message = "Pick failed consecutively"
-                return PickState.ERROR
-            return PickState.PICKING
-
-        # Pick
-        t0 = time.time()
-        pick_ok = self._call_pick(abort_event)
-        self._ctx.last_pick_time_ms = (time.time() - t0) * 1000.0
-        if abort_event.is_set():
-            return PickState.IDLE
-
-        if pick_ok:
             self._ctx.consecutive_pick_failures = 0
-            return PickState.PLACING
+            gripper_holding = True  # pick成功，夹爪夹住物体
 
-        self._log.warn("Pick failed — skip target")
-        self._pool.mark_failed(target.position_map, "pick failed")
-        self._ctx.workspace_idx += 1
-        self._ctx.consecutive_pick_failures += 1
+            # Place — return_to_ready=False，由我们显式控制后续姿态
+            place_ok = self._call_place(abort_event)
+            if abort_event.is_set():
+                break
+            if not place_ok:
+                self._log.error("Place failed")
+
+            # Place 后显式回 ready 位置（开爪），确保手部相机能继续检测
+            if not self._call_go_ready(self._cfg.pick_speed, open_gripper=True,
+                                       abort_event=abort_event) or abort_event.is_set():
+                break
+
+            gripper_holding = False  # 已开爪
+            picks_done += 1
+
+        # --- 3. 收臂 ---
+        # 安全检查：若夹爪仍夹持物体，先强制展臂开爪再收臂
+        if gripper_holding:
+            self._log.error("Safety: 夹爪仍持有物体！强制开爪后再收臂...")
+            self._call_go_ready(self._cfg.pick_speed, open_gripper=True, abort_event=abort_event)
+            time.sleep(0.3)
+
+        self._log.info("收臂...")
+        self._safe_stow(abort_event)
+
+        if abort_event.is_set():
+            return PickState.IDLE
         if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
             self._ctx.error_message = "Pick failed consecutively"
             return PickState.ERROR
-        return PickState.PICKING
-
-    def _do_placing(self, abort_event) -> PickState:
-        place_ok = self._call_place(abort_event)
-        if abort_event.is_set():
-            return PickState.IDLE
-
-        target = self._ctx.current_target
-        if place_ok:
-            self._pool.mark_picked(target.position_map)
-        else:
-            self._log.warn("Place failed — mark as failed")
-            self._pool.mark_failed(target.position_map, "place failed")
-
-        self._ctx.workspace_idx += 1
-        if self._ctx.workspace_idx < len(self._ctx.workspace_targets):
-            return PickState.PICKING
         return PickState.PLANNING
 
     def _do_error(self, abort_event) -> PickState:
+        self._pool.resume()
         self._log.error(f"ERROR: {self._ctx.error_message}")
         self._ctx.error_retries += 1
         if self._ctx.error_retries >= self._cfg.max_error_retries:
@@ -332,7 +349,8 @@ class PickStateMachine:
         return future.result()
 
     def _safe_stow(self, abort_event) -> bool:
-        return self._call_go_ready(self._cfg.pick_speed, open_gripper=False, abort_event=abort_event)
+        """收臂归零 — 用 go_zero 而非 go_ready (go_ready = 展臂)"""
+        return self._call_go_zero(abort_event)
 
     def _call_go_ready(self, speed: int, open_gripper: bool, abort_event) -> bool:
         client = self._node.go_ready_client
@@ -347,6 +365,20 @@ class PickStateMachine:
         if not resp.success:
             self._log.warn(f"go_ready failed: {resp.message}")
         return resp.success
+
+    def _call_go_zero(self, abort_event) -> bool:
+        """收臂到零位 (安全导航姿态)"""
+        client = self._node.go_zero_client
+        req = GoZero.Request()
+        req.is_mit_mode = False
+
+        future = client.call_async(req)
+        resp = self._wait_future(future, 30.0, abort_event)
+        if resp is None:
+            return False
+        if not resp.status:
+            self._log.warn(f"go_zero failed: code={resp.code}")
+        return resp.status
 
     def _call_observe(self, prompt: str, abort_event) -> bool:
         client = self._node.observe_client
@@ -389,7 +421,7 @@ class PickStateMachine:
         goal = PiperPlace.Goal()
         goal.use_default_place = True
         goal.speed = self._cfg.pick_speed
-        goal.return_to_ready = True
+        goal.return_to_ready = False  # 由循环显式调 go_ready 控制后续姿态
 
         send_future = client.send_goal_async(goal)
         goal_handle = self._wait_future(send_future, 10.0, abort_event)
@@ -413,56 +445,3 @@ class PickStateMachine:
             except Exception:
                 pass
             self._ctx.active_goal_handle = None
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _check_in_working_area(self, pos_map: Point) -> bool:
-        """Check if a map-frame position is in Piper working area.
-        This is the ONLY m->mm conversion point.
-        """
-        # Transform map -> base_link first
-        try:
-            tf = self._node.tf_buffer.lookup_transform(
-                'base_link', 'map',
-                self._node.get_clock().now().to_msg(),
-                timeout=None
-            )
-        except Exception:
-            return False
-
-        from cleaner_manager.target_pool import _transform_point
-        pos_base = _transform_point(pos_map, tf)
-
-        client = self._node.in_working_area_client
-        req = InWorkingArea.Request()
-        req.point_in_base = [pos_base.x * 1000.0, pos_base.y * 1000.0, pos_base.z * 1000.0]
-        req.yaw = float('nan')
-        req.offset = []
-        req.point3d_cam = []
-        req.end_pose = []
-
-        future = client.call_async(req)
-        resp = self._wait_future(future, 5.0, None)
-        if resp is None:
-            return False
-        return resp.in_area
-
-    def _wait_perception_stable(self, abort_event):
-        """Wait until tracked object count stabilizes."""
-        stable_count = 0
-        last_count = -1
-        deadline = time.time() + self._cfg.scan_stable_timeout
-
-        while time.time() < deadline and not abort_event.is_set():
-            current = self._pool.get_active_count()
-            if current == last_count:
-                stable_count += 1
-            else:
-                stable_count = 0
-            last_count = current
-
-            if stable_count >= self._cfg.scan_stable_frames:
-                return
-            time.sleep(0.3)

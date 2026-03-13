@@ -24,6 +24,7 @@ from typing import Optional, Dict, Any, List
 import cv2
 import numpy as np
 import requests
+import yaml
 from PIL import Image
 from pycocotools import mask as coco_mask
 
@@ -708,6 +709,11 @@ class DepthOptimizerOnline:
         self.session.trust_env = False
         self.session.proxies = {'http': None, 'https': None}
 
+        # FoundationStereo 配置
+        self.fs_url = getattr(cfg, 'fs_url', 'http://192.168.112.14:8084')
+        self.fs_api_url = f'{self.fs_url}/api/predict'
+        self.fs_vis_url = f'{self.fs_url}/api/predict_vis'
+
         warmup_runs = getattr(cfg, 'warmup', 0)
         if warmup_runs > 0:
             self._warmup(warmup_runs)
@@ -959,6 +965,144 @@ class DepthOptimizerOnline:
     def get_visualization(self, rgb, depth, **kwargs) -> Optional[np.ndarray]:
         """便捷接口：仅返回可视化图像"""
         result = self.forward(rgb, depth, chosen_policy='vis', **kwargs)
+        if result.get('success') and 'vis_image' in result:
+            return result['vis_image']
+        return None
+
+    def forward_stereo(self, ir_left, ir_right, intrinsics,
+                       rgb=None, raw_depth=None,
+                       get_vis=False, _timing=None) -> Dict:
+        """被动双目深度估计（FoundationStereo）
+
+        Args:
+            ir_left: 左目 IR 灰度图（numpy array / 文件路径 str / bytes）
+            ir_right: 右目 IR 灰度图（numpy array / 文件路径 str / bytes）
+            intrinsics: 相机内参（文件路径 str / dict / bytes）
+            rgb: 可选 RGB 图像（numpy array / 文件路径 str / bytes）
+            raw_depth: 可选原始深度图（numpy array / 文件路径 str / bytes）
+            get_vis: 是否同时获取可视化图像
+            _timing: 可选，用于记录内部耗时
+
+        Returns:
+            dict: {'success': True, 'depth': np.ndarray(uint16), 'mode': 'foundation_stereo', ...}
+                  或 {'success': False, 'error': str}
+        """
+        t0 = time.time()
+
+        def _encode_ir(img):
+            if isinstance(img, str):
+                img = cv2.imread(img, cv2.IMREAD_UNCHANGED)
+            elif isinstance(img, bytes):
+                img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            _, buf = cv2.imencode('.png', img)
+            return buf.tobytes()
+
+        def _encode_color(img):
+            if isinstance(img, str):
+                img = cv2.imread(img, cv2.IMREAD_COLOR)
+            elif isinstance(img, bytes):
+                img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_COLOR)
+            _, buf = cv2.imencode('.png', img)
+            return buf.tobytes()
+
+        def _encode_depth(img):
+            if isinstance(img, str):
+                img = cv2.imread(img, cv2.IMREAD_UNCHANGED)
+            elif isinstance(img, bytes):
+                img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            _, buf = cv2.imencode('.png', img)
+            return buf.tobytes()
+
+        def _encode_intrinsics(intr):
+            if isinstance(intr, str):
+                with open(intr, 'rb') as f:
+                    return f.read()
+            elif isinstance(intr, dict):
+                return yaml.dump(intr).encode()
+            elif isinstance(intr, bytes):
+                return intr
+            raise TypeError(f'Unsupported intrinsics type: {type(intr)}')
+
+        try:
+            ir_left_bytes = _encode_ir(ir_left)
+            ir_right_bytes = _encode_ir(ir_right)
+            intrinsics_bytes = _encode_intrinsics(intrinsics)
+
+            files = {
+                'left_ir':    ('left_ir.png',     ir_left_bytes,     'image/png'),
+                'right_ir':   ('right_ir.png',    ir_right_bytes,    'image/png'),
+                'intrinsics': ('intrinsics.yaml', intrinsics_bytes, 'application/octet-stream'),
+            }
+            if rgb is not None:
+                files['rgb'] = ('rgb.png', _encode_color(rgb), 'image/png')
+            if raw_depth is not None:
+                files['raw_depth'] = ('depth.png', _encode_depth(raw_depth), 'image/png')
+
+            t1 = time.time()
+
+            resp = self.session.post(self.fs_api_url, files=files, timeout=60)
+            resp.raise_for_status()
+
+            t2 = time.time()
+
+            depth_arr = cv2.imdecode(
+                np.frombuffer(resp.content, dtype=np.uint8),
+                cv2.IMREAD_UNCHANGED
+            )
+            if depth_arr is None:
+                return {'success': False, 'error': 'Failed to decode depth PNG from response'}
+
+            result = {
+                'success': True,
+                'depth': depth_arr,
+                'mode': 'foundation_stereo',
+                'elapsed_ms': (t2 - t1) * 1000,
+            }
+
+            if get_vis:
+                resp_vis = self.session.post(self.fs_vis_url, files=files, timeout=60)
+                resp_vis.raise_for_status()
+                vis_arr = cv2.imdecode(
+                    np.frombuffer(resp_vis.content, dtype=np.uint8),
+                    cv2.IMREAD_COLOR
+                )
+                if vis_arr is not None:
+                    result['vis_image'] = vis_arr
+
+            t3 = time.time()
+            if _timing is not None:
+                _timing['fs_encode'] = (t1 - t0) * 1000
+                _timing['fs_http'] = (t2 - t1) * 1000
+                _timing['fs_total'] = (t3 - t0) * 1000
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            # DEBUG: capture response body for 500 errors
+            _resp_body = ''
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    _resp_body = e.response.text[:500]
+                except Exception:
+                    pass
+            print(f'[DepthOptimizerOnline/FS] Request failed: {e}')
+            if _resp_body:
+                print(f'[DepthOptimizerOnline/FS] Response body: {_resp_body}')
+            return {'success': False, 'error': str(e)}
+        except Exception as e:
+            print(f'[DepthOptimizerOnline/FS] Error: {e}')
+            return {'success': False, 'error': str(e)}
+
+    def optimize_stereo_depth(self, ir_left, ir_right, intrinsics, **kwargs) -> Optional[np.ndarray]:
+        """便捷接口：仅返回立体匹配深度图，失败返回 None"""
+        result = self.forward_stereo(ir_left, ir_right, intrinsics, **kwargs)
+        if result.get('success') and 'depth' in result:
+            return result['depth']
+        return None
+
+    def get_stereo_visualization(self, ir_left, ir_right, intrinsics, **kwargs) -> Optional[np.ndarray]:
+        """便捷接口：仅返回可视化 BGR 图，失败返回 None"""
+        result = self.forward_stereo(ir_left, ir_right, intrinsics, get_vis=True, **kwargs)
         if result.get('success') and 'vis_image' in result:
             return result['vis_image']
         return None

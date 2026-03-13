@@ -10,9 +10,8 @@
 5. 调用 ApproachNavigator 执行三阶段导航
 
 Usage:
-    make percept-nav-test
-    make percept-nav-test ARGS="--prompt bottle"
-    make percept-nav-test ARGS="--auto"
+    python3 scripts/test_approach_nav.py
+    python3 scripts/test_approach_nav.py --auto
 """
 
 import sys
@@ -37,10 +36,9 @@ from approach_navigator.nav_types import NavStage
 class TestApproachNav(Node):
     """三阶段导航测试节点"""
 
-    def __init__(self, prompt: str = "bottle.cup.box", auto_select: bool = False):
+    def __init__(self, auto_select: bool = False):
         super().__init__('test_approach_nav')
 
-        self.prompt = prompt
         self.auto_select = auto_select
 
         # TF2 坐标变换
@@ -65,14 +63,7 @@ class TestApproachNav(Node):
     def _on_objects_received(self, msg: Object3DArray):
         """接收感知话题数据"""
         with self.objects_lock:
-            # 根据 prompt 过滤类别
-            prompt_parts = self.prompt.lower().split('.')
-            filtered_objects = []
-            for obj in msg.objects:
-                if obj.category.lower() in prompt_parts:
-                    filtered_objects.append(obj)
-
-            self.latest_objects = filtered_objects
+            self.latest_objects = list(msg.objects)
 
     def get_objects(self, timeout: float = 5.0) -> list:
         """获取当前检测到的物体
@@ -338,21 +329,8 @@ class TestApproachNav(Node):
                 else:
                     print("  当前障碍物距离: 无数据")
 
-                if not auto_select:
-                    navigator.depth_sensor.set_logging_enabled(False)
-                    confirm = input("确认执行阶段3 (精确接近)? (y/n): ").strip().lower()
-                    navigator.depth_sensor.set_logging_enabled(True)
-                    print("=" * 70)
-                    if confirm != 'y':
-                        print("取消阶段3，停止机器人")
-                        try:
-                            from geometry_msgs.msg import Twist
-                            navigator.cmd_vel_pub.publish(Twist())
-                        except Exception:
-                            pass
-                else:
-                    print("[自动模式] 继续执行阶段3...")
-                    print("=" * 70)
+                print("继续执行阶段3...")
+                print("=" * 70)
 
         # 执行导航
         result = navigator.approach_to_target(
@@ -380,8 +358,6 @@ class TestApproachNav(Node):
 
 def main():
     parser = argparse.ArgumentParser(description='三阶段导航测试')
-    parser.add_argument('--prompt', type=str, default='bottle.cup.box',
-                        help='检测提示词 (用.分隔多个类别)')
     parser.add_argument('--auto', action='store_true',
                         help='自动选择最近的物体')
     args = parser.parse_args()
@@ -390,10 +366,7 @@ def main():
 
     try:
         # 创建测试节点
-        node = TestApproachNav(
-            prompt=args.prompt,
-            auto_select=args.auto
-        )
+        node = TestApproachNav(auto_select=args.auto)
 
         # 等待 TF 可用
         print("等待 TF 变换可用...")
@@ -421,24 +394,8 @@ def main():
         print(f"\n选择目标: {target_obj.category}")
         print(f"map 位置: ({map_pos.x:.3f}, {map_pos.y:.3f}, {map_pos.z:.3f})")
 
-        # 确认并选择各阶段
-        skip_stages = set()
-        if not args.auto:
-            confirm = input("\n确认开始导航? (y/n): ").strip().lower()
-            if confirm != 'y':
-                print("取消导航")
-                return
-
-            print("\n阶段选择 (直接回车=执行, s=跳过):")
-            for num, name in [(1, "Nav2 全局导航"), (2, "精确对齐"), (3, "精确接近")]:
-                c = input(f"  阶段{num} [{name}]: ").strip().lower()
-                if c == 's':
-                    skip_stages.add(num)
-            if skip_stages:
-                print(f"将跳过阶段: {sorted(skip_stages)}")
-
         # 执行导航
-        node.run_navigation(target_obj, map_pos, auto_select=args.auto, skip_stages=skip_stages)
+        node.run_navigation(target_obj, map_pos, auto_select=args.auto)
 
     except KeyboardInterrupt:
         print("\n用户中断")

@@ -124,7 +124,7 @@ def generate_launch_description():
         description='Run demo client for single grasp'
     )
     demo_prompt_arg = DeclareLaunchArgument(
-        'demo_prompt', default_value='bottle.cup.pen',
+        'demo_prompt', default_value='bottle.cup.box.can.toy.pen.bag',
         description='Demo target object prompt'
     )
     demo_place_after_arg = DeclareLaunchArgument(

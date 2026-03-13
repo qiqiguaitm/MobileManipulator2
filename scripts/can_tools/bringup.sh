@@ -37,9 +37,11 @@ cleanup_can_interfaces() {
         sudo ip link delete "$iface" 2>/dev/null || true
     done
 
-    # 关闭现有的 can0 和 can1
+    # 关闭现有的 CAN 接口
     sudo ip link set can0 down 2>/dev/null || true
     sudo ip link set can1 down 2>/dev/null || true
+    sudo ip link set can2 down 2>/dev/null || true
+    sudo ip link set can3 down 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -53,10 +55,10 @@ configure_can_by_usb() {
 
     echo "配置 $TARGET_NAME (${BITRATE}bps) @ USB $USB_ADDR"
 
-    # 查找 USB 地址对应的接口
+    # 查找 USB 地址对应的接口 (ethtool 读取 bus-info 不需要 root)
     local FOUND_IFACE=""
     for iface in $(ip -br link show type can | awk '{print $1}'); do
-        local bus=$(sudo ethtool -i "$iface" 2>/dev/null | grep "bus-info" | awk '{print $2}')
+        local bus=$(ethtool -i "$iface" 2>/dev/null | grep "bus-info" | awk '{print $2}')
         if [ "$bus" == "$USB_ADDR" ]; then
             FOUND_IFACE="$iface"
             break
@@ -79,9 +81,9 @@ configure_can_by_usb() {
         return 0
     fi
 
-    # 如果目标名被占用，先把它改成临时名
+    # 如果目标名被占用，先把它改成临时名（不用 _ct 后缀，避免与内置 MTTCAN 冲突）
     if ip link show "$TARGET_NAME" &>/dev/null; then
-        local TEMP_NAME="${TARGET_NAME}_ct"
+        local TEMP_NAME="cantmp${RANDOM}"
         sudo ip link set "$TARGET_NAME" down
         sudo ip link set "$TARGET_NAME" name "$TEMP_NAME"
         echo "  将占用的 $TARGET_NAME 临时改名为 $TEMP_NAME"
@@ -116,20 +118,20 @@ elif [ "$MODE" == "manual" ]; then
     echo "----------------------------------------"
     echo ""
     echo "USB 地址映射 (硬编码):"
-    echo "  1-4.2:1.0 -> Piper 机械臂 (can0, 1000kbps)"
-    echo "  1-4.1:1.0 -> Tracer 底盘 (can1, 500kbps)"
+    echo "  1-4.2:1.0 -> Tracer 底盘 (can1, 500kbps)"
+    echo "  1-4.1:1.0 -> Piper 机械臂 (can0, 1000kbps)"
     echo ""
 
     # 清理残留接口
     cleanup_can_interfaces
 
-    # 配置 Piper 机械臂 (can0)
-    configure_can_by_usb "can0" "1000000" "1-4.2:1.0"
-    PIPER_OK=$?
-
     # 配置 Tracer 底盘 (can1)
-    configure_can_by_usb "can1" "500000" "1-4.1:1.0"
+    configure_can_by_usb "can1" "500000" "1-4.2:1.0"
     CHASSIS_OK=$?
+
+    # 配置 Piper 机械臂 (can0)
+    configure_can_by_usb "can0" "1000000" "1-4.1:1.0"
+    PIPER_OK=$?
 
     # 清理临时接口
     for iface in $(ip -br link show type can | awk '{print $1}' | grep '_ct$'); do

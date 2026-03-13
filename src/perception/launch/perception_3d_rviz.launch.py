@@ -61,7 +61,7 @@ def generate_launch_description():
         description='Auto detection rate in Hz (0=disable)'
     )
     enable_depth_optimizer_arg = DeclareLaunchArgument(
-        'enable_depth_optimizer', default_value='true',
+        'enable_depth_optimizer', default_value='false',
         description='Enable CDM depth optimization'
     )
 

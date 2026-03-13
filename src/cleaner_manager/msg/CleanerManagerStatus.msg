@@ -10,3 +10,4 @@ uint8 consecutive_failures
 float32 last_nav_time_ms
 float32 last_pick_time_ms
 string error_message
+TargetEntry[] pool_targets

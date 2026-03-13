@@ -78,7 +78,7 @@ PiperGraspPanel::PiperGraspPanel(QWidget* parent)
             this, &PiperGraspPanel::handlePlaceProgress, Qt::QueuedConnection);
 
     // Default prompt
-    current_prompt_ = "bottle.cup.toy.box.pen.key";
+    current_prompt_ = "bottle.cup.box.can.toy.pen.bag";
     edit_prompt_->setText(current_prompt_);
 }
 
@@ -239,7 +239,7 @@ void PiperGraspPanel::setupUi()
     QHBoxLayout* prompt_layout = new QHBoxLayout();
     prompt_layout->addWidget(new QLabel("Prompt:"));
     edit_prompt_ = new QLineEdit();
-    edit_prompt_->setPlaceholderText("bottle.cup.toy.box.pen.key");
+    edit_prompt_->setPlaceholderText("bottle.cup.box.can.toy.pen.bag");
     prompt_layout->addWidget(edit_prompt_);
     grasp_layout->addLayout(prompt_layout);
 
@@ -471,6 +471,17 @@ void PiperGraspPanel::setupRos()
     sub_arm_status_ = node_->create_subscription<piper_msgs::msg::PiperStatusMsg>(
         "/arm_status", 1,
         std::bind(&PiperGraspPanel::armStatusCallback, this, std::placeholders::_1));
+
+    // Subscribe to default_prompt from perception (single source of truth, latched)
+    sub_default_prompt_ = node_->create_subscription<std_msgs::msg::String>(
+        "/piper/default_prompt", rclcpp::QoS(1).transient_local().reliable(),
+        [this](const std_msgs::msg::String::SharedPtr msg) {
+            if (!panel_alive_.load() || msg->data.empty()) return;
+            QMetaObject::invokeMethod(this, [this, prompt = QString::fromStdString(msg->data)]() {
+                current_prompt_ = prompt;
+                edit_prompt_->setText(prompt);
+            }, Qt::QueuedConnection);
+        });
 
     // Service clients
     srv_enable_ = node_->create_client<piper_msgs::srv::EnableEnhanced>("/piper/enable");

@@ -1,0 +1,12 @@
+<library path="cleaner_panels">
+  <class name="cleaner_manager/CleanerPanel"
+         type="cleaner_manager::CleanerPanel"
+         base_class_type="rviz_common::Panel">
+    <description>手动控制面板: 状态/目标/底盘/臂/GO/CANCEL</description>
+  </class>
+  <class name="cleaner_manager/PerceptionPanel"
+         type="cleaner_manager::PerceptionPanel"
+         base_class_type="rviz_common::Panel">
+    <description>感知状态面板: 实时物体列表/配置/点击选择</description>
+  </class>
+</library>

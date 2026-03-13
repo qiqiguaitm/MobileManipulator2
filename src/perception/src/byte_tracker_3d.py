@@ -17,6 +17,7 @@ ByteTracker3D - 基于ByteTrack思想的3D目标跟踪器
 - ByteTrack: https://arxiv.org/abs/2110.06864
 """
 
+import time
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
@@ -35,17 +36,56 @@ from perception.dual_camera_matcher import CategoryCompatibility
 class TrackerConfig:
     """跟踪器配置"""
     # 距离阈值
-    match_thresh: float = 0.15      # 第一阶段匹配阈值 (15cm)
-    second_thresh: float = 0.25     # 第二阶段匹配阈值 (25cm, 更宽松)
+    match_thresh: float = 0.20      # 第一阶段匹配阈值 (20cm, 适配2-3Hz低频)
+    second_thresh: float = 0.30     # 第二阶段匹配阈值 (30cm, 更宽松)
 
     # 轨迹管理
-    track_buffer: int = 15          # Lost轨迹保留帧数
-    confirm_frames: int = 2         # 新轨迹确认帧数
+    track_buffer_s: float = 3.0     # Lost轨迹保留时间（秒），与 update() 调用频率无关
+
+    # 新轨迹确认：基于真实时间，不受 update() 调用频率影响
+    # 物理含义：新检测必须持续观测 confirm_time_s 秒 + 至少 min_confirm_hits 次匹配才能成为稳定轨迹
+    # 解决问题：遮挡边缘期 SAM3 产生的 ghost 检测在 0.4s 内就能被确认，
+    #           导致 ghost 抢占正在恢复中的 Lost 老轨迹的 ID。
+    confirm_time_s: float = 0.8     # 新轨迹确认所需最短观测时间（秒）
+    min_confirm_hits: int = 2       # 新轨迹确认所需最少匹配次数（防单帧误检）
+
+    # 年轻轨迹代价惩罚：在匈牙利匹配中给 tracklet_len 少的轨迹附加惩罚代价
+    # 目的：防止 ghost 轨迹（tracklet_len=1）在位置恰好更近时抢走 Lost 老轨迹（tracklet_len=17）的检测
+    # 公式：age_penalty = age_penalty_weight * (1 - min(tracklet_len/age_stable_frames, 1))
+    # 效果示例（bottle 遮挡场景）：
+    #   ghost (len=1):    stability=0.10, age_penalty = 0.15 * 0.90 = 0.135，总代价 0.003+0.135 = 0.138
+    #   track_1 (len=17): stability=1.00, age_penalty = 0.15 * 0.00 = 0.000，总代价 0.045+0.000 = 0.045 ← 胜出
+    #   注意: stability = min(tracklet_len/age_stable_frames, 1.0)，len≥age_stable_frames时上限截断为1.0
+    age_penalty_weight: float = 0.15   # 年轻轨迹代价惩罚权重
+    age_stable_frames: int = 10        # 达到此匹配次数后视为稳定（惩罚趋于 0）
+
+    # Lost 轨迹速度衰减：每次 predict() 前将 Kalman 速度乘以 decay
+    # 目的：遮挡边缘期深度腐蚀会给 Kalman 注入伪速度（如 z 漂移），
+    #        Lost 期间 predict() 按伪速度外推 → 位置偏离真实位置 → 输给 ghost。
+    # 衰减使 Lost 轨迹的预测位置收敛到 last-seen 位置附近，
+    # 恢复后 Kalman 增益自动增大（P 在 Lost 期间增长），一次 update 即可修正。
+    # 仅影响 Lost 状态，Tracked 状态完全不受影响。
+    lost_velocity_decay: float = 0.7   # Lost 轨迹速度衰减因子（每次 predict 前乘以此值）
 
     # Re-ID: 从 Removed 池恢复旧 ID（物体消失后重新出现）
     # 注意: position 在 base_link 坐标系，机器人移动时 Re-ID 不可靠
     reid_thresh: float = 0.3        # Re-ID 距离阈值 (30cm)
-    reid_buffer: int = 100          # Removed 轨迹保留帧数 (~10s @10Hz)
+    reid_buffer_s: float = 10.0     # Removed 轨迹保留时间（秒），与调用频率无关
+    reid_cat_weight: float = 0.05   # Re-ID 类别软代价权重 (m)：同类=0, 兼容=+1.5cm, 不兼容=+5cm
+                                    # 距离仍为硬门控，类别仅作排序偏好（防分类抖动导致 Re-ID 失败）
+
+    # 代价函数权重（归一化代价，与 dual_camera_matcher 同构）
+    # IoU可用时(Tracked+同相机): cost = 0.70*dist_norm + 0.15*(1-iou) + 0.15*cat_cost
+    # IoU不可用时(Lost/跨相机): cost = 0.80*dist_norm + 0.20*cat_cost
+    # cat_cost: 0.0=相同 / 0.3=兼容 / 1.0=不兼容（软门控，不再硬拦截）
+    cost_max: float = 0.75          # 归一化代价门槛
+
+    # 类别投票：连续 N 帧检测到不同类别后更新轨迹类别（仅 Tracked 状态）
+    # 防止轨迹出生时类别标错后一直锁死（如 can 被标成 box 后永远是 box）
+    confirm_cat_frames: int = 5     # 连续 N 帧不同类别才更新（防止单帧误检）
+
+    # 调试：每次成功匹配时打印代价分解（配合 _cc_track_debug.py --cost 使用）
+    cost_debug: bool = False
 
     # Kalman滤波器参数
     process_noise_pos: float = 0.01     # 位置过程噪声
@@ -172,7 +212,7 @@ class STrack3D:
                  confidence: float, cfg: TrackerConfig,
                  detection: dict = None, reuse_id: int = None):
         # ID 延迟分配：构造时不消耗 ID，确认时才分配
-        # 噪声轨迹（活不到 confirm_frames）永远不会消耗 ID 号
+        # 噪声轨迹（观测时间不满 confirm_time_s）永远不会消耗 ID 号
         self.track_id = None
         self._reuse_id = reuse_id  # Re-ID 复用的旧 ID，在 activate() 时使用
 
@@ -180,14 +220,25 @@ class STrack3D:
         self.category = category
         self.confidence = confidence
 
+        # 类别投票状态（连续不同类别匹配计数，达到阈值后更新类别）
+        self._cat_vote_streak: int = 0   # 连续不同类别帧数
+        self._cat_vote_pending: str = '' # 投票中的目标类别
+
         # 状态
         self.state = TrackState.New
-        self.frame_id = 0           # 最后更新的帧号
+        self.frame_id = 0           # 最后更新的帧号（用于调试和日志）
         self.start_frame = 0        # 开始帧号
-        self.tracklet_len = 0       # 连续跟踪长度
+        self.tracklet_len = 0       # 累计匹配帧数（只增不减，跨 Lost 也保留）
+        self.first_seen_time: float = 0.0  # 轨迹第一次创建时的 wall-clock 时间（用于 confirm_time_s 判断）
+        self.last_seen_time: float = 0.0   # 最后匹配时的 wall-clock 时间（time.monotonic，用于 TTL 判断）
 
         # 保存最后匹配的检测数据（包含 _original 等字段）
         self.last_detection = detection
+
+        # 最后匹配帧的相机bbox（IoU计算用，按相机分开存储）
+        # 仅在 Tracked 状态下更新，Lost 状态 bbox 不再可信
+        self.last_chassis_bbox: Optional[List[float]] = None  # fused/chassis 检测的bbox
+        self.last_top_bbox: Optional[List[float]] = None      # top 检测的bbox
 
         # Kalman滤波器
         self.kalman = KalmanFilter3D(cfg)
@@ -203,6 +254,8 @@ class STrack3D:
 
     def predict(self):
         """Kalman预测"""
+        if self.state == TrackState.Lost:
+            self.kalman.x[3:6] *= self.cfg.lost_velocity_decay
         self.kalman.predict()
 
     def update(self, detection: dict, frame_id: int):
@@ -214,6 +267,35 @@ class STrack3D:
         self.confidence = detection['confidence']
         self.frame_id = frame_id
         self.tracklet_len += 1
+
+        # 类别投票：连续 confirm_cat_frames 帧检测到不同类别后更新（仅 Tracked 状态）
+        # 防止轨迹出生时标错类别后永远锁死，代价: cat_cost 惩罚累积 → 被新轨迹抢占
+        if self.state == TrackState.Tracked:
+            det_cat = detection.get('category', '')
+            if det_cat and det_cat != self.category:
+                if det_cat == self._cat_vote_pending:
+                    self._cat_vote_streak += 1
+                else:
+                    # 新的不同类别，重新计票
+                    self._cat_vote_pending = det_cat
+                    self._cat_vote_streak = 1
+                if self._cat_vote_streak >= self.cfg.confirm_cat_frames:
+                    self.category = det_cat
+                    self._cat_vote_streak = 0
+                    self._cat_vote_pending = ''
+            elif det_cat:
+                # 类别一致，重置投票
+                self._cat_vote_streak = 0
+                self._cat_vote_pending = ''
+
+        # 更新相机bbox（IoU 计算用，按相机来源分开存储）
+        source = detection.get('source', '')
+        bbox = detection.get('bbox')
+        if bbox:
+            if source in ('fused', 'chassis', 'chassis_only'):
+                self.last_chassis_bbox = bbox
+            elif source in ('top', 'top_only'):
+                self.last_top_bbox = bbox
 
         # 保存最后匹配的检测数据（包含 _original 等字段）
         self.last_detection = detection
@@ -239,13 +321,31 @@ class STrack3D:
                 STrack3D._count += 1
                 self.track_id = STrack3D._count
 
-    def reactivate(self, detection: dict, frame_id: int):
+    def _should_confirm(self, current_time: Optional[float]) -> bool:
+        """
+        判断此 New 轨迹是否已满足确认条件（基于真实时间 + 最少匹配次数）。
+
+        条件：
+          1. current_time - first_seen_time >= confirm_time_s （持续观测足够长）
+          2. tracklet_len >= min_confirm_hits               （至少匹配过若干次）
+
+        时间条件防止 ghost 在遮挡边缘期（0.4s 内）抢先确认；
+        hit 条件防止单帧误检（e.g. double-call 第二次调用）立即确认。
+        """
+        if current_time is None or self.first_seen_time <= 0.0:
+            return False
+        elapsed = current_time - self.first_seen_time
+        return (elapsed >= self.cfg.confirm_time_s and
+                self.tracklet_len >= self.cfg.min_confirm_hits)
+
+    def reactivate(self, detection: dict, frame_id: int,
+                   current_time: Optional[float] = None):
         """重新激活轨迹（Lost → Tracked）"""
         self.update(detection, frame_id)
         self.state = TrackState.Tracked
         # 修复：New → Lost → reactivate 路径中 track_id 永远为 None 的 bug
-        # 若累计观测已达确认门槛，立即分配 ID
-        if self.track_id is None and self.tracklet_len >= self.cfg.confirm_frames:
+        # 若已满足时间+次数确认条件，立即分配 ID
+        if self.track_id is None and self._should_confirm(current_time):
             self.activate(frame_id)
 
     @staticmethod
@@ -284,13 +384,16 @@ class ByteTracker3D:
         self.lost_stracks: List[STrack3D] = []     # Lost状态
         self.removed_stracks: List[STrack3D] = []  # Removed状态（可选保留）
 
-        # 帧计数
+        # 帧计数（调试/日志用，不再用于生命周期判断）
         self.frame_id = 0
+        # 当前帧的 wall-clock 时间，由 update() 设置，供内部方法共用
+        self._current_time: float = 0.0
 
         # 重置ID计数器
         STrack3D.reset_id()
 
-    def update(self, fused_objects: List[dict]) -> List[dict]:
+    def update(self, fused_objects: List[dict],
+               current_time: Optional[float] = None) -> List[dict]:
         """
         核心更新函数 - ByteTrack两阶段匹配
 
@@ -305,6 +408,7 @@ class ByteTracker3D:
                   'confidence': float, 'source': str, 'quality': str}, ...]
         """
         self.frame_id += 1
+        self._current_time = current_time if current_time is not None else time.monotonic()
 
         # ========== Step 0: 分离高/低置信度检测 ==========
         high_dets = []  # 双相机融合成功
@@ -328,29 +432,40 @@ class ByteTracker3D:
 
         # ========== Step 2: 第一阶段匹配 (高置信度 vs 所有轨迹) ==========
         matches1, unmatched_track_indices, unmatched_det_indices = \
-            self._match(all_stracks, high_dets, self.cfg.match_thresh)
+            self._match(all_stracks, high_dets, self.cfg.match_thresh, stage=1)
 
         # 更新匹配的轨迹
         for t_idx, d_idx in matches1:
             track = all_stracks[t_idx]
             det = high_dets[d_idx]
+            old_cat = track.category  # 记录更新前类别（用于检测类别变化）
 
             if track.state == TrackState.Lost:
                 # Lost → Tracked (恢复)
-                track.reactivate(det, self.frame_id)
+                track.reactivate(det, self.frame_id, self._current_time)
             else:
                 # 正常更新
                 track.update(det, self.frame_id)
                 if track.state == TrackState.New:
-                    if track.tracklet_len >= self.cfg.confirm_frames:
+                    if track._should_confirm(self._current_time):
                         track.activate(self.frame_id)
                 else:
                     track.state = TrackState.Tracked
 
             # 延迟激活: 轨迹经历 New→Lost→reactivate 后 track_id 仍为 None
-            # 此时 state=Tracked 但未分配 ID，需要在 tracklet_len 达标后补发
-            if track.track_id is None and track.tracklet_len >= self.cfg.confirm_frames:
+            # 此时 state=Tracked 但未分配 ID，需要在时间+次数达标后补发
+            if track.track_id is None and track._should_confirm(self._current_time):
                 track.activate(self.frame_id)
+
+            # 更新 wall-clock 时间（用于基于时间的 TTL 判断）
+            track.last_seen_time = self._current_time
+
+            # 类别投票日志
+            if self.log and track.category != old_cat:
+                self.log.info(
+                    f'[CAT_UPDATE] track_{track.track_id}: {old_cat} → {track.category} '
+                    f'(after {self.cfg.confirm_cat_frames} consecutive votes)'
+                )
 
         # ========== Step 3: 第二阶段匹配 (低置信度 vs 未匹配轨迹) ==========
         # ByteTrack核心: 用单相机检测恢复/继续跟踪
@@ -362,23 +477,24 @@ class ByteTracker3D:
 
         if remaining_tracks and low_dets:
             matches2, unmatched_remaining_indices, unmatched_low_det_indices = \
-                self._match(remaining_tracks, low_dets, self.cfg.second_thresh)
+                self._match(remaining_tracks, low_dets, self.cfg.second_thresh, stage=2)
 
             # 更新/恢复匹配的轨迹
             for t_idx, d_idx in matches2:
                 track = remaining_tracks[t_idx]
                 det = low_dets[d_idx]
+                old_cat = track.category  # 记录更新前类别
 
                 if track.state == TrackState.Lost:
                     # Lost → Tracked (恢复)
-                    track.reactivate(det, self.frame_id)
+                    track.reactivate(det, self.frame_id, self._current_time)
                     if self.log:
                         self.log.debug(f"Recovered Lost track {track.track_id} with low-conf detection")
                 else:
                     # 用低置信度检测继续跟踪
                     track.update(det, self.frame_id)
                     if track.state == TrackState.New:
-                        if track.tracklet_len >= self.cfg.confirm_frames:
+                        if track._should_confirm(self._current_time):
                             track.activate(self.frame_id)
                     else:
                         track.state = TrackState.Tracked
@@ -386,8 +502,18 @@ class ByteTracker3D:
                         self.log.debug(f"Continued track {track.track_id} with low-conf detection")
 
                 # 延迟激活（同 Step 2）
-                if track.track_id is None and track.tracklet_len >= self.cfg.confirm_frames:
+                if track.track_id is None and track._should_confirm(self._current_time):
                     track.activate(self.frame_id)
+
+                # 更新 wall-clock 时间
+                track.last_seen_time = self._current_time
+
+                # 类别投票日志
+                if self.log and track.category != old_cat:
+                    self.log.info(
+                        f'[CAT_UPDATE] track_{track.track_id}: {old_cat} → {track.category} '
+                        f'(after {self.cfg.confirm_cat_frames} consecutive votes)'
+                    )
 
         # ========== Step 4: 处理未匹配轨迹 ==========
         # 找出所有未匹配的轨迹
@@ -405,8 +531,8 @@ class ByteTracker3D:
                 # Tracked → Lost
                 track.mark_lost()
             elif track.state == TrackState.Lost:
-                # 检查是否超时
-                if self.frame_id - track.frame_id > self.cfg.track_buffer:
+                # 基于真实时间判断是否超时，不受 DOUBLE_CALL 等异常调用频率影响
+                if self._current_time - track.last_seen_time > self.cfg.track_buffer_s:
                     track.mark_removed()
             elif track.state == TrackState.New:
                 # 未确认的新轨迹也标记为Lost
@@ -430,6 +556,15 @@ class ByteTracker3D:
             new_track.frame_id = self.frame_id
             new_track.start_frame = self.frame_id
             new_track.tracklet_len = 1
+            new_track.first_seen_time = self._current_time  # 记录出生时刻，用于 confirm_time_s 判断
+            new_track.last_seen_time = self._current_time   # 用于 TTL（track_buffer_s）判断
+
+            # Re-ID 轨迹立即激活：Re-ID 本身即代表"已确认"，无需再等 confirm_time_s
+            # 修复 Re-ID 链断裂：激活后 track_id 立即分配，即使下一帧未被匹配
+            # 也能以 track_id is not None 进入 removed_stracks，保持链的连续性
+            if reuse_id is not None:
+                new_track.activate(self.frame_id)
+
             self.tracked_stracks.append(new_track)
 
             if self.log:
@@ -447,7 +582,7 @@ class ByteTracker3D:
         return self._get_output(fused_objects)
 
     def _match(self, tracks: List[STrack3D], detections: List[dict],
-               thresh: float) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+               thresh: float, stage: int = 1) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
         """
         匈牙利算法匹配
 
@@ -455,6 +590,7 @@ class ByteTracker3D:
             tracks: 轨迹列表
             detections: 检测列表
             thresh: 距离阈值
+            stage: 匹配阶段（1=高置信度，2=低置信度），用于代价日志
 
         Returns:
             matches: 匹配对 [(track_idx, det_idx), ...]
@@ -464,46 +600,172 @@ class ByteTracker3D:
         if len(tracks) == 0 or len(detections) == 0:
             return [], list(range(len(tracks))), list(range(len(detections)))
 
-        # 构建代价矩阵
-        cost_matrix = self._compute_cost(tracks, detections)
+        # 构建代价矩阵（归一化，dist 用 thresh 归一化，cat 为软权重）
+        cost_matrix = self._compute_cost(tracks, detections, thresh)
 
         # 匈牙利算法
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-        # 过滤超出阈值的匹配
+        # 过滤超出归一化门槛的匹配
         matches = []
         unmatched_tracks = list(range(len(tracks)))
         unmatched_dets = list(range(len(detections)))
 
         for r, c in zip(row_ind, col_ind):
-            if cost_matrix[r, c] < thresh:
+            if cost_matrix[r, c] < self.cfg.cost_max:
                 matches.append((r, c))
                 unmatched_tracks.remove(r)
                 unmatched_dets.remove(c)
+                if self.log and self.cfg.cost_debug:
+                    self._log_match_cost(tracks[r], detections[c], thresh,
+                                         cost_matrix[r, c], stage)
 
         return matches, unmatched_tracks, unmatched_dets
 
-    def _compute_cost(self, tracks: List[STrack3D],
-                      detections: List[dict]) -> np.ndarray:
+    def _log_match_cost(self, track: 'STrack3D', det: dict,
+                        thresh: float, cost_total: float, stage: int):
         """
-        计算代价矩阵（3D距离 + 类别兼容性）
+        打印单次匹配的代价分解，供 _cc_track_debug.py --cost 解析。
 
-        类别不兼容 → 无穷大
+        格式（key=value，便于脚本 split 解析）：
+          [COST] s=1 mode=3T trk=track_3 tcat=box dcat=can src=fused
+                 cost=0.320 d=0.183 i=0.010 c=0.127 dist=5.0 iou=0.96
         """
+        W_DIST_3, W_IOU_3, W_CAT_3 = 0.70, 0.15, 0.15
+        W_DIST_2, W_CAT_2 = 0.80, 0.20
+
+        dist = float(np.linalg.norm(track.position - det['position']))
+        dist_norm = min(dist / thresh, 1.0)
+        cat_cost = CategoryCompatibility.compute_category_cost(
+            track.category, det['category'])
+
+        iou = 0.0
+        use_iou = False
+        if track.state == TrackState.Tracked:
+            det_source = det.get('source', '')
+            det_bbox = det.get('bbox')
+            if det_source in ('fused', 'chassis', 'chassis_only'):
+                track_bbox = track.last_chassis_bbox
+            elif det_source in ('top', 'top_only'):
+                track_bbox = track.last_top_bbox
+            else:
+                track_bbox = None
+            if track_bbox is not None and det_bbox is not None:
+                iou = self._compute_iou(track_bbox, det_bbox)
+                use_iou = True
+
+        if use_iou:
+            d_term = W_DIST_3 * dist_norm
+            i_term = W_IOU_3 * (1.0 - iou)
+            c_term = W_CAT_3 * cat_cost
+            mode = '3T'
+        else:
+            d_term = W_DIST_2 * dist_norm
+            i_term = 0.0
+            c_term = W_CAT_2 * cat_cost
+            mode = 'FB'
+
+        stability = min(track.tracklet_len / self.cfg.age_stable_frames, 1.0)
+        age_term = self.cfg.age_penalty_weight * (1.0 - stability)
+
+        tid = track.track_id if track.track_id else '?'
+        self.log.info(
+            f'[COST] s={stage} mode={mode} trk={tid} tcat={track.category} '
+            f'dcat={det["category"]} src={det.get("source", "?")} '
+            f'cost={cost_total:.3f} d={d_term:.3f} i={i_term:.3f} c={c_term:.3f} age={age_term:.3f} '
+            f'hits={track.tracklet_len} dist={dist * 100:.1f} iou={iou:.2f}'
+        )
+
+    @staticmethod
+    def _compute_iou(bbox_a: Optional[List[float]],
+                     bbox_b: Optional[List[float]]) -> float:
+        """
+        计算两个bbox的IoU，格式 [x1, y1, x2, y2]。
+        任意一个为空或面积为0则返回0。
+        """
+        if not bbox_a or not bbox_b:
+            return 0.0
+        x1a, y1a, x2a, y2a = bbox_a[:4]
+        x1b, y1b, x2b, y2b = bbox_b[:4]
+        area_a = (x2a - x1a) * (y2a - y1a)
+        area_b = (x2b - x1b) * (y2b - y1b)
+        if area_a <= 0 or area_b <= 0:
+            return 0.0
+        ix1 = max(x1a, x1b)
+        iy1 = max(y1a, y1b)
+        ix2 = min(x2a, x2b)
+        iy2 = min(y2a, y2b)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _compute_cost(self, tracks: List[STrack3D],
+                      detections: List[dict],
+                      thresh: float) -> np.ndarray:
+        """
+        计算归一化代价矩阵（双分支）
+
+        IoU可用时（Tracked状态 + 同相机bbox均有效）：
+          cost = 0.70*dist_norm + 0.15*(1-iou) + 0.15*cat_cost
+          优先级：距离 >> IoU = 类别（低频场景IoU不可靠，降权）
+
+        IoU不可用时（Lost状态 / 跨相机 / bbox退化）：
+          cost = 0.80*dist_norm + 0.20*cat_cost
+
+        cat_cost: 0.0=相同 / 0.3=兼容 / 1.0=不兼容（软门控）
+        最终由 cost_max=0.75 决定是否接受。
+        """
+        # IoU可用分支权重
+        W_DIST_3 = 0.70
+        W_IOU_3  = 0.15
+        W_CAT_3  = 0.15
+        # IoU不可用回退权重
+        W_DIST_2 = 0.80
+        W_CAT_2  = 0.20
+
         n_tracks = len(tracks)
         n_dets = len(detections)
         cost = np.full((n_tracks, n_dets), 1e6, dtype=np.float32)
 
         for i, track in enumerate(tracks):
             for j, det in enumerate(detections):
-                # 类别兼容性检查
-                if not CategoryCompatibility.is_compatible(
+                dist = np.linalg.norm(track.position - det['position'])
+                dist_norm = min(dist / thresh, 1.0)
+                cat_cost = CategoryCompatibility.compute_category_cost(
                     track.category, det['category']
-                ):
-                    continue  # 不兼容，保持无穷大
+                )  # 0.0 / 0.3 / 1.0
 
-                # 3D距离
-                cost[i, j] = np.linalg.norm(track.position - det['position'])
+                # IoU: 仅 Tracked 状态 + 同相机来源时可用
+                use_iou = False
+                iou = 0.0
+                if track.state == TrackState.Tracked:
+                    det_source = det.get('source', '')
+                    det_bbox = det.get('bbox')
+                    if det_source in ('fused', 'chassis', 'chassis_only'):
+                        track_bbox = track.last_chassis_bbox
+                    elif det_source in ('top', 'top_only'):
+                        track_bbox = track.last_top_bbox
+                    else:
+                        track_bbox = None
+                    if track_bbox is not None and det_bbox is not None:
+                        iou = self._compute_iou(track_bbox, det_bbox)
+                        use_iou = True
+
+                # 年轻轨迹惩罚：tracklet_len 少的轨迹（ghost/噪声）附加代价，
+                # 防止其在位置恰好更近时抢走 Lost 老轨迹的检测。
+                # 公式：penalty = weight * (1 - min(len/stable_frames, 1))
+                # tracklet_len=1:  penalty ≈ weight * 0.9  (最大惩罚)
+                # tracklet_len=10: penalty = 0              (稳定轨迹，无惩罚)
+                stability = min(track.tracklet_len / self.cfg.age_stable_frames, 1.0)
+                age_penalty = self.cfg.age_penalty_weight * (1.0 - stability)
+
+                if use_iou:
+                    cost[i, j] = (W_DIST_3 * dist_norm
+                                  + W_IOU_3  * (1.0 - iou)
+                                  + W_CAT_3  * cat_cost
+                                  + age_penalty)
+                else:
+                    cost[i, j] = W_DIST_2 * dist_norm + W_CAT_2 * cat_cost + age_penalty
 
         return cost
 
@@ -520,22 +782,32 @@ class ByteTracker3D:
             elif track.state == TrackState.New:
                 new_tracked.append(track)
             elif track.state == TrackState.Removed:
-                # 只保留已确认过的轨迹用于 Re-ID（噪声轨迹不保留）
-                if track.tracklet_len >= self.cfg.confirm_frames:
+                # 只保留已激活（track_id 已分配）的轨迹用于 Re-ID
+                # - 普通轨迹：activate() 在 confirm_time_s 达标后触发，track_id 非 None
+                # - Re-ID 轨迹：创建时立即 activate()，track_id 非 None（即使存活仅 1 帧）
+                # - 噪声轨迹：从未 activate()，track_id = None，不保留
+                if track.track_id is not None:
                     self.removed_stracks.append(track)
 
         self.tracked_stracks = new_tracked
         self.lost_stracks = new_lost
 
-        # 清理过期的 Removed 轨迹（超过 reid_buffer 帧）
+        # 清理过期的 Removed 轨迹（基于真实时间，与调用频率无关）
         self.removed_stracks = [
             t for t in self.removed_stracks
-            if self.frame_id - t.frame_id <= self.cfg.reid_buffer
+            if self._current_time - t.last_seen_time <= self.cfg.reid_buffer_s
         ]
 
     def _try_reid(self, detection: dict) -> Optional[int]:
         """
-        尝试从 Removed 池中找到同类别、位置接近的旧轨迹，复用其 track_id。
+        尝试从 Removed 池中找到位置接近的旧轨迹，复用其 track_id。
+
+        匹配策略：距离为硬门控（> reid_thresh 直接跳过），类别为软代价偏好。
+        cost = dist + reid_cat_weight * cat_cost
+        - 同类别：cost = dist（无惩罚）
+        - 兼容类别：cost = dist + reid_cat_weight * 0.3
+        - 不兼容：cost = dist + reid_cat_weight * 1.0
+        分类器抖动（box→bottle）时距离足够近仍可 Re-ID，但同类候选优先。
 
         Returns:
             旧 track_id (int) 如果匹配成功，否则 None
@@ -543,23 +815,31 @@ class ByteTracker3D:
         if not self.removed_stracks:
             return None
 
-        best_dist = self.cfg.reid_thresh
+        best_cost = float('inf')
         best_idx = -1
 
         det_pos = detection['position']
         det_cat = detection['category']
 
         for i, track in enumerate(self.removed_stracks):
-            # 类别必须兼容
-            if not CategoryCompatibility.is_compatible(track.category, det_cat):
-                continue
-            dist = np.linalg.norm(track.position - det_pos)
-            if dist < best_dist:
-                best_dist = dist
+            dist = float(np.linalg.norm(track.position - det_pos))
+            if dist >= self.cfg.reid_thresh:
+                continue  # 距离硬门控
+            cat_cost = CategoryCompatibility.compute_category_cost(track.category, det_cat)
+            cost = dist + self.cfg.reid_cat_weight * cat_cost
+            if cost < best_cost:
+                best_cost = cost
                 best_idx = i
 
         if best_idx >= 0:
             old_track = self.removed_stracks.pop(best_idx)
+            # 清除 pool 中所有同位置的竞争轨迹（同一物体被重复创建的不同 ID）
+            # 根因：分类器抖动(box↔can)在 pool 里积累了 track_2(box)+track_5(can) 两个竞争者，
+            # 之后检测类别决定复活哪个，导致振荡。清除同位置竞争者可彻底切断循环。
+            self.removed_stracks = [
+                t for t in self.removed_stracks
+                if float(np.linalg.norm(t.position - det_pos)) >= self.cfg.reid_thresh
+            ]
             return old_track.track_id
 
         return None
@@ -645,10 +925,11 @@ if __name__ == '__main__':
 
     # 创建跟踪器
     cfg = TrackerConfig(
-        match_thresh=0.15,
-        second_thresh=0.25,
-        track_buffer=15,
-        confirm_frames=2,
+        match_thresh=0.20,
+        second_thresh=0.30,
+        track_buffer_s=3.0,
+        confirm_time_s=0.8,
+        min_confirm_hits=2,
     )
     tracker = ByteTracker3D(cfg)
 

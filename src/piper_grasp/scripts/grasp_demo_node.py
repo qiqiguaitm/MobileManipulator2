@@ -23,7 +23,7 @@ from piper_msgs.action import PiperPick, PiperPlace
 class DemoClient(Node):
     """Single grasp demo client"""
 
-    def __init__(self, prompt='bottle.cup.pen', enable_cdm=True, speed=30, place_after=True):
+    def __init__(self, prompt='bottle.cup.box.can.toy.pen.bag', enable_cdm=True, speed=30, place_after=True):
         super().__init__('demo_client_node')
 
         # Declare ROS parameters (for launch file compatibility)
@@ -233,7 +233,7 @@ class DemoClient(Node):
 
 def main(args=None):
     parser = argparse.ArgumentParser(description='Piper single grasp demo')
-    parser.add_argument('--prompt', type=str, default='bottle.cup.pen',
+    parser.add_argument('--prompt', type=str, default='bottle.cup.box.can.toy.pen.bag',
                         help='Target object')
     parser.add_argument('--no-place', action='store_true',
                         help='Skip place after pick')

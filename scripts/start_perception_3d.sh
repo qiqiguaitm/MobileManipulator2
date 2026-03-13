@@ -30,13 +30,14 @@ source "$SCRIPT_DIR/_ros2_env.sh"
 # 默认参数
 # ============================================================================
 CAMERA_NAME="top"
-DETECTOR_TYPE="dinox"
+DETECTOR_TYPE="sam3"
 ENABLE_RVIZ="false"
 SKIP_CAMERA="false"
 RUN_TEST="false"
 CUSTOM_PROMPT=""
 EXTRINSICS_SUFFIX=""
-ENABLE_CDM="true"
+ENABLE_CDM="false"
+ENABLE_FS="true"
 
 # ============================================================================
 # 解析参数
@@ -68,6 +69,10 @@ for arg in "$@"; do
             EXTRINSICS_SUFFIX="${arg#*=}"
             ;;
         --no-cdm)
+            ENABLE_CDM="false"
+            ;;
+        --foundation-stereo)
+            ENABLE_FS="true"
             ENABLE_CDM="false"
             ;;
         -h|--help)
@@ -163,10 +168,16 @@ if [ "$SKIP_CAMERA" = "false" ] && [ "$CAMERA_NAME" != "none" ]; then
         exit 1
     }
 
+    # FoundationStereo 需要启用相机的 IR 流（关闭投影仪）
+    INFRA_ARGS=""
+    if [ "$ENABLE_FS" = "true" ]; then
+        INFRA_ARGS="top_enable_infra:=true chassis_enable_infra:=true"
+    fi
+
     # 根据相机类型设置参数
     case $CAMERA_NAME in
         top)
-            CAM_ARGS="top_enable:=true hand_enable:=false chassis_enable:=false"
+            CAM_ARGS="top_enable:=true hand_enable:=false chassis_enable:=false $INFRA_ARGS"
             WAIT_TOPIC="/camera/top/color/image_raw"
             ;;
         hand)
@@ -174,11 +185,11 @@ if [ "$SKIP_CAMERA" = "false" ] && [ "$CAMERA_NAME" != "none" ]; then
             WAIT_TOPIC="/camera/hand/color/image_raw"
             ;;
         chassis)
-            CAM_ARGS="top_enable:=false hand_enable:=false chassis_enable:=true"
+            CAM_ARGS="top_enable:=false hand_enable:=false chassis_enable:=true $INFRA_ARGS"
             WAIT_TOPIC="/camera/chassis/color/image_raw"
             ;;
         dual)
-            CAM_ARGS="top_enable:=true hand_enable:=false chassis_enable:=true"
+            CAM_ARGS="top_enable:=true hand_enable:=false chassis_enable:=true $INFRA_ARGS"
             WAIT_TOPIC="/camera/top/color/image_raw"
             ;;
         *)
@@ -197,6 +208,41 @@ if [ "$SKIP_CAMERA" = "false" ] && [ "$CAMERA_NAME" != "none" ]; then
         echo -e "${GREEN}   ✓ 相机启动成功${NC}"
     else
         echo -e "${YELLOW}   ⚠ 相机话题等待超时，继续启动...${NC}"
+    fi
+
+    # Dual 模式: 等 Top 深度稳定后验证 chassis depth，失败则自动重启 chassis 节点
+    # 根本原因: Top D455 硬件 reset (~7s) 期间 chassis 启动会导致 USB interface busy
+    # 修复策略: Top 稳定后重启 chassis，此时无 USB 竞争
+    if [ "$CAMERA_NAME" = "dual" ]; then
+        echo "   等待 Top 深度流稳定..."
+        if wait_for_topic "/camera/top/depth/image_rect_raw" 20; then
+            sleep 3  # USB 总线完全静默
+            if ! ros2 topic list 2>/dev/null | grep -q "/camera/chassis/depth/image_rect_raw"; then
+                echo -e "${YELLOW}   ⚠ Chassis 深度流未启动（USB 竞争），自动恢复中...${NC}"
+                CHASSIS_CAM_PID=$(ps aux | grep "realsense2_camera_node.*__node:=chassis" | grep -v grep | awk '{print $2}' | head -1)
+                CHASSIS_PARAMS=$(grep -rl "337122071540" /tmp/launch_params_* 2>/dev/null | head -1)
+                if [ -n "$CHASSIS_CAM_PID" ] && [ -n "$CHASSIS_PARAMS" ]; then
+                    kill -9 "$CHASSIS_CAM_PID" 2>/dev/null
+                    sleep 3
+                    ros2 run realsense2_camera realsense2_camera_node \
+                        --ros-args \
+                        -r __node:=chassis \
+                        -r __ns:=/camera \
+                        --params-file "$CHASSIS_PARAMS" \
+                        >> /tmp/camera_driver.log 2>&1 &
+                    echo "   Chassis 节点已重启 (PID=$!)"
+                    if wait_for_topic "/camera/chassis/depth/image_rect_raw" 20; then
+                        echo -e "${GREEN}   ✓ Chassis 深度流恢复成功${NC}"
+                    else
+                        echo -e "${YELLOW}   ⚠ Chassis 深度流恢复失败，继续启动...${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}   ⚠ 未找到 chassis 节点或参数文件，跳过恢复${NC}"
+                fi
+            else
+                echo -e "${GREEN}   ✓ Chassis 深度流正常${NC}"
+            fi
+        fi
     fi
 else
     echo "[4/5] 跳过相机启动"
@@ -228,12 +274,18 @@ if [ "$ENABLE_CDM" = "false" ]; then
     echo -e "${YELLOW}   CDM 深度优化: 已禁用 (使用原始深度)${NC}"
 fi
 
-echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG"
+FS_ARG=""
+if [ "$ENABLE_FS" = "true" ]; then
+    FS_ARG="depth_source:=foundation_stereo top_enable_infra:=true chassis_enable_infra:=true"
+    echo -e "${YELLOW}   FoundationStereo: 已启用 (被动双目深度估计，双相机)${NC}"
+fi
+
+echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG"
 echo ""
 
 # 如果需要测试，后台启动
 if [ "$RUN_TEST" = "true" ]; then
-    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG > /tmp/perception_launch.log 2>&1 &
+    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG > /tmp/perception_launch.log 2>&1 &
     LAUNCH_PID=$!
 
     # 等待节点启动
@@ -280,5 +332,5 @@ if [ "$RUN_TEST" = "true" ]; then
     wait $LAUNCH_PID
 else
     # 前台启动
-    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG
+    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG
 fi

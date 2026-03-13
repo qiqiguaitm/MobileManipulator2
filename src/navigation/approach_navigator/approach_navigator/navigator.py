@@ -321,9 +321,11 @@ class ApproachNavigator(Node):
         return ApproachResult(True, final_distance=final_dist)
 
     def cancel(self):
-        """取消导航"""
+        """取消导航 — 仅设置标志 + 停车，不直接调用 cancelTask()。
+        cancelTask() 由 worker 线程的 poll 循环负责调用，
+        避免与 BasicNavigator 内部 executor generator 的并发竞争。
+        """
         self._cancel_requested = True
-        self.nav.cancelTask()
         self._stop_robot()
         self.get_logger().info("导航已取消")
 
@@ -394,8 +396,9 @@ class ApproachNavigator(Node):
                 self.get_logger().info(f"距离过近 ({dist:.3f}m)，跳过对齐")
                 return True, ""
 
-        # 控制循环
-        rate = self.create_rate(20)     # 20 Hz
+        # 控制循环 — 用 time.sleep 替代 create_rate().sleep()，
+        # 后者依赖 executor generator，在 worker 线程中有并发风险。
+        loop_dt = 0.05                  # 20 Hz
         start_time = time.time()
         last_error = 0.0                # 上次角度误差
         last_time = start_time          # 上次时间
@@ -411,7 +414,7 @@ class ApproachNavigator(Node):
             # 获取当前位姿
             robot_pos, robot_yaw = self._get_robot_pose()
             if robot_pos is None:
-                rate.sleep()
+                time.sleep(loop_dt)
                 continue
 
             # 计算角度误差
@@ -445,7 +448,7 @@ class ApproachNavigator(Node):
             # 更新状态
             last_error = error
             last_time = current_time
-            rate.sleep()
+            time.sleep(loop_dt)
 
         self._stop_robot()
         return False, "被中断"
@@ -465,7 +468,7 @@ class ApproachNavigator(Node):
         Returns:
             (bool, str, float): (成功标志, 错误消息, 最终距离)
         """
-        rate = self.create_rate(self.config.control_rate)
+        loop_dt = 1.0 / self.config.control_rate   # time.sleep 替代 create_rate
         start_time = time.time()
 
         self.get_logger().info(f"开始精确接近，目标距离: {self.config.final_approach_distance}m")
@@ -533,7 +536,7 @@ class ApproachNavigator(Node):
                         f"[等待] 无点云数据...",
                         throttle_duration_sec=1.0
                     )
-                    rate.sleep()
+                    time.sleep(loop_dt)
                     continue
             else:
                 # 检查是否检测到更近的障碍物
@@ -601,7 +604,7 @@ class ApproachNavigator(Node):
             cmd.angular.z = 0.0
             self.cmd_vel_pub.publish(cmd)
 
-            rate.sleep()
+            time.sleep(loop_dt)
 
         self._stop_robot()
         return False, "被中断", 0.0

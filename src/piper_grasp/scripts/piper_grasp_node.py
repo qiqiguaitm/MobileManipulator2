@@ -1235,11 +1235,21 @@ class PiperGraspNode(Node):
             self.get_logger().info(f"=== PICK: APPROACHING === target=[{target_x:.1f}, {target_y:.1f}, {approach_z:.1f}]mm pitch={approach_pitch}")
             send_feedback(2, "Approaching", 0.2, "Moving to approach")
 
+            # Diagnostic: log current gc_pos before approach (catch stale/zero reads)
+            _, pre_gc = self.arm.get_position(return_gripper_center=True)
+            self.get_logger().info(
+                f"APPROACH_DIAG: pre_gc=[{pre_gc[0]:.1f},{pre_gc[1]:.1f},{pre_gc[2]:.1f},"
+                f"{pre_gc[3]:.1f},{pre_gc[4]:.1f},{pre_gc[5]:.1f}]")
+
             tmp = self.arm.set_position(x=target_x, y=target_y, z=approach_z,
                                         pitch=approach_pitch, wait=True, speed=speed,
                                         use_gripper_center=True)
             if not tmp:
                 err_info = self.arm._get_error_info() if hasattr(self.arm, '_get_error_info') else "unknown"
+                _, fail_gc = self.arm.get_position(return_gripper_center=True)
+                self.get_logger().error(
+                    f"APPROACH_DIAG: FAILED! post_gc=[{fail_gc[0]:.1f},{fail_gc[1]:.1f},{fail_gc[2]:.1f},"
+                    f"{fail_gc[3]:.1f},{fail_gc[4]:.1f},{fail_gc[5]:.1f}]")
                 raise RuntimeError(f"Failed to move to approach position ({err_info})")
 
             if goal_handle.is_cancel_requested:

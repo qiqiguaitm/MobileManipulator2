@@ -1,6 +1,6 @@
 # perception_grasp_rviz.yaml - 抓取感知 RViz 可视化节点配置 (ROS2)
 
-perception_grasp_rviz:
+perception_grasp_rviz_node:
   ros__parameters:
     # 订阅的 perception_grasp_node topics
     result_topic: "perception_grasp_node/result"

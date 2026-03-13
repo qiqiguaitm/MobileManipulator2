@@ -60,9 +60,16 @@ check_dependencies() {
     fi
 }
 
-# 获取所有 CAN 接口
+# 获取所有 USB CAN 接口（过滤内置 MTTCAN）
 get_can_interfaces() {
-    ip -br link show type can 2>/dev/null | awk '{print $1}' || true
+    local usb_ifaces=""
+    for iface in $(ip -br link show type can 2>/dev/null | awk '{print $1}'); do
+        local drv=$(ethtool -i "$iface" 2>/dev/null | awk '/^driver:/{print $2}')
+        if [ "$drv" = "gs_usb" ]; then
+            usb_ifaces="$usb_ifaces $iface"
+        fi
+    done
+    echo $usb_ifaces
 }
 
 # 设置 CAN 接口波特率
@@ -250,26 +257,31 @@ main() {
             sudo ip link set "$iface" down 2>/dev/null || true
         done
 
+        # 先把两者都改成临时名，避免 can0↔can1 互换时名字冲突
+        # 不用 _ct 后缀，避免与内置 MTTCAN 接口冲突
+        local chassis_tmp="cantmp_ch_$$"
+        local piper_tmp="cantmp_pi_$$"
+        if [ -n "$chassis_iface" ]; then
+            sudo ip link set "$chassis_iface" name "$chassis_tmp" || true
+        fi
+        if [ -n "$piper_iface" ]; then
+            sudo ip link set "$piper_iface" name "$piper_tmp" || true
+        fi
+
         # 配置底盘
         if [ -n "$chassis_iface" ]; then
             echo "  配置底盘: $chassis_iface -> $CHASSIS_CAN_NAME @ ${CHASSIS_BITRATE}bps"
-            rename_can_interface "$chassis_iface" "$CHASSIS_CAN_NAME"
-            setup_can_interface "$CHASSIS_CAN_NAME" $CHASSIS_BITRATE
+            sudo ip link set "$chassis_tmp" name "$CHASSIS_CAN_NAME"
+            sudo ip link set "$CHASSIS_CAN_NAME" type can bitrate $CHASSIS_BITRATE
+            sudo ip link set "$CHASSIS_CAN_NAME" up
         fi
 
         # 配置机械臂
         if [ -n "$piper_iface" ]; then
-            # 如果底盘已占用目标名称，需要处理
-            if [ "$chassis_iface" == "$PIPER_CAN_NAME" ]; then
-                # 底盘原来叫 can0，现在改成 can1 了，piper 可以用 can0
-                :
-            fi
             echo "  配置机械臂: $piper_iface -> $PIPER_CAN_NAME @ ${PIPER_BITRATE}bps"
-            # 如果 piper_iface 还是原名（没被底盘重命名覆盖）
-            if ip link show "$piper_iface" &>/dev/null; then
-                rename_can_interface "$piper_iface" "$PIPER_CAN_NAME"
-            fi
-            setup_can_interface "$PIPER_CAN_NAME" $PIPER_BITRATE
+            sudo ip link set "$piper_tmp" name "$PIPER_CAN_NAME"
+            sudo ip link set "$PIPER_CAN_NAME" type can bitrate $PIPER_BITRATE
+            sudo ip link set "$PIPER_CAN_NAME" up
         fi
 
         echo ""

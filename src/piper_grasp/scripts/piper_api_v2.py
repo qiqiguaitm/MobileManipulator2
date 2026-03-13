@@ -509,7 +509,8 @@ class PiperAPI:
                 # 如果位置变化了，说明获取到了新数据
                 if last_pos is not None:
                     diff = sum(abs(pos[i] - last_pos[i]) for i in range(3))
-                    if diff > 0.5:  # 位置有变化
+                    if diff > 0.5:  # 位置有变化，使用新数据
+                        last_pos = pos
                         break
 
                 last_pos = pos

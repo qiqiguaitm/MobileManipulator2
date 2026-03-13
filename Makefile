@@ -10,15 +10,15 @@ FASTDDS_PROFILE := $(WS_DIR)/config/fastdds_profile.xml
 # ROS_SETUP: 如果 FastDDS 配置存在则使用，否则跳过
 ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
 	(test -f $(FASTDDS_PROFILE) && export FASTRTPS_DEFAULT_PROFILES_FILE=$(FASTDDS_PROFILE) || true) && \
-	export DISPLAY=$${DISPLAY:-:1001} && \
+	export DISPLAY=$${DISPLAY:-:1} && \
 	source /opt/ros/humble/setup.bash && \
 	source $(WS_DIR)/install/setup.bash
 
 .PHONY: help \
         navigation navi nav navi-fusion nav-fusion navi-approach \
         percept-nav \
-        cleaner-manager cleaner-manager-no-rviz cleaner-manager-node \
-        full-manual manual-control rviz \
+        cleaner-manager-node \
+        full-manual rviz \
         build build-all build-drivers build-slam build-nav build-perception build-cleaner-manager \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
@@ -60,11 +60,8 @@ help:
 	@echo "  make percept-nav      - 一键启动 (导航+相机+感知+接近导航)"
 	@echo ""
 	@echo "全系统命令 (Cleaner Manager):"
-	@echo "  make cleaner-manager         - 全系统启动 (导航+相机+机械臂+感知+管理+RViz)"
-	@echo "  make cleaner-manager-no-rviz - 全系统启动 (无RViz)"
-	@echo "  make cleaner-manager-node    - 仅启动管理节点 (需其他模块已运行)"
 	@echo "  make full-manual            - 手动控制全流程 (导航+相机+感知+机械臂+GUI面板)"
-	@echo "  make manual-control         - 仅启动手动控制节点+面板 (需其他模块已运行)"
+	@echo "  make cleaner-manager-node   - 仅启动管理节点 (需其他模块已运行)"
 	@echo "  make rviz                   - 单独启动 RViz (手动控制配置)"
 	@echo "  make build-cleaner-manager  - 构建 cleaner_manager 包"
 	@echo ""
@@ -154,28 +151,6 @@ percept-nav:
 # 全系统命令 (Cleaner Manager)
 # ============================================
 
-# 全系统启动: 导航 + 相机 + 机械臂 + 感知 + Cleaner Manager + RViz
-cleaner-manager:
-	@echo "[CLEANER-MANAGER] 全系统启动..."
-	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
-		rviz:=true \
-		use_odom_fusion:=true \
-		launch_chassis:=true \
-		detector_type:=sam3 \
-		extrinsics_suffix:=_stereo_hand \
-		enable_depth_optimizer:=true
-
-# 全系统启动 (无RViz)
-cleaner-manager-no-rviz:
-	@echo "[CLEANER-MANAGER] 全系统启动 (无RViz)..."
-	@$(ROS_SETUP) && ros2 launch cleaner_manager cleaner_manager_full.launch.py \
-		rviz:=false \
-		use_odom_fusion:=true \
-		launch_chassis:=true \
-		detector_type:=sam3 \
-		extrinsics_suffix:=_stereo_hand \
-		enable_depth_optimizer:=true
-
 # 仅启动 cleaner_manager_node (需其他模块已运行)
 cleaner-manager-node:
 	@echo "[CLEANER-MANAGER] 启动管理节点..."
@@ -190,26 +165,44 @@ build-cleaner-manager:
 # 单独启动 RViz (手动控制配置) — 先开 RViz 再跑 full-manual
 rviz:
 	@echo "[RVIZ] 启动 RViz (cleaner_manager 配置)..."
-	@DISPLAY=$${DISPLAY:-:1001} xhost +local: 2>/dev/null || true
-	@$(ROS_SETUP) && DISPLAY=$${DISPLAY:-:1001} rviz2 -d \
+	@$(ROS_SETUP) && rviz2 -d \
 		$$(ros2 pkg prefix cleaner_manager)/share/cleaner_manager/config/cleaner_manager.rviz
 
 # 全手动模式: 感知 + 导航 + 抓取全流程 (手动控制面板)
 full-manual:
+	@echo "[FULL-MANUAL] 清理残留相机进程..."
+	-@pkill -15 -f "[r]ealsense2_camera_node" 2>/dev/null; sleep 2; \
+	pkill -9 -f "[r]ealsense2_camera_node" 2>/dev/null; sleep 1
+	@echo "[FULL-MANUAL] 重置所有 RealSense USB 设备..."
+	-@lsusb | grep '8086:0b' | while read line; do \
+		bus=$$(echo "$$line" | awk '{print $$2}'); \
+		dev=$$(echo "$$line" | awk '{print $$4}' | tr -d ':'); \
+		usbreset "$$bus/$$dev" 2>/dev/null && echo "  [OK] Reset: $$bus/$$dev"; \
+	done; \
+	sleep 2
+	@echo "[FULL-MANUAL] 解绑 D455 的 uvcvideo 驱动..."
+	-@for iface in /sys/bus/usb/devices/*/idProduct; do \
+		product=$$(cat "$$iface" 2>/dev/null); \
+		if [ "$$product" = "0b5c" ]; then \
+			devdir=$$(dirname "$$iface"); \
+			for sub in $$devdir/*/driver; do \
+				if [ -L "$$sub" ] && [ "$$(basename $$(readlink $$sub))" = "uvcvideo" ]; then \
+					subdev=$$(basename $$(dirname "$$sub")); \
+					echo "$$subdev" > /sys/bus/usb/drivers/uvcvideo/unbind 2>/dev/null && \
+						echo "  [OK] Unbind uvcvideo: $$subdev"; \
+				fi; \
+			done; \
+		fi; \
+	done; \
+	sleep 1
 	@echo "[FULL-MANUAL] 启动手动控制全流程 (导航+相机+感知+机械臂+手动控制面板)..."
-	@DISPLAY=$${DISPLAY:-:1001} xhost +local: 2>/dev/null || true
+	@DISPLAY=$${DISPLAY:-:1} xhost +local: 2>/dev/null || true
 	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control_full.launch.py \
 		rviz:=true gui:=true \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
 		detector_type:=sam3 \
-		extrinsics_suffix:=_stereo_hand \
-		enable_depth_optimizer:=true
-
-# 仅手动控制节点+Panel (需其他模块已运行)
-manual-control:
-	@echo "[MANUAL-CONTROL] 启动手动控制节点+面板..."
-	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control.launch.py
+		extrinsics_suffix:=_stereo_hand
 
 # ============================================
 # 构建命令
@@ -404,7 +397,8 @@ cam-hand: cam-clean
 cam-chassis: cam-clean
 	@echo "[CAM] 启动底盘相机 (D435)..."
 	@$(ROS_SETUP) && ros2 launch camera_driver camera_driver.launch.py \
-		top_enable:=false hand_enable:=false chassis_enable:=true
+		top_enable:=false hand_enable:=false chassis_enable:=true \
+		enable_infra:=$(or $(enable_infra),false)
 
 # 启动双相机 (Top + Chassis)
 cam-dual: cam-clean
@@ -455,13 +449,17 @@ percept-multi-rviz:
 percept-full:
 	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz
 
-# 一键启动 - 使用 SAM3 检测器
+# 一键启动 - 使用 SAM3 检测器（与 percept-full 等效，保留别名）
 percept-full-sam3:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz
 
-# 同上，临时禁用 CDM（调试用）
+# FoundationStereo 被动双目深度 + SAM3 检测器（与 percept-full 等效，保留别名）
+percept-full-sam3-fs:
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz
+
+# 回退到原始深度 + SAM3（调试用：禁用 FoundationStereo，用原始 RealSense 深度）
 percept-full-sam3-nocdm:
-	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --detector=sam3 --no-cdm
+	@bash $(SCRIPTS_DIR)/start_perception_3d.sh --camera=dual --rviz --no-cdm
 
 # 一键启动 - SAM3, 无RViz
 percept-full-sam3-no-rviz:

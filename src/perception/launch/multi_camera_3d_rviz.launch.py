@@ -79,14 +79,18 @@ def generate_launch_description():
     
     # 检测器类型
     detector_type_arg = DeclareLaunchArgument(
-        'detector_type', default_value='dinox',
+        'detector_type', default_value='sam3',
         description='Detector type: dinox or sam3'
     )
 
-    # 检测参数
-    auto_detect_rate_arg = DeclareLaunchArgument(
-        'auto_detect_rate', default_value='6.0',
-        description='Auto detection rate in Hz (0=disable)'
+    # 检测参数 — 每相机独立，与硬件帧率对齐
+    top_detect_rate_arg = DeclareLaunchArgument(
+        'top_detect_rate', default_value='5.0',
+        description='Top camera (D455) detection rate in Hz'
+    )
+    chassis_detect_rate_arg = DeclareLaunchArgument(
+        'chassis_detect_rate', default_value='6.0',
+        description='Chassis camera (D435) detection rate in Hz'
     )
     
     # LiDAR 参数
@@ -119,8 +123,26 @@ def generate_launch_description():
 
     # CDM 深度优化开关
     enable_depth_optimizer_arg = DeclareLaunchArgument(
-        'enable_depth_optimizer', default_value='true',
+        'enable_depth_optimizer', default_value='false',
         description='Enable CDM depth optimization (set false to use raw RealSense depth)'
+    )
+
+    # FoundationStereo 被动双目深度（所有相机）
+    depth_source_arg = DeclareLaunchArgument(
+        'depth_source', default_value='foundation_stereo',
+        description="All cameras depth source: 'raw' (RealSense) or 'foundation_stereo'"
+    )
+    foundation_stereo_url_arg = DeclareLaunchArgument(
+        'foundation_stereo_url', default_value='http://192.168.112.14:8084',
+        description='FoundationStereo HTTP service URL'
+    )
+    top_enable_infra_arg = DeclareLaunchArgument(
+        'top_enable_infra', default_value='true',
+        description='Enable IR1/IR2 streams for top camera (required for FoundationStereo)'
+    )
+    chassis_enable_infra_arg = DeclareLaunchArgument(
+        'chassis_enable_infra', default_value='true',
+        description='Enable IR1/IR2 streams for chassis camera (required for FoundationStereo)'
     )
 
     # ==================== Included Launches ====================
@@ -137,6 +159,8 @@ def generate_launch_description():
             'hand_enable': 'false',
             'top_serial_no': LaunchConfiguration('top_serial_no'),
             'chassis_serial_no': LaunchConfiguration('chassis_serial_no'),
+            'top_enable_infra': LaunchConfiguration('top_enable_infra'),
+            'chassis_enable_infra': LaunchConfiguration('chassis_enable_infra'),
         }.items()
     )
 
@@ -154,8 +178,9 @@ def generate_launch_description():
             {'enable_top': LaunchConfiguration('enable_top')},
             {'enable_chassis': LaunchConfiguration('enable_chassis')},
             {'detector_type': LaunchConfiguration('detector_type')},
-            {'auto_detect_rate': LaunchConfiguration('auto_detect_rate')},
-            {'default_prompt': 'bottle.cup.can.box.barrel.toy.cabinet'},
+            {'top_detect_rate': LaunchConfiguration('top_detect_rate')},
+            {'chassis_detect_rate': LaunchConfiguration('chassis_detect_rate')},
+            {'default_prompt': 'coke can.scissors.rubiks cube.toy vegetable.toy food.bottle.box.black block'},
             # 匈牙利匹配融合参数
             {'fusion_distance_threshold': 0.2},  # 20cm 距离硬门控
             {'fusion_max_cost': 0.7},
@@ -167,6 +192,8 @@ def generate_launch_description():
             {'extrinsics_dir': config_dir},
             {'extrinsics_suffix': LaunchConfiguration('extrinsics_suffix')},
             {'enable_depth_optimizer': LaunchConfiguration('enable_depth_optimizer')},
+            {'depth_source': LaunchConfiguration('depth_source')},
+            {'foundation_stereo_url': LaunchConfiguration('foundation_stereo_url')},
             # 数据新鲜度配置
             {'data_max_age': 2.0},
             {'strict_data_freshness': False},
@@ -259,13 +286,18 @@ def generate_launch_description():
         chassis_serial_arg,
         detector_type_arg,
         perf_mode_arg,
-        auto_detect_rate_arg,
+        top_detect_rate_arg,
+        chassis_detect_rate_arg,
         lidar_topic_arg,
         enable_lidar_arg,
         rviz_arg,
         publish_rate_arg,
         extrinsics_suffix_arg,
         enable_depth_optimizer_arg,
+        depth_source_arg,
+        foundation_stereo_url_arg,
+        top_enable_infra_arg,
+        chassis_enable_infra_arg,
 
         # TF 基础 (注意: map->base_link 由导航节点发布，禁止感知覆盖)
         lidar_tf_node,

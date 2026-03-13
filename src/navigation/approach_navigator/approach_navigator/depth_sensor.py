@@ -74,6 +74,10 @@ class DepthSensor:
         # ========== 感知日志控制 ==========
         self._log_enabled: bool = True   # 可在 input() 期间关闭，避免淹没终端
 
+        # ========== 调试点云发布节流 (2Hz, 避免 Jetson 过载) ==========
+        self._debug_publish_interval: float = 0.5  # 500ms
+        self._last_debug_publish: float = 0.0
+
         # ========== 聚类后端检测 ==========
         self._use_sklearn = False
         try:
@@ -228,14 +232,17 @@ class DepthSensor:
             self._result_timestamp = time.time()
             self._processing_time_ms = (time.time() - t0) * 1000
 
-        # 8. 发布调试点云 (只在有订阅者时发布, 避免序列化开销)
-        self._publish_debug_clouds(front_points, obstacle_points, ground_points, clusters)
+        # 8. 发布调试点云 (2Hz 节流 + 仅有订阅者时发布)
+        now_mono = time.time()
+        if now_mono - self._last_debug_publish >= self._debug_publish_interval:
+            self._last_debug_publish = now_mono
+            self._publish_debug_clouds(front_points, obstacle_points, ground_points, clusters)
 
         t7 = time.time()
         total_ms = (t7 - t0) * 1000
 
         if self._log_enabled and nearest is not None:
-            self._node.get_logger().info(
+            self._node.get_logger().debug(
                 f"感知: front={len(front_points)} obs={len(obstacle_points)} "
                 f"ground={len(ground_points)} clusters={len(clusters)} "
                 f"nearest_z={nearest[2]:.3f}m  总{total_ms:.0f}ms "
@@ -329,8 +336,11 @@ class DepthSensor:
 
         # 将平面参数应用到全量地面候选点
         if normal is not None:
-            dists = np.abs(potential_ground @ normal - d_plane)
-            inliers = dists < 0.03
+            # 有符号距离: 正值=地面以下(或在地面上), 负值=地面以上(物体)
+            # 只将位于地面平面 1cm 以上至 3cm 以下范围内的点视为地面,
+            # 避免将低矮物体顶面(可能距地面仅 2-3cm)误判为地面点而去除
+            signed = potential_ground @ normal - d_plane
+            inliers = (signed >= -0.01) & (signed < 0.03)
         else:
             inliers = None
 
@@ -395,6 +405,8 @@ class DepthSensor:
 
             if abs(normal[1]) < 0.7:
                 continue
+            if normal[1] < 0:
+                normal = -normal   # 确保法向量指向+y方向(向下)，使有符号距离符号一致
 
             d     = float(np.dot(normal, p1))
             count = int(np.sum(np.abs(points @ normal - d) < distance_threshold))
@@ -414,7 +426,7 @@ class DepthSensor:
 
     def _cluster(self, points: np.ndarray,
                  tolerance: float = 0.05,
-                 min_size: int = 100,
+                 min_size: int = 50,
                  max_size: int = 10000) -> List[np.ndarray]:
         if len(points) < min_size:
             return []

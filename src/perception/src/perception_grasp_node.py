@@ -3,14 +3,17 @@
 Perception Grasp Node - 基于手部相机的抓取感知节点
 
 功能:
-- 订阅手部相机 RGB + Depth
-- 三服务并行: GraspAnything + DinoX + CDM
+- 订阅手部相机 RGB + Depth + IR 双目
+- 三服务并行: GraspAnything + DinoX/SAM3 + CDM 深度优化
 - 输出相机光学坐标系下的 3D 抓取位姿
 - 发布 GraspObjectArray (所有检测物体) 和优化后深度图
 
+参数:
+- depth_source: 'cdm'（默认，RealSense + CDM srv）、'raw'（RealSense 原始）或 'foundation_stereo'（IR 双目 FS）
+
 发布 Topics:
 - ~result (GraspObjectArray): 所有检测物体 + chosen_index
-- ~depth (sensor_msgs/Image): CDM优化后深度图 (16UC1, mm)
+- ~depth (sensor_msgs/Image): CDM 优化后深度图 (16UC1, mm)
 
 Service:
 - ~detect (GraspDetect): 按需检测服务
@@ -85,6 +88,11 @@ class PerceptionGraspNode(Node):
         if not self.has_parameter('log_level'):
             self.declare_parameter('log_level', 'INFO')
 
+        # 深度源: 'cdm'（默认，RealSense + CDM srv）、'raw'（RealSense 原始）或 'foundation_stereo'（IR 双目）
+        if not self.has_parameter('depth_source'):
+            self.declare_parameter('depth_source', 'cdm')
+        self.depth_source = self.get_parameter('depth_source').value
+
         # === 并发控制 ===
         self._detect_lock = threading.Lock()
         self._detecting = False
@@ -119,6 +127,23 @@ class PerceptionGraspNode(Node):
         )
         self._sync.registerCallback(self._sync_callback)
         self.log.info(f"Sync subscribe: {rgb_topic}, {depth_topic}")
+
+        # === IR 双目订阅 (仅 FoundationStereo 模式) ===
+        if self.depth_source == 'foundation_stereo':
+            self.ir_left = None
+            self.ir_right = None
+            self.ir_intrinsics = None
+            self._ir_lock = threading.Lock()
+            ir_left_topic  = camera_cfg.get('ir_left_topic',  '/camera/hand/infra1/image_rect_raw')
+            ir_right_topic = camera_cfg.get('ir_right_topic', '/camera/hand/infra2/image_rect_raw')
+            ir_info_topic  = camera_cfg.get('ir_info_topic',  '/camera/hand/infra2/camera_info')
+            self._ir_left_sub  = message_filters.Subscriber(self, Image, ir_left_topic,  qos_profile=SENSOR_QOS)
+            self._ir_right_sub = message_filters.Subscriber(self, Image, ir_right_topic, qos_profile=SENSOR_QOS)
+            self._ir_sync = message_filters.ApproximateTimeSynchronizer(
+                [self._ir_left_sub, self._ir_right_sub], queue_size=5, slop=0.1)
+            self._ir_sync.registerCallback(self._ir_sync_callback)
+            self.create_subscription(CameraInfo, ir_info_topic, self._ir_info_callback, SENSOR_QOS)
+            self.log.info(f"IR subscribe: {ir_left_topic}, {ir_right_topic}")
 
         # === 初始化检测服务 ===
         self._init_detectors()
@@ -159,6 +184,13 @@ class PerceptionGraspNode(Node):
                      f"dist_weight={self._chosen_policy.get('distance_weight', 0.0):.2f}, "
                      f"mode={self._chosen_policy.get('distance_mode', 'reciprocal')}")
         self.log.info(f"Chosen policy: {policy_str}")
+
+        # === 发布 default_prompt (single source of truth) ===
+        self._default_prompt_pub = self.create_publisher(String, '/piper/default_prompt', LATCHED_QOS)
+        prompt_msg = String()
+        prompt_msg.data = self._realtime_prompt
+        self._default_prompt_pub.publish(prompt_msg)
+        self.log.info(f"Published default_prompt: '{self._realtime_prompt}'")
 
         # === 可选: 订阅外部 prompt 覆盖默认值 ===
         prompt_topic = realtime_cfg.get('prompt_topic', '/usr/prompt/grasp')
@@ -230,15 +262,22 @@ class PerceptionGraspNode(Node):
             self.object_detector = DinoXDetectorOnline(det_config)
             self.log.info(f"DinoX initialized: {dinox_cfg.get('url')}")
 
-        # 3. DepthOptimizerOnline (CDM)
-        cdm_cfg = services_cfg.get('cdm', {})
-        cdm_config = SimpleConfig(
-            url=cdm_cfg.get('url', 'http://192.168.112.14:8082'),
-            chosen_policy=cdm_cfg.get('chosen_policy', 'dn'),
-            warmup=0
-        )
-        self.depth_optimizer = DepthOptimizerOnline(cdm_config)
-        self.log.info(f"CDM initialized: {cdm_cfg.get('url')}")
+        # 3. DepthOptimizerOnline (CDM 或 FoundationStereo)
+        if self.depth_source == 'foundation_stereo':
+            fs_cfg = services_cfg.get('foundation_stereo', {})
+            depth_url = fs_cfg.get('url', 'http://192.168.112.14:8084')
+            self.log.info(f"FoundationStereo depth optimizer: {depth_url}")
+            depth_config = SimpleConfig(url=depth_url, warmup=0)
+        else:
+            cdm_cfg = services_cfg.get('cdm', {})
+            depth_url = cdm_cfg.get('url', 'http://192.168.112.14:8082')
+            depth_config = SimpleConfig(
+                url=depth_url,
+                chosen_policy=cdm_cfg.get('chosen_policy', 'dn'),
+                warmup=0
+            )
+            self.log.info(f"CDM depth optimizer: {depth_url}")
+        self.depth_optimizer = DepthOptimizerOnline(depth_config)
 
     def _warmup(self):
         """预热 GraspAnything 服务"""
@@ -262,6 +301,32 @@ class PerceptionGraspNode(Node):
                 'cy': msg.k[5],
             }
             self.log.info(f"Camera intrinsics loaded: {msg.width}x{msg.height}")
+
+    def _ir_info_callback(self, msg):
+        """IR infra2 camera_info 回调 — 提取双目内参（一次性）"""
+        if self.ir_intrinsics is not None:
+            return
+        fx = msg.p[0]
+        tx = msg.p[3]  # -fx * baseline for right camera
+        baseline = -tx / fx if fx > 0 and tx != 0.0 else 0.054  # D435 default ~54mm
+        self.ir_intrinsics = {
+            'fx': fx, 'fy': msg.p[5], 'cx': msg.p[2], 'cy': msg.p[6],
+            'width': msg.width, 'height': msg.height,
+            'baseline': baseline,
+        }
+        self.log.info(f"IR intrinsics loaded: {msg.width}x{msg.height}, baseline={baseline:.4f}m")
+
+    def _ir_sync_callback(self, ir1_msg, ir2_msg):
+        """IR 双目同步回调 — 缓存最新帧"""
+        ir_left  = self.bridge.imgmsg_to_cv2(ir1_msg, 'passthrough')
+        ir_right = self.bridge.imgmsg_to_cv2(ir2_msg, 'passthrough')
+        if ir_left.dtype != np.uint8:
+            ir_left  = (ir_left  / ir_left.max()  * 255).astype(np.uint8) if ir_left.max()  > 0 else ir_left.astype(np.uint8)
+        if ir_right.dtype != np.uint8:
+            ir_right = (ir_right / ir_right.max() * 255).astype(np.uint8) if ir_right.max() > 0 else ir_right.astype(np.uint8)
+        with self._ir_lock:
+            self.ir_left  = ir_left
+            self.ir_right = ir_right
 
     def _sync_callback(self, rgb_msg, depth_msg):
         """同步回调 - RGB 和 Depth 时间戳对齐"""
@@ -290,6 +355,10 @@ class PerceptionGraspNode(Node):
         if new_prompt and new_prompt != self._realtime_prompt:
             self.log.info(f"Prompt updated: '{self._realtime_prompt}' -> '{new_prompt}'")
             self._realtime_prompt = new_prompt
+            # Re-publish so rviz panel and piper_grasp_node pick up the change
+            pub_msg = String()
+            pub_msg.data = new_prompt
+            self._default_prompt_pub.publish(pub_msg)
 
     def _realtime_timer_callback(self):
         """实时模式: 定时检测回调"""
@@ -409,8 +478,22 @@ class PerceptionGraspNode(Node):
             futures['dinox'] = self._executor.submit(
                 timed_call, 'dinox', self.object_detector.forward, prompt, rgb, _timing=detail_timing)
             if enable_cdm:
-                futures['cdm'] = self._executor.submit(
-                    timed_call, 'cdm', self.depth_optimizer.forward, rgb, depth_mm, 'dn', _timing=detail_timing)
+                if self.depth_source == 'foundation_stereo':
+                    with self._ir_lock:
+                        ir_left  = self.ir_left.copy()  if self.ir_left  is not None else None
+                        ir_right = self.ir_right.copy() if self.ir_right is not None else None
+                    ir_intr = self.ir_intrinsics
+                    if ir_left is not None and ir_right is not None and ir_intr is not None:
+                        futures['cdm'] = self._executor.submit(
+                            timed_call, 'cdm', self.depth_optimizer.forward_stereo,
+                            ir_left, ir_right, ir_intr, _timing=detail_timing)
+                    else:
+                        self.log.warn("DETECT: IR frames not ready, skip stereo depth")
+                else:
+                    # CDM 模式: RealSense 原始深度 + CDM srv
+                    futures['cdm'] = self._executor.submit(
+                        timed_call, 'cdm', self.depth_optimizer.forward,
+                        rgb, depth_mm, _timing=detail_timing)
             timing['submit'] = (time.time() - t_submit) * 1000
 
             t_wait = time.time()
@@ -774,9 +857,9 @@ class PerceptionGraspNode(Node):
                             depth_at_point = depth[cy_int, cx_int]
                             if not (min_depth < depth_at_point < max_depth):
                                 if depth_filtered_count == 0:
-                                    self.log.warn(f"DEPTH_REJECT T{target_idx}({target_category}): "
-                                                  f"pixel=({cx_int},{cy_int}), depth={depth_at_point:.3f}m, "
-                                                  f"range=[{min_depth},{max_depth}]")
+                                    self.log.debug(f"DEPTH_REJECT T{target_idx}({target_category}): "
+                                                   f"pixel=({cx_int},{cy_int}), depth={depth_at_point:.3f}m, "
+                                                   f"range=[{min_depth},{max_depth}]")
                                 depth_filtered_count += 1
                                 continue  # 深度不在有效范围，跳过此 affordance
 
@@ -883,7 +966,7 @@ class PerceptionGraspNode(Node):
                 cached_mask = mask_cache.get(target_idx)
                 depth_val = self._get_robust_depth(depth, cached_mask, target_bbox, min_depth, max_depth)
                 if not (min_depth < depth_val < max_depth):
-                    self.log.warn(f"ROBUST_DEPTH_REJECT T{target_idx}({target_category}): "
+                    self.log.debug(f"ROBUST_DEPTH_REJECT T{target_idx}({target_category}): "
                                   f"depth={depth_val:.3f}m, range=[{min_depth},{max_depth}]")
                 if min_depth < depth_val < max_depth:
                     point3d = self._deproject_pixel_to_point([cx, cy], depth_val)
@@ -903,8 +986,13 @@ class PerceptionGraspNode(Node):
                     width_valid = (obj_msg.grasp_width3d == 0.0 or obj_msg.grasp_width3d <= max_gripper_width)
 
                     if not width_valid:
-                        self.log.warn(f"WIDTH_REJECT T{target_idx}({target_category}): "
-                                      f"width={obj_msg.grasp_width3d*1000:.1f}mm > max={max_gripper_width*1000:.1f}mm")
+                        tp_px_dist = float(np.linalg.norm(
+                            np.array(tps[1]) - np.array(tps[0]))) if tps and len(tps) >= 2 else 0.0
+                        log_fn = self.log.warn if verbose else self.log.debug
+                        log_fn(f"WIDTH_REJECT T{target_idx}({target_category}): "
+                               f"width={obj_msg.grasp_width3d*1000:.1f}mm > max={max_gripper_width*1000:.1f}mm "
+                               f"[tp_px={tp_px_dist:.1f}px depth={depth_val:.3f}m "
+                               f"tp=({tps[0][0]:.0f},{tps[0][1]:.0f})->({tps[1][0]:.0f},{tps[1][1]:.0f})]")
 
                     # 更新最佳选择（只有宽度有效时才更新）
                     if width_valid:

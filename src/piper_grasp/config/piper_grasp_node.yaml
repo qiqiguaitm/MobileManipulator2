@@ -66,6 +66,7 @@ piper_ros:
   grasp:
     enabled: true
     perception_service: "/perception_grasp_node/detect"
+    default_prompt: 'bottle.cup.box.can.toy.pen.bag'  # fallback when observe_prompt is empty
     default_speed: 30            # %
     approach_speed: 20           # %
     min_z: -245                  # mm (min Z during grasp), -245 in real
@@ -130,6 +131,13 @@ piper_ros:
       # Persistence
       persist_file: "/tmp/piper_grasp_blacklist.json"
 
+    # Observe retry (code reads from grasp.observe, not ik_planning.observe)
+    observe:
+      timeout: 5.0               # seconds
+      retry_count: 3
+      retry_delay: 0.5           # seconds
+      min_score: 0.3
+
   # === IK Trajectory Planning (Pinocchio + CasADi) ===
   ik_planning:
     enabled: false               # Disabled: use segmented MoveJ as default
@@ -149,13 +157,6 @@ piper_ros:
     # Speed limits
     descent_speed: 15            # % speed for IK trajectory descent
     lift_speed: 20               # % speed for IK trajectory lift
-
-    # Observe retry
-    observe:
-      timeout: 5.0               # seconds
-      retry_count: 3
-      retry_delay: 0.5           # seconds
-      min_score: 0.3
 
   # === Recovery ===
   recovery:

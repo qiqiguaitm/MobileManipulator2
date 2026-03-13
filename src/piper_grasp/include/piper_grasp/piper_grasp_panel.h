@@ -35,6 +35,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 
 // Standard messages
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 // piper_msgs (all messages consolidated here in ROS2)
@@ -201,6 +202,7 @@ private:
     // Subscriptions
     rclcpp::Subscription<piper_msgs::msg::PiperStatus>::SharedPtr sub_status_;
     rclcpp::Subscription<piper_msgs::msg::PiperStatusMsg>::SharedPtr sub_arm_status_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_default_prompt_;
 
     // Service clients
     rclcpp::Client<piper_msgs::srv::EnableEnhanced>::SharedPtr srv_enable_;

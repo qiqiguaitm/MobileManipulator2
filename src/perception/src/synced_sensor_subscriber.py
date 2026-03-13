@@ -67,6 +67,9 @@ class SyncedSensorSubscriber:
         enable_lidar: bool = True,
         sync_slop: float = 0.1,
         qos_profile: Optional[QoSProfile] = None,
+        ir_left_topic: str = '',
+        ir_right_topic: str = '',
+        ir_info_topic: str = '',
     ):
         """
         初始化同步传感器订阅器
@@ -91,6 +94,9 @@ class SyncedSensorSubscriber:
         self.enable_lidar = enable_lidar
         self.sync_slop = sync_slop
         self.qos_profile = qos_profile or SENSOR_QOS
+        self.ir_left_topic = ir_left_topic
+        self.ir_right_topic = ir_right_topic
+        self.ir_info_topic = ir_info_topic
 
         self._bridge = CvBridge()
         self._latest_data: Optional[dict] = None
@@ -98,11 +104,19 @@ class SyncedSensorSubscriber:
         self._intrinsics: Optional[dict] = None
         self._connected = False
 
+        # IR data (independent sync, optional)
+        self._latest_ir: Optional[dict] = None
+        self._ir_lock = threading.Lock()
+        self._ir_intrinsics: Optional[dict] = None
+
         # 订阅器引用 (保持活跃)
         self._color_sub = None
         self._depth_sub = None
         self._lidar_sub = None
         self._sync = None
+        self._ir_left_sub = None
+        self._ir_right_sub = None
+        self._ir_sync = None
 
     @property
     def node(self) -> Node:
@@ -113,6 +127,11 @@ class SyncedSensorSubscriber:
     def intrinsics(self) -> Optional[dict]:
         """相机内参 {fx, fy, cx, cy, width, height}"""
         return self._intrinsics
+
+    @property
+    def ir_intrinsics(self) -> Optional[dict]:
+        """IR相机内参 {fx, fy, cx, cy, width, height, baseline}，仅当IR启用时有值"""
+        return self._ir_intrinsics
 
     @property
     def connected(self) -> bool:
@@ -188,8 +207,108 @@ class SyncedSensorSubscriber:
                 f'[SyncedSensor] 两路同步模式 (RGB+Depth), slop={self.sync_slop}s'
             )
 
+        # 3. Optional IR sync (independent from color/depth sync)
+        if self.ir_left_topic and self.ir_right_topic:
+            # Get IR2 camera_info for baseline (P matrix has Tx = -fx * baseline)
+            if self.ir_info_topic:
+                ir_info_msg = wait_for_message(
+                    self._node, CameraInfo, self.ir_info_topic,
+                    timeout=timeout, qos_profile=DEFAULT_QOS,
+                )
+                if ir_info_msg is not None:
+                    self._parse_ir_camera_info(ir_info_msg)
+                    self._logger.info(
+                        f'[SyncedSensor] IR内参获取成功: baseline={self._ir_intrinsics.get("baseline", 0):.4f}m'
+                    )
+                else:
+                    self._logger.warn('[SyncedSensor] IR camera_info获取超时，baseline未知')
+
+            self._ir_left_sub = message_filters.Subscriber(
+                self._node, Image, self.ir_left_topic, qos_profile=self.qos_profile
+            )
+            self._ir_right_sub = message_filters.Subscriber(
+                self._node, Image, self.ir_right_topic, qos_profile=self.qos_profile
+            )
+            self._ir_sync = message_filters.ApproximateTimeSynchronizer(
+                [self._ir_left_sub, self._ir_right_sub],
+                queue_size=10,
+                slop=self.sync_slop,
+            )
+            self._ir_sync.registerCallback(self._ir_sync_callback)
+            self._logger.info(
+                f'[SyncedSensor] IR双目同步模式已启用: {self.ir_left_topic}, {self.ir_right_topic}'
+            )
+
         self._connected = True
         return True
+
+    def _parse_ir_camera_info(self, msg: CameraInfo):
+        """从IR camera_info构建FS服务所需的内参格式（与capture_d435.py一致）。
+
+        对于stereo右相机(infra2): P = [fx, 0, cx, Tx, 0, fy, cy, 0, 0, 0, 1, 0]
+        其中 Tx = -fx * baseline，故 baseline = -Tx / fx
+
+        profiles    = 彩色相机内参（来自已解析的 self._intrinsics）
+        ir_profiles = IR相机内参（来自infra2 P矩阵，image_rect_raw已去畸变故distortion为零）
+        """
+        # IR intrinsics from P matrix (rectified projection matrix)
+        # All values must be native Python types (not numpy) for yaml.dump → safe_load
+        ir_fx = float(msg.p[0])
+        ir_fy = float(msg.p[5])
+        ir_cx = float(msg.p[2])
+        ir_cy = float(msg.p[6])
+        tx = float(msg.p[3])
+        baseline = float(-tx / ir_fx) if ir_fx > 0 and tx != 0.0 else 0.095
+
+        ir_res = f"{msg.width}x{msg.height}"
+
+        # Color intrinsics (parsed earlier from color/camera_info K matrix)
+        color = self._intrinsics or {}
+        color_w = int(color.get('width', msg.width))
+        color_h = int(color.get('height', msg.height))
+        color_res = f"{color_w}x{color_h}"
+
+        self._ir_intrinsics = {
+            'camera_id': 'realsense',
+            'baseline': round(baseline, 4),
+            'default_resolution': ir_res,
+            'profiles': [{
+                'resolution': color_res,
+                'image_width': color_w,
+                'image_height': color_h,
+                'fx': round(float(color.get('fx', ir_fx)), 3),
+                'fy': round(float(color.get('fy', ir_fy)), 3),
+                'cx': round(float(color.get('cx', ir_cx)), 3),
+                'cy': round(float(color.get('cy', ir_cy)), 3),
+                'distortion': color.get('distortion', [0.0, 0.0, 0.0, 0.0]),
+            }],
+            'ir_profiles': [{
+                'resolution': ir_res,
+                'image_width': msg.width,
+                'image_height': msg.height,
+                'fx': round(float(ir_fx), 3),
+                'fy': round(float(ir_fy), 3),
+                'cx': round(float(ir_cx), 3),
+                'cy': round(float(ir_cy), 3),
+                'distortion': [0.0, 0.0, 0.0, 0.0],  # image_rect_raw已去畸变
+            }],
+        }
+
+    def _ir_sync_callback(self, ir1_msg: Image, ir2_msg: Image):
+        """IR双目同步回调"""
+        ir_left = self._bridge.imgmsg_to_cv2(ir1_msg, 'passthrough')
+        ir_right = self._bridge.imgmsg_to_cv2(ir2_msg, 'passthrough')
+        # Ensure uint8 grayscale
+        if ir_left.dtype != np.uint8:
+            ir_left = (ir_left / ir_left.max() * 255).astype(np.uint8) if ir_left.max() > 0 else ir_left.astype(np.uint8)
+        if ir_right.dtype != np.uint8:
+            ir_right = (ir_right / ir_right.max() * 255).astype(np.uint8) if ir_right.max() > 0 else ir_right.astype(np.uint8)
+        with self._ir_lock:
+            self._latest_ir = {
+                'left': ir_left,
+                'right': ir_right,
+                'timestamp': ir1_msg.header.stamp,
+            }
 
     def disconnect(self):
         """断开订阅"""
@@ -204,14 +323,15 @@ class SyncedSensorSubscriber:
         self._logger.info('[SyncedSensor] 已断开连接')
 
     def _parse_camera_info(self, msg: CameraInfo):
-        """解析相机内参"""
+        """解析相机内参（所有值转为 native Python 类型，避免 numpy → YAML 序列化问题）"""
         self._intrinsics = {
-            'fx': msg.k[0],
-            'fy': msg.k[4],
-            'cx': msg.k[2],
-            'cy': msg.k[5],
-            'width': msg.width,
-            'height': msg.height,
+            'fx': float(msg.k[0]),
+            'fy': float(msg.k[4]),
+            'cx': float(msg.k[2]),
+            'cy': float(msg.k[5]),
+            'width': int(msg.width),
+            'height': int(msg.height),
+            'distortion': [round(float(c), 4) for c in msg.d[:4]] if len(msg.d) >= 4 else [0.0, 0.0, 0.0, 0.0],
         }
 
     def _sync_callback_with_lidar(self, color_msg: Image, depth_msg: Image, lidar_msg: PointCloud2):
@@ -234,7 +354,7 @@ class SyncedSensorSubscriber:
 
     def _copy_data(self, data: dict) -> dict:
         """深拷贝数据字典，避免返回共享引用"""
-        return {
+        result = {
             'rgb': data['rgb'].copy() if data['rgb'] is not None else None,
             'depth': data['depth'].copy() if data['depth'] is not None else None,
             'lidar_points': data['lidar_points'].copy() if data.get('lidar_points') is not None else None,
@@ -242,6 +362,15 @@ class SyncedSensorSubscriber:
             'timestamp': data['timestamp'],
             'frame_id': data['frame_id'],
         }
+        # Merge latest IR data (independent sync)
+        with self._ir_lock:
+            if self._latest_ir is not None:
+                result['ir_left'] = self._latest_ir['left'].copy()
+                result['ir_right'] = self._latest_ir['right'].copy()
+            else:
+                result['ir_left'] = None
+                result['ir_right'] = None
+        return result
 
     def _process_camera_data(self, color_msg: Image, depth_msg: Image) -> dict:
         """处理相机数据"""

@@ -15,6 +15,7 @@ Perception Grasp RViz Node - 抓取感知 RViz 可视化节点 (ROS2)
 """
 
 import math
+import time
 import threading
 from collections import deque
 from typing import Optional
@@ -103,8 +104,12 @@ class PerceptionGraspRVizNode(Node):
         self._smooth_max = None
         self._alpha = 0.1
 
-        # === 获取相机内参 ===
-        self._get_camera_info()
+        # === 订阅 camera_info (异步获取内参) ===
+        from rclpy.qos import qos_profile_sensor_data
+        self._info_sub = self.create_subscription(
+            CameraInfo, self._camera_info_topic,
+            self._camera_info_callback, qos_profile_sensor_data)
+        self.get_logger().info(f'等待相机内参: {self._camera_info_topic}')
 
         # === 订阅 RGB ===
         self._rgb_sub = self.create_subscription(
@@ -132,6 +137,10 @@ class PerceptionGraspRVizNode(Node):
             LATCHED_QOS
         )
         self.get_logger().info(f'订阅 depth: {self._depth_topic}')
+
+        # panel 节流 (避免相机帧率刷 panel 浪费 CPU)
+        self._panel_interval = 0.25  # 最快 4Hz
+        self._last_panel_time = 0.0
 
         # === 发布器 ===
         self._pointcloud_pub = self.create_publisher(
@@ -175,40 +184,22 @@ class PerceptionGraspRVizNode(Node):
         self._result_topic = self.get_parameter('result_topic').value
         self._camera_info_topic = self.get_parameter('camera_info_topic').value
 
-    def _get_camera_info(self):
-        """获取相机内参"""
-        self.get_logger().info(f'等待相机内参: {self._camera_info_topic}')
-        try:
-            # 使用一次性订阅获取
-            from rclpy.qos import qos_profile_sensor_data
-            msg = None
-            timeout = 10.0
-            start = self.get_clock().now()
-            sub = self.create_subscription(
-                CameraInfo, self._camera_info_topic,
-                lambda m: setattr(self, '_temp_info', m),
-                qos_profile_sensor_data
-            )
-            self._temp_info = None
-            while self._temp_info is None:
-                rclpy.spin_once(self, timeout_sec=0.1)
-                if (self.get_clock().now() - start).nanoseconds / 1e9 > timeout:
-                    raise RuntimeError('等待相机内参超时')
-            msg = self._temp_info
-            self.destroy_subscription(sub)
-
-            self._intrinsics = {
-                'fx': msg.k[0],
-                'fy': msg.k[4],
-                'cx': msg.k[2],
-                'cy': msg.k[5],
-                'width': msg.width,
-                'height': msg.height,
-            }
-            self.get_logger().info(f'内参: {msg.width}x{msg.height}')
-        except Exception as e:
-            self.get_logger().error(f'获取内参失败: {e}')
-            raise
+    def _camera_info_callback(self, msg: CameraInfo):
+        """异步获取相机内参 (只需要第一帧)"""
+        if self._intrinsics is not None:
+            return  # 已获取
+        self._intrinsics = {
+            'fx': msg.k[0],
+            'fy': msg.k[4],
+            'cx': msg.k[2],
+            'cy': msg.k[5],
+            'width': msg.width,
+            'height': msg.height,
+        }
+        self.get_logger().info(f'内参已获取: {msg.width}x{msg.height}')
+        # 取消订阅，不再需要
+        self.destroy_subscription(self._info_sub)
+        self._info_sub = None
 
     def _rgb_callback(self, msg: Image):
         """RGB 回调"""
@@ -227,17 +218,18 @@ class PerceptionGraspRVizNode(Node):
             self.get_logger().warn(f'RGB 解码失败: {e}')
 
     def _result_callback(self, msg: GraspObjectArray):
-        """Result 回调"""
+        """Result 回调 — 立即刷新 panel (跳过节流)"""
         with self._data_lock:
             self._latest_result = msg
             depth = self._latest_depth
             rgb = self._latest_rgb
 
         if depth is not None and rgb is not None:
+            self._last_panel_time = 0.0  # 重置节流，立即刷新
             self._visualize(rgb, depth, msg)
 
     def _depth_callback(self, msg: Image):
-        """Depth 回调"""
+        """Depth 回调 — 始终生成 2x2 panel (有无检测结果都显示)"""
         try:
             depth_mm = self._bridge.imgmsg_to_cv2(msg, 'passthrough')
             depth_m = depth_mm.astype(np.float32) / 1000.0
@@ -247,13 +239,21 @@ class PerceptionGraspRVizNode(Node):
                 result = self._latest_result
                 rgb = self._latest_rgb
 
-            if result is not None and rgb is not None:
-                self._visualize(rgb, depth_m, result)
+            if rgb is None:
+                return
+
+            # 节流: 避免相机帧率刷 panel
+            now = time.time()
+            if now - self._last_panel_time < self._panel_interval:
+                return
+            self._last_panel_time = now
+
+            self._visualize(rgb, depth_m, result)
         except Exception as e:
             self.get_logger().warn(f'Depth 解码失败: {e}')
 
-    def _visualize(self, rgb, depth, result):
-        """生成并发布所有可视化"""
+    def _visualize(self, rgb, depth, result=None):
+        """生成并发布所有可视化 (result 可为 None — 显示干净画面)"""
         stamp = self.get_clock().now().to_msg()
 
         # 1. 点云
@@ -272,6 +272,10 @@ class PerceptionGraspRVizNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Panel 生成失败: {e}')
 
+        # 以下仅在有检测结果时执行
+        if result is None:
+            return
+
         # 3. 3D Markers
         try:
             markers = self._create_markers(result, depth, stamp)
@@ -287,13 +291,13 @@ class PerceptionGraspRVizNode(Node):
             except Exception as e:
                 self.get_logger().warn(f'Pose 生成失败: {e}')
 
-    def _create_panel(self, rgb, depth, result):
-        """生成 2x2 可视化面板"""
+    def _create_panel(self, rgb, depth, result=None):
+        """生成 2x2 可视化面板 (result=None 时显示干净画面)"""
         img_h, img_w = rgb.shape[:2]
         panel_w, panel_h = img_w // 2, img_h // 2
 
-        chosen_idx = result.chosen_index
-        objects = result.objects
+        chosen_idx = result.chosen_index if result is not None else -1
+        objects = result.objects if result is not None else []
 
         # Panel 1: Detection
         vis_detection = rgb.copy()

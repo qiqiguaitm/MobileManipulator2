@@ -1,8 +1,20 @@
-robot_manager_node:
+# cleaner_manager unified configuration
+# Used by both manual_control_node (interactive) and cleaner_manager_node (autonomous)
+
+manual_control_node:
   ros__parameters:
-    tracked_objects_topic: "/object_tracker_node/tracked_objects"
-    min_track_score: 0.3
-    min_position_confidence: 0.3
+    observe_prompt: ""         # empty = use piper_grasp_node default_prompt (single source)
+    pick_speed: 30
+    lift_height: 200.0
+    observe_timeout: 10.0
+    pick_timeout: 60.0
+    place_timeout: 30.0
+    nav_timeout: 120.0
+    status_rate: 10.0
+
+cleaner_manager_node:
+  ros__parameters:
+    tracked_objects_topic: "/multi_camera_perception/fused/objects_3d"
     min_distance: 0.3          # m
     max_distance: 3.0          # m
     max_attempts: 3
@@ -10,8 +22,8 @@ robot_manager_node:
     scan_stable_frames: 3
     scan_stable_timeout: 3.0   # s
     pick_speed: 30             # 1-100%
-    lift_height: 200.0         # mm (pass-through to Piper)
-    observe_prompt: "bottle.cup.box"
+    lift_height: 200.0         # mm
+    observe_prompt: ""         # empty = use piper_grasp_node default_prompt (single source)
     observe_timeout: 10.0      # s
     pick_timeout: 60.0         # s
     place_timeout: 30.0        # s
@@ -20,3 +32,15 @@ robot_manager_node:
     error_cooldown: 5.0        # s
     max_error_retries: 3
     status_rate: 1.0           # Hz
+    target_ttl: 60.0           # s, target expiry; 0=disabled
+    match_threshold: 0.20      # m, position merge threshold (was 0.08)
+    min_observations: 2        # min frames before target enters candidate pool
+    wait_for_first_target_timeout: 15.0  # s, startup wait for perception
+    min_scan_time: 2.0         # s, minimum SCANNING dwell time
+    workspace_radius: 0.8      # m, geometric pre-filter before in_working_area RPC
+    # --- Grasp filter (TargetFilter, configurable via CleanerPanel at runtime) ---
+    grasp_z_min: -0.20          # m, base_link frame; floor=-0.15m (chassis 15cm high)
+    grasp_z_max:  0.35          # m, 35cm above base_link = 50cm above floor
+    grasp_distance_max: 3.0     # m, max grasp distance
+    grasp_physical_min_size: 0.02  # m, min object physical size (noise filter)
+    grasp_physical_max_size: 0.20  # m, max object physical size (background filter)

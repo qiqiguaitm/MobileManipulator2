@@ -1,0 +1,21 @@
+# UI -> ManualControlNode command
+
+uint8 CMD_DETECT = 1
+uint8 CMD_SELECT = 2
+uint8 CMD_GO = 3
+uint8 CMD_CANCEL = 4
+uint8 CMD_SET_PROMPT = 5
+uint8 CMD_SELECT_OBJECT = 6    # 直接选择物体 (无需先检测)
+
+uint8 command
+string prompt
+int32 target_index
+# CMD_SELECT_OBJECT 专用字段
+string object_id
+string category
+float64 distance
+geometry_msgs/Point target_position
+string position_frame    # 坐标系 ("map" 或 "base_link"，默认 "map")
+---
+bool success
+string message

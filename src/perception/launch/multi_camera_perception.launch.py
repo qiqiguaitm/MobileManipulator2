@@ -60,10 +60,14 @@ def generate_launch_description():
         description='Chassis camera serial number'
     )
 
-    # 自动检测频率
-    auto_detect_rate_arg = DeclareLaunchArgument(
-        'auto_detect_rate', default_value='10.0',
-        description='Auto detection rate in Hz (0=disable)'
+    # 自动检测频率 — 每相机独立，与硬件帧率对齐
+    top_detect_rate_arg = DeclareLaunchArgument(
+        'top_detect_rate', default_value='5.0',
+        description='Top camera (D455) detection rate in Hz'
+    )
+    chassis_detect_rate_arg = DeclareLaunchArgument(
+        'chassis_detect_rate', default_value='6.0',
+        description='Chassis camera (D435) detection rate in Hz'
     )
 
     # 融合距离阈值
@@ -138,8 +142,10 @@ def generate_launch_description():
             # 注意：需要配合相机驱动参数修改
             
             # 检测配置
-            {'auto_detect_rate': LaunchConfiguration('auto_detect_rate')},
+            {'top_detect_rate': LaunchConfiguration('top_detect_rate')},
+            {'chassis_detect_rate': LaunchConfiguration('chassis_detect_rate')},
             {'default_prompt': 'bottle.cup.box.barrel.toy.cabinet'},
+            {'min_score': 0.35},
             
             # 数据新鲜度配置（chassis相机可能需要更宽松的设置）
             {'data_max_age': 2.0},  # 2秒数据有效期（默认0.5秒可能太严格）
@@ -179,7 +185,8 @@ def generate_launch_description():
         enable_chassis_arg,
         top_serial_arg,
         chassis_serial_arg,
-        auto_detect_rate_arg,
+        top_detect_rate_arg,
+        chassis_detect_rate_arg,
         fusion_threshold_arg,
         enable_lidar_arg,
         lidar_topic_arg,

@@ -16,6 +16,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 
+#include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -77,6 +78,7 @@ public:
     pose_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("pose", 5);
     aligned_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_points", 5);
     status_pub_ = this->create_publisher<hdl_localization::msg::ScanMatchingStatus>("status", 5);
+    localization_status_pub_ = this->create_publisher<std_msgs::msg::Bool>("localization_status", 5);
 
     // global localization
     use_global_localization_ = this->declare_parameter<bool>("use_global_localization", true);
@@ -148,7 +150,8 @@ private:
     // 声明其他参数
     this->declare_parameter<double>("cool_time_duration", 2.0);
     this->declare_parameter<bool>("enable_robot_odometry_prediction", false);
-    this->declare_parameter<double>("status_max_correspondence_dist", 0.5);
+    this->declare_parameter<double>("status_max_correspondence_dist", 0.2);
+    this->declare_parameter<double>("localization_inlier_threshold", 0.95);
 
     // 参数化初始位姿
     this->declare_parameter<bool>("specify_init_pose", false);
@@ -327,6 +330,36 @@ private:
 
     // correct
     auto aligned = pose_estimator_->correct(stamp, filtered);
+
+    // --- localization_status: subsampled inlier check ---
+    {
+      double max_corr_dist = 0.5;
+      this->get_parameter_or("status_max_correspondence_dist", max_corr_dist, 0.5);
+      double threshold = 0.3;
+      this->get_parameter_or("localization_inlier_threshold", threshold, 0.3);
+      double max_dist_sq = max_corr_dist * max_corr_dist;
+
+      int step = std::max(1, (int)aligned->size() / 500);
+      int inlier = 0, checked = 0;
+      std::vector<int> nn_idx(1);
+      std::vector<float> nn_dist(1);
+      for (size_t i = 0; i < aligned->size(); i += step) {
+        const auto& pt = aligned->at(i);
+        if (registration_->getSearchMethodTarget()->nearestKSearch(pt, 1, nn_idx, nn_dist) > 0) {
+          checked++;
+          if (nn_dist[0] < max_dist_sq) {
+            inlier++;
+          }
+        }
+      }
+      bool ok = registration_->hasConverged()
+             && checked > 0
+             && (double)inlier / checked > threshold;
+
+      std_msgs::msg::Bool status_msg;
+      status_msg.data = ok;
+      localization_status_pub_->publish(status_msg);
+    }
 
     if(aligned_pub_->get_subscription_count()) {
       sensor_msgs::msg::PointCloud2 aligned_msg;
@@ -559,7 +592,7 @@ private:
             registration_->align(aligned, candidate_pose.matrix().cast<float>());
 
             if (!registration_->hasConverged()) {
-              RCLCPP_INFO(this->get_logger(), "  Candidate[%zu]: NDT not converged, skip (sc_dist=%.3f)", i, sc_dist);
+              RCLCPP_DEBUG(this->get_logger(), "  Candidate[%zu]: NDT not converged, skip (sc_dist=%.3f)", i, sc_dist);
               continue;
             }
 
@@ -593,7 +626,7 @@ private:
             double drift_factor = std::exp(-std::max(0.0, drift - 1.0) / 2.0);
             double combined_score = sc_confidence * inlier_fraction * ndt_quality * drift_factor;
 
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_DEBUG(this->get_logger(),
               "  Candidate[%zu]: sc_dist=%.3f, ndt_fit=%.3f, ndt_q=%.2f, inlier=%.2f, drift=%.2f, score=%.4f, pos=(%.2f, %.2f)",
               i, sc_dist, ndt_score, ndt_quality, inlier_fraction, drift, combined_score,
               ndt_result(0, 3), ndt_result(1, 3));
@@ -801,6 +834,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pose_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_pub_;
   rclcpp::Publisher<hdl_localization::msg::ScanMatchingStatus>::SharedPtr status_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr localization_status_pub_;
 
   // 服务
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr relocalize_server_;

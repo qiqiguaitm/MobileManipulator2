@@ -13,7 +13,7 @@ perception_grasp_node:
       realtime_mode:
         enabled: false
         rate: 1.0
-        default_prompt: 'pen.box.phone.bottle.toy'
+        default_prompt: 'bottle.cup.box.can.toy.pen.bag'
         prompt_topic: '/usr/prompt/grasp'
 
     # 检测服务配置

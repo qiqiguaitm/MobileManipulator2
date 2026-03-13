@@ -18,7 +18,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -62,16 +62,37 @@ def generate_launch_description():
     )
 
     # Image configuration (1280x720 matching LiDAR calibration)
+    # D435 supports 6fps, D455 supports 5fps — no common low-fps value
     depth_profile_arg = DeclareLaunchArgument(
         'depth_profile', default_value='1280,720,6',
-        description='Depth stream profile (width,height,fps)'
+        description='Depth stream profile for D435 cameras (width,height,fps)'
     )
     color_profile_arg = DeclareLaunchArgument(
         'color_profile', default_value='1280,720,6',
-        description='Color stream profile (width,height,fps)'
+        description='Color stream profile for D435 cameras (width,height,fps)'
+    )
+    top_depth_profile_arg = DeclareLaunchArgument(
+        'top_depth_profile', default_value='1280,720,5',
+        description='Depth stream profile for D455 top camera (width,height,fps)'
+    )
+    top_color_profile_arg = DeclareLaunchArgument(
+        'top_color_profile', default_value='1280,720,5',
+        description='Color stream profile for D455 top camera (width,height,fps)'
     )
 
     # Feature flags
+    top_enable_infra_arg = DeclareLaunchArgument(
+        'top_enable_infra', default_value='false',
+        description='Enable IR1/IR2 streams for top camera (needed for FoundationStereo)'
+    )
+    chassis_enable_infra_arg = DeclareLaunchArgument(
+        'chassis_enable_infra', default_value='false',
+        description='Enable IR1/IR2 streams for chassis camera (needed for FoundationStereo)'
+    )
+    hand_enable_infra_arg = DeclareLaunchArgument(
+        'hand_enable_infra', default_value='false',
+        description='Enable IR1/IR2 streams for hand camera (needed for FoundationStereo)'
+    )
     enable_depth_arg = DeclareLaunchArgument(
         'enable_depth', default_value='true',
         description='Enable depth stream'
@@ -93,8 +114,8 @@ def generate_launch_description():
         description='Enable depth alignment to color'
     )
     initial_reset_arg = DeclareLaunchArgument(
-        'initial_reset', default_value='true',
-        description='Reset device on startup'
+        'initial_reset', default_value='false',
+        description='Reset device on startup (ROS1: top=false, hand/chassis=true)'
     )
     publish_tf_arg = DeclareLaunchArgument(
         'publish_tf', default_value='true',
@@ -107,8 +128,8 @@ def generate_launch_description():
 
     # Startup delay between cameras (seconds)
     camera_delay_arg = DeclareLaunchArgument(
-        'camera_delay', default_value='3.0',
-        description='Delay between camera startups to avoid USB conflicts'
+        'camera_delay', default_value='5.0',
+        description='Stagger interval: hand at 1x, chassis at 2x (seconds)'
     )
 
     # Get launch configurations
@@ -120,6 +141,8 @@ def generate_launch_description():
     chassis_serial_no = LaunchConfiguration('chassis_serial_no')
     depth_profile = LaunchConfiguration('depth_profile')
     color_profile = LaunchConfiguration('color_profile')
+    top_depth_profile = LaunchConfiguration('top_depth_profile')
+    top_color_profile = LaunchConfiguration('top_color_profile')
     enable_depth = LaunchConfiguration('enable_depth')
     enable_color = LaunchConfiguration('enable_color')
     pointcloud_enable = LaunchConfiguration('pointcloud_enable')
@@ -128,33 +151,25 @@ def generate_launch_description():
     initial_reset = LaunchConfiguration('initial_reset')
     publish_tf = LaunchConfiguration('publish_tf')
     enable_camera_tf = LaunchConfiguration('enable_camera_tf')
+    top_enable_infra = LaunchConfiguration('top_enable_infra')
 
-    # Common camera arguments
-    def get_camera_args(camera_name, camera_namespace, serial_no):
+    # Common camera arguments shared across all cameras
+    def _common_args():
         return {
-            'camera_name': camera_name,
-            'camera_namespace': camera_namespace,
-            'serial_no': serial_no,
-            'initial_reset': initial_reset,
             'enable_depth': enable_depth,
             'enable_color': enable_color,
             'enable_infra1': 'false',
             'enable_infra2': 'false',
             'enable_gyro': 'false',
             'enable_accel': 'false',
-            'depth_module.depth_profile': depth_profile,
-            'rgb_camera.color_profile': color_profile,
             'enable_sync': enable_sync,
             'align_depth.enable': align_depth_enable,
             'pointcloud.enable': pointcloud_enable,
             'publish_tf': publish_tf,
-            # 飞点过滤: 空间滤波消除深度边缘伪像，时序滤波降低帧间噪声
-            'spatial_filter.enable': 'true',
-            'temporal_filter.enable': 'true',
         }
 
-    # ========== Top Camera (starts immediately) ==========
-    # Topic format: /{camera_namespace}/{camera_name}/... → /camera/top/...
+    # ========== Top Camera (D455, starts immediately) ==========
+    # D455 uses 5fps (no 6fps support), separate profile args
     top_camera_launch = GroupAction(
         condition=IfCondition(top_enable),
         actions=[
@@ -162,7 +177,25 @@ def generate_launch_description():
                 PythonLaunchDescriptionSource(
                     os.path.join(realsense_dir, 'launch', 'rs_launch.py')
                 ),
-                launch_arguments=get_camera_args('top', 'camera', top_serial_no).items()
+                launch_arguments={
+                    'camera_name': 'top',
+                    'camera_namespace': 'camera',
+                    'serial_no': top_serial_no,
+                    # Force reset when IR enabled to ensure proper stream reconfiguration
+                    'initial_reset': PythonExpression(
+                        ["'true' if '", top_enable_infra, "' == 'true' else '", initial_reset, "'"]
+                    ),
+                    'depth_module.depth_profile': top_depth_profile,
+                    'rgb_camera.color_profile': top_color_profile,
+                    **_common_args(),
+                    # Override infra streams for top camera (FoundationStereo support)
+                    'enable_infra1': top_enable_infra,
+                    'enable_infra2': top_enable_infra,
+                    # Match infra profile to depth profile when infra is enabled
+                    'depth_module.infra_profile': PythonExpression(
+                        ["'1280,720,5' if '", top_enable_infra, "' == 'true' else '0,0,0'"]
+                    ),
+                }.items()
             )
         ]
     )
@@ -179,30 +212,37 @@ def generate_launch_description():
         actions = []
 
         def _resolved_camera_args(camera_name, serial_key):
+            """D435 cameras (hand/chassis) — use depth_profile/color_profile (6fps default)."""
+            # Per-camera infra enable flag
+            infra_key = f'{camera_name}_enable_infra'
+            enable_infra = cfg.get(infra_key, 'false')
+            depth_profile = cfg.get('depth_profile', '1280,720,6')
+            # Match infra profile to depth profile when infra is enabled
+            infra_profile = depth_profile if enable_infra.lower() == 'true' else '0,0,0'
             return {
                 'camera_name': camera_name,
                 'camera_namespace': 'camera',
                 'serial_no': cfg.get(serial_key, ''),
-                'initial_reset': cfg.get('initial_reset', 'true'),
+                'initial_reset': 'true',  # hand/chassis hardcode true (matching ROS1)
                 'enable_depth': cfg.get('enable_depth', 'true'),
                 'enable_color': cfg.get('enable_color', 'true'),
-                'enable_infra1': 'false',
-                'enable_infra2': 'false',
+                'enable_infra1': enable_infra,
+                'enable_infra2': enable_infra,
                 'enable_gyro': 'false',
                 'enable_accel': 'false',
-                'depth_module.depth_profile': cfg.get('depth_profile', '1280,720,6'),
+                'depth_module.depth_profile': depth_profile,
                 'rgb_camera.color_profile': cfg.get('color_profile', '1280,720,6'),
+                'depth_module.infra_profile': infra_profile,
                 'enable_sync': cfg.get('enable_sync', 'true'),
                 'align_depth.enable': cfg.get('align_depth_enable', 'true'),
                 'pointcloud.enable': cfg.get('pointcloud_enable', 'false'),
                 'publish_tf': cfg.get('publish_tf', 'true'),
-                # 飞点过滤: 空间滤波消除深度边缘伪像，时序滤波降低帧间噪声
-                'spatial_filter.enable': 'true',
-                'temporal_filter.enable': 'true',
             }
 
-        delay = float(cfg.get('camera_delay', '3.0'))
+        delay = float(cfg.get('camera_delay', '5.0'))
 
+        # Stagger cameras: hand at 1×delay, chassis at 2×delay.
+        # Same-time startup causes USB bus contention (all on Bus 002).
         if cfg.get('hand_enable', 'false').lower() == 'true':
             actions.append(TimerAction(
                 period=delay,
@@ -214,7 +254,7 @@ def generate_launch_description():
 
         if cfg.get('chassis_enable', 'false').lower() == 'true':
             actions.append(TimerAction(
-                period=delay,
+                period=delay * 2,
                 actions=[IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(rs_launch),
                     launch_arguments=_resolved_camera_args('chassis', 'chassis_serial_no').items()
@@ -247,6 +287,11 @@ def generate_launch_description():
         chassis_serial_arg,
         depth_profile_arg,
         color_profile_arg,
+        top_depth_profile_arg,
+        top_color_profile_arg,
+        top_enable_infra_arg,
+        chassis_enable_infra_arg,
+        hand_enable_infra_arg,
         enable_depth_arg,
         enable_color_arg,
         pointcloud_enable_arg,

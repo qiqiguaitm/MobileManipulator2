@@ -8,7 +8,7 @@ Panels:
     Tree Height: 441
   - Class: piper_grasp/PiperGraspPanel
     Name: Piper Grasp Control
-    prompt: bottle.cup.box.toy.pen
+    prompt: bottle.cup.box.can.toy.pen.bag
   - Class: rviz_common/Views
     Expanded:
       - /Current View1

@@ -94,8 +94,8 @@ GlobalLocalizationResults GlobalLocalizationSC::query(
     size_t idx = candidate_indices[i];
     auto [dist, shift] = sc_utils::distanceBtnScanContext(query_desc, entries_[idx].descriptor);
 
-    RCLCPP_INFO(node_->get_logger(), "SC candidate %zu: dist=%.3f, shift=%d, pos=(%.2f, %.2f)",
-                idx, dist, shift, entries_[idx].pose(0, 3), entries_[idx].pose(1, 3));
+    RCLCPP_DEBUG(node_->get_logger(), "SC candidate %zu: dist=%.3f, shift=%d, pos=(%.2f, %.2f)",
+                 idx, dist, shift, entries_[idx].pose(0, 3), entries_[idx].pose(1, 3));
 
     if (dist <= sc_dist_threshold_) {
       candidates.push_back({(int)idx, dist, shift});
@@ -129,9 +129,9 @@ GlobalLocalizationResults GlobalLocalizationSC::query(
     double inlier_fraction = 1.0 - cand.dist;
     results.push_back(std::make_shared<GlobalLocalizationResult>(cand.dist, inlier_fraction, pose));
 
-    RCLCPP_INFO(node_->get_logger(), "SC result[%d]: entry=%d, dist=%.3f, yaw=%.1fdeg, pos=(%.2f, %.2f)",
-                i, cand.entry_idx, cand.dist, yaw_offset * 180.0 / M_PI,
-                pose.translation().x(), pose.translation().y());
+    RCLCPP_DEBUG(node_->get_logger(), "SC result[%d]: entry=%d, dist=%.3f, yaw=%.1fdeg, pos=(%.2f, %.2f)",
+                 i, cand.entry_idx, cand.dist, yaw_offset * 180.0 / M_PI,
+                 pose.translation().x(), pose.translation().y());
   }
 
   return GlobalLocalizationResults(results);

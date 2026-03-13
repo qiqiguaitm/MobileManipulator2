@@ -355,8 +355,8 @@ class MultiCameraRVizNode(Node):
                 # 复制 rgb 用于后续发布，避免数据竞争
                 rgb_copy = rgb.copy() if rgb is not None else None
 
-            # 有检测结果时立即发布检测图像（跟随 RGB 帧率）
-            if objects is not None and rgb_copy is not None:
+            # 始终发布检测图像（无检测结果时显示原始图像）
+            if rgb_copy is not None:
                 self._publish_detection_image(camera_name, rgb_copy, objects)
 
         except Exception as e:
@@ -1010,7 +1010,7 @@ class MultiCameraRVizNode(Node):
     def _fused_objects_callback(self, msg: Object3DArray):
         """融合结果回调"""
         obj_count = len(msg.objects) if msg else 0
-        self.get_logger().info(f'[FUSED_VIZ] 收到融合结果: {obj_count} objects')
+        self.get_logger().debug(f'[FUSED_VIZ] 收到融合结果: {obj_count} objects')
 
         with self._fused_lock:
             self._latest_fused_objects = msg
