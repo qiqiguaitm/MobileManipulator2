@@ -13,9 +13,11 @@
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
+import struct
 import sys
 import time
 from io import BytesIO
@@ -712,7 +714,12 @@ class DepthOptimizerOnline:
         # FoundationStereo 配置
         self.fs_url = getattr(cfg, 'fs_url', 'http://192.168.112.14:8084')
         self.fs_api_url = f'{self.fs_url}/api/predict'
+        self.fs_raw_url = f'{self.fs_url}/api/predict_raw'
         self.fs_vis_url = f'{self.fs_url}/api/predict_vis'
+
+        # Intrinsics 缓存（避免每次都传 YAML）
+        self._intr_hash = None      # 服务端返回的 MD5 hex
+        self._intr_bytes = None     # 上次发送的 intrinsics bytes
 
         warmup_runs = getattr(cfg, 'warmup', 0)
         if warmup_runs > 0:
@@ -974,6 +981,9 @@ class DepthOptimizerOnline:
                        get_vis=False, _timing=None) -> Dict:
         """被动双目深度估计（FoundationStereo）
 
+        使用 /api/predict_raw 端点，返回 raw uint16 bytes（省去 PNG 编解码）。
+        intrinsics 首次发送后缓存 hash，后续请求仅传 header。
+
         Args:
             ir_left: 左目 IR 灰度图（numpy array / 文件路径 str / bytes）
             ir_right: 右目 IR 灰度图（numpy array / 文件路径 str / bytes）
@@ -997,22 +1007,6 @@ class DepthOptimizerOnline:
             _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 95])
             return buf.tobytes()
 
-        def _encode_color(img):
-            if isinstance(img, str):
-                img = cv2.imread(img, cv2.IMREAD_COLOR)
-            elif isinstance(img, bytes):
-                img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_COLOR)
-            _, buf = cv2.imencode('.png', img)
-            return buf.tobytes()
-
-        def _encode_depth(img):
-            if isinstance(img, str):
-                img = cv2.imread(img, cv2.IMREAD_UNCHANGED)
-            elif isinstance(img, bytes):
-                img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-            _, buf = cv2.imencode('.png', img)
-            return buf.tobytes()
-
         def _encode_intrinsics(intr):
             if isinstance(intr, str):
                 with open(intr, 'rb') as f:
@@ -1028,29 +1022,48 @@ class DepthOptimizerOnline:
             ir_right_bytes = _encode_ir(ir_right)
             intrinsics_bytes = _encode_intrinsics(intrinsics)
 
+            # 构建 multipart files
             files = {
-                'left_ir':    ('left_ir.jpg',     ir_left_bytes,     'image/jpeg'),
-                'right_ir':   ('right_ir.jpg',    ir_right_bytes,    'image/jpeg'),
-                'intrinsics': ('intrinsics.yaml', intrinsics_bytes, 'application/octet-stream'),
+                'left_ir':  ('left_ir.jpg',  ir_left_bytes,  'image/jpeg'),
+                'right_ir': ('right_ir.jpg', ir_right_bytes, 'image/jpeg'),
             }
-            if rgb is not None:
-                files['rgb'] = ('rgb.png', _encode_color(rgb), 'image/png')
-            if raw_depth is not None:
-                files['raw_depth'] = ('depth.png', _encode_depth(raw_depth), 'image/png')
+
+            # Intrinsics 缓存：内容不变时用 hash 代替重传
+            headers = {}
+            if (self._intr_hash is not None
+                    and self._intr_bytes is not None
+                    and intrinsics_bytes == self._intr_bytes):
+                # 服务端已缓存，仅传 hash
+                headers['X-Intrinsics-Hash'] = self._intr_hash
+            else:
+                # 首次或内容变化，完整发送
+                files['intrinsics'] = ('intrinsics.yaml', intrinsics_bytes,
+                                       'application/octet-stream')
+                self._intr_bytes = intrinsics_bytes
 
             t1 = time.time()
 
-            resp = self.session.post(self.fs_api_url, files=files, timeout=60)
+            resp = self.session.post(self.fs_raw_url, files=files,
+                                     headers=headers, timeout=60)
             resp.raise_for_status()
 
             t2 = time.time()
 
-            depth_arr = cv2.imdecode(
-                np.frombuffer(resp.content, dtype=np.uint8),
-                cv2.IMREAD_UNCHANGED
-            )
-            if depth_arr is None:
-                return {'success': False, 'error': 'Failed to decode depth PNG from response'}
+            # 更新 intrinsics hash 缓存
+            resp_hash = resp.headers.get('X-Intrinsics-Hash')
+            if resp_hash:
+                self._intr_hash = resp_hash
+
+            # 解码 raw uint16 depth
+            data = resp.content
+            if len(data) < 8:
+                return {'success': False, 'error': 'Response too short for raw depth'}
+            h, w = struct.unpack('<II', data[:8])
+            expected = 8 + h * w * 2
+            if len(data) != expected:
+                return {'success': False,
+                        'error': f'Raw depth size mismatch: got {len(data)}, expected {expected}'}
+            depth_arr = np.frombuffer(data[8:], dtype=np.uint16).reshape(h, w)
 
             result = {
                 'success': True,
@@ -1060,7 +1073,13 @@ class DepthOptimizerOnline:
             }
 
             if get_vis:
-                resp_vis = self.session.post(self.fs_vis_url, files=files, timeout=60)
+                # vis 仍用原 PNG 端点（不在关键路径上）
+                vis_files = {
+                    'left_ir':    ('left_ir.jpg',     ir_left_bytes,     'image/jpeg'),
+                    'right_ir':   ('right_ir.jpg',    ir_right_bytes,    'image/jpeg'),
+                    'intrinsics': ('intrinsics.yaml', intrinsics_bytes, 'application/octet-stream'),
+                }
+                resp_vis = self.session.post(self.fs_vis_url, files=vis_files, timeout=60)
                 resp_vis.raise_for_status()
                 vis_arr = cv2.imdecode(
                     np.frombuffer(resp_vis.content, dtype=np.uint8),
