@@ -1377,11 +1377,9 @@ def main():
                        help='SAM3 service URL (default: http://192.168.112.14:8081)')
     parser.add_argument('--fs-url', type=str, default='http://192.168.112.14:8084',
                        help='FoundationStereo service URL (default: http://192.168.112.14:8084)')
-    parser.add_argument('--top-dir', type=str, default='/home/didi/workspace/MobileManipulator2/data/top_captures/20260312_023303',
-                       help='Top camera capture directory')
-    parser.add_argument('--chassis-dir', type=str,
-                       default='/home/didi/workspace/MobileManipulator2/data/chassis_captures/20260309_152956',
-                       help='Chassis camera capture directory')
+    parser.add_argument('--data-dir', type=str,
+                       default='/data/workspace/MobileManipulator2/data/robot_captures',
+                       help='Capture data directory (auto-discovers timestamped subdirs)')
     parser.add_argument('--text-prompt', type=str, default='pen,box,phone,bottle,toy',
                        help='SAM3 text prompt for parallel mode')
     args = parser.parse_args()
@@ -1426,22 +1424,28 @@ def main():
 
     # 加载立体相机数据 (Stereo 测试需要)
     stereo_available = False
-    top_frames = chassis_frames = top_intrinsics = chassis_intrinsics = None
-    if os.path.isdir(args.top_dir) and os.path.isdir(args.chassis_dir):
-        try:
-            print("\n加载立体相机数据...")
-            top_frames, top_intrinsics = load_camera_data(args.top_dir)
-            chassis_frames, chassis_intrinsics = load_camera_data(args.chassis_dir)
-            stereo_available = True
-        except Exception as e:
-            print(f"加载立体相机数据失败, 跳过 Stereo 测试: {e}")
+    camera_datasets = []  # list of (name, frames, intrinsics)
+    if os.path.isdir(args.data_dir):
+        subdirs = sorted([
+            d for d in os.listdir(args.data_dir)
+            if os.path.isdir(os.path.join(args.data_dir, d))
+        ])
+        if subdirs:
+            print(f"\n加载立体相机数据 ({args.data_dir})...")
+            for subdir in subdirs:
+                cap_dir = os.path.join(args.data_dir, subdir)
+                try:
+                    frames, intrinsics = load_camera_data(cap_dir)
+                    camera_datasets.append((subdir, frames, intrinsics))
+                except Exception as e:
+                    print(f"  跳过 {subdir}: {e}")
+            if camera_datasets:
+                stereo_available = True
+                print(f"  共加载 {len(camera_datasets)} 组相机数据")
+        else:
+            print(f"\n[Stereo] 跳过 - {args.data_dir} 下无子目录")
     else:
-        missing = []
-        if not os.path.isdir(args.top_dir):
-            missing.append(args.top_dir)
-        if not os.path.isdir(args.chassis_dir):
-            missing.append(args.chassis_dir)
-        print(f"\n[Stereo] 跳过 - 目录不存在: {', '.join(missing)}")
+        print(f"\n[Stereo] 跳过 - 目录不存在: {args.data_dir}")
 
     text_prompt_dinox = 'pen.box.phone.bottle.toy'
     text_prompt_sam3 = 'pen,box,phone,bottle,toy'
@@ -1585,12 +1589,10 @@ def main():
             fs_service = DepthOptimizerOnline(SimpleConfig(fs_url=args.fs_url, warmup=0))
 
             stereo_args_list = []
-            for f in top_frames:
-                stereo_args_list.append(
-                    (f'top:{f["idx"]}', (f['ir_left'], f['ir_right'], top_intrinsics)))
-            for f in chassis_frames:
-                stereo_args_list.append(
-                    (f'chassis:{f["idx"]}', (f['ir_left'], f['ir_right'], chassis_intrinsics)))
+            for cam_name, frames, intrinsics in camera_datasets:
+                for f in frames:
+                    stereo_args_list.append(
+                        (f'{cam_name}:{f["idx"]}', (f['ir_left'], f['ir_right'], intrinsics)))
 
             result = benchmark_with_timing(
                 func=fs_service.forward_stereo,
@@ -1644,7 +1646,7 @@ def main():
 
     # ========== 7. 并发 SAM3+Stereo 双路测试 ==========
     stereo_concurrent_result = None
-    if stereo_available and fs_service is not None:
+    if stereo_available and fs_service is not None and len(camera_datasets) >= 2:
         try:
             # 复用已有的 SAM3 服务
             if 'sam3_service' not in dir():
@@ -1656,13 +1658,16 @@ def main():
                 )
                 sam3_service = SAM3Online(cfg)
 
+            cam_a_name, cam_a_frames, cam_a_intrinsics = camera_datasets[0]
+            cam_b_name, cam_b_frames, cam_b_intrinsics = camera_datasets[1]
+
             stereo_concurrent_result = benchmark_concurrent_sam3_stereo_2way(
                 sam3_service=sam3_service,
                 fs_service=fs_service,
-                top_frames=top_frames,
-                top_intrinsics=top_intrinsics,
-                chassis_frames=chassis_frames,
-                chassis_intrinsics=chassis_intrinsics,
+                top_frames=cam_a_frames,
+                top_intrinsics=cam_a_intrinsics,
+                chassis_frames=cam_b_frames,
+                chassis_intrinsics=cam_b_intrinsics,
                 text_prompt=text_prompt_sam3,
                 num_runs=num_runs,
                 warmup_runs=warmup_runs,
@@ -1671,8 +1676,8 @@ def main():
             print(f"\n[SAM3+Stereo 双路] 测试失败: {e}")
             import traceback
             traceback.print_exc()
-    elif not stereo_available:
-        print(f"\n[SAM3+Stereo 双路] 跳过 - 无立体相机数据")
+    elif not stereo_available or len(camera_datasets) < 2:
+        print(f"\n[SAM3+Stereo 双路] 跳过 - 需要至少2组相机数据 (当前 {len(camera_datasets)} 组)")
 
     # ========== 汇总对比 ==========
     if all_results:
