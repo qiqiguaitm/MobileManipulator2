@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import os
-import struct
+
 import sys
 import time
 from io import BytesIO
@@ -1054,16 +1054,12 @@ class DepthOptimizerOnline:
             if resp_hash:
                 self._intr_hash = resp_hash
 
-            # 解码 raw uint16 depth
-            data = resp.content
-            if len(data) < 8:
-                return {'success': False, 'error': 'Response too short for raw depth'}
-            h, w = struct.unpack('<II', data[:8])
-            expected = 8 + h * w * 2
-            if len(data) != expected:
-                return {'success': False,
-                        'error': f'Raw depth size mismatch: got {len(data)}, expected {expected}'}
-            depth_arr = np.frombuffer(data[8:], dtype=np.uint16).reshape(h, w)
+            # 解码 depth PNG (uint16)
+            depth_arr = cv2.imdecode(
+                np.frombuffer(resp.content, dtype=np.uint8),
+                cv2.IMREAD_UNCHANGED)
+            if depth_arr is None:
+                return {'success': False, 'error': 'Failed to decode depth PNG'}
 
             result = {
                 'success': True,
