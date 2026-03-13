@@ -1382,6 +1382,8 @@ def main():
                        help='Capture data directory (auto-discovers timestamped subdirs)')
     parser.add_argument('--text-prompt', type=str, default='pen,box,phone,bottle,toy',
                        help='SAM3 text prompt for parallel mode')
+    parser.add_argument('--max-stereo-frames', type=int, default=20,
+                       help='Stereo 测试最大帧数 (default: 20, 0=不限)')
     args = parser.parse_args()
 
     # 如果没有指定任何模式，默认运行 benchmark
@@ -1593,6 +1595,10 @@ def main():
                 for f in frames:
                     stereo_args_list.append(
                         (f'{cam_name}:{f["idx"]}', (f['ir_left'], f['ir_right'], intrinsics)))
+
+            if args.max_stereo_frames > 0 and len(stereo_args_list) > args.max_stereo_frames:
+                print(f"  [Stereo] 帧数限制: {len(stereo_args_list)} → {args.max_stereo_frames}")
+                stereo_args_list = stereo_args_list[:args.max_stereo_frames]
 
             result = benchmark_with_timing(
                 func=fs_service.forward_stereo,
