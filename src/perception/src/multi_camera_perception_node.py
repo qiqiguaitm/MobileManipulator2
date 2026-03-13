@@ -8,8 +8,8 @@ Multi-Camera Perception 3D - ROS2 节点 (Timer+Queue 架构)
 3. 统一的服务接口
 
 架构:
-    - Timer 按 auto_detect_rate 频率触发，采集各相机最新帧放入 Queue(maxsize=1)
-    - 每相机一个 Worker 线程，阻塞等待 Queue → 检测 + 3D 测量 → 发布
+    - 每相机独立 Timer（top=5Hz/D455, chassis=6Hz/D435），与硬件帧率对齐
+    - 每相机一个 Queue(maxsize=1) + Worker 线程，阻塞等待 → 检测 + 3D 测量 → 发布
     - Timer 控制 GPU 请求注入频率，避免连续满载；Queue 满时跳过（背压）
 
 发布:
@@ -43,7 +43,7 @@ from geometry_msgs.msg import TransformStamped
 from perception.utils import CvBridgeNumPy2 as CvBridge
 from pycocotools import mask as coco_mask
 
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
 
@@ -59,6 +59,9 @@ from perception.byte_tracker_3d import ByteTracker3D, TrackerConfig
 
 from perception.synced_sensor_subscriber import SyncedSensorSubscriber
 from perception.utils import SENSOR_QOS, LATCHED_QOS, ThrottledLogger, stamp_to_sec
+
+import tf2_ros
+from rclpy.duration import Duration
 
 
 @dataclass
@@ -92,9 +95,14 @@ class DetectionTask:
     prompt: str
     # 预计算的变换（在主线程查询，避免后台线程TF竞争）
     optical_to_base_matrix: Optional[np.ndarray] = None
+    base_to_map_matrix: Optional[np.ndarray] = None  # 定位就绪时的 base_link→map 4x4 矩阵
     # 元数据
     timestamp_sec: float = 0.0
     frame_id: str = ''
+    # FoundationStereo 被动双目数据（仅top相机启用时）
+    ir_left: Optional[np.ndarray] = None
+    ir_right: Optional[np.ndarray] = None
+    ir_intrinsics: Optional[Dict] = None
 
 
 class MultiCameraPerceptionNode(Node):
@@ -144,6 +152,12 @@ class MultiCameraPerceptionNode(Node):
             PerceptionStatus, '/perception/status', 1
         )
 
+        # ========== Map 坐标系支持 ==========
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._localization_ready = False
+        self.create_subscription(Bool, '/localization_status', self._localization_status_cb, 5)
+
         # ========== Timer + Queue 架构 ==========
         self._shutdown = False
         self._task_queues: Dict[str, queue.Queue] = {}
@@ -161,9 +175,42 @@ class MultiCameraPerceptionNode(Node):
         self.get_logger().info(f'  Top相机: {"启用" if self.enable_top else "禁用"}')
         self.get_logger().info(f'  Chassis相机: {"启用" if self.enable_chassis else "禁用"}')
         self.get_logger().info(f'  LiDAR: {"启用" if self.enable_lidar else "禁用"}')
+        self.get_logger().info(f'  深度源: {self.depth_source}')
         self.get_logger().info(f'  Target frame: {self.target_frame}')
-        self.get_logger().info(f'  自动检测: {self.auto_detect_rate} Hz')
+        self.get_logger().info(f'  Map frame: 定位就绪后自动切换')
+        for _cn, _r in self._camera_detect_rates.items():
+            self.get_logger().info(f'  检测 [{_cn}]: {_r} Hz')
+        self.get_logger().info(f'  融合发布: {self.fusion_publish_rate} Hz')
         self.get_logger().info('='*60)
+
+    def _localization_status_cb(self, msg: Bool):
+        self._localization_ready = msg.data
+
+    def _get_base_to_map_matrix(self) -> Optional[np.ndarray]:
+        """查询 base_link→map 变换，定位未就绪或查询失败时返回 None"""
+        if not self._localization_ready:
+            return None
+        try:
+            ts = self._tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.05))
+            t = ts.transform.translation
+            q = ts.transform.rotation
+            # quaternion → rotation matrix (无 scipy 依赖)
+            x, y, z, w = q.x, q.y, q.z, q.w
+            mat = np.eye(4)
+            mat[0, 0] = 1 - 2*(y*y + z*z)
+            mat[0, 1] = 2*(x*y - w*z)
+            mat[0, 2] = 2*(x*z + w*y)
+            mat[1, 0] = 2*(x*y + w*z)
+            mat[1, 1] = 1 - 2*(x*x + z*z)
+            mat[1, 2] = 2*(y*z - w*x)
+            mat[2, 0] = 2*(x*z - w*y)
+            mat[2, 1] = 2*(y*z + w*x)
+            mat[2, 2] = 1 - 2*(x*x + y*y)
+            mat[:3, 3] = [t.x, t.y, t.z]
+            return mat
+        except Exception:
+            return None
 
     def _load_config(self):
         """声明和加载 ROS2 参数"""
@@ -189,7 +236,7 @@ class MultiCameraPerceptionNode(Node):
 
         # Prompt 配置
         self.declare_parameter('prompt_source', 'default')
-        self.declare_parameter('default_prompt', 'bottle.cup.box.barrel.toy')
+        self.declare_parameter('default_prompt', 'coke can.scissors.rubiks cube.toy vegetable.toy food.bottle.box.black block')
         self.default_prompt = self.get_parameter('default_prompt').value
 
         # 检测服务
@@ -197,20 +244,37 @@ class MultiCameraPerceptionNode(Node):
         self.declare_parameter('detector_url', 'http://192.168.112.14:10086')
         self.declare_parameter('sam3_url', 'http://192.168.112.14:8081')
         self.declare_parameter('detector_timeout', 3.0)
-        self.declare_parameter('min_score', 0.25)
+        self.declare_parameter('min_score', 0.40)
+        self.declare_parameter('min_confidence', 0.3)
         self.declare_parameter('iou_threshold', 0.5)
+        # footprint 矩形排除区（base_link 坐标系，与 nav2 footprint 对应）
+        self.declare_parameter('footprint_x_min', -0.375)
+        self.declare_parameter('footprint_x_max',  0.434)
+        self.declare_parameter('footprint_y_min', -0.31)
+        self.declare_parameter('footprint_y_max',  0.31)
         self.detector_type = self.get_parameter('detector_type').value
         self.detector_url = self.get_parameter('detector_url').value
         self.sam3_url = self.get_parameter('sam3_url').value
         self.detector_timeout = self.get_parameter('detector_timeout').value
         self.min_score = self.get_parameter('min_score').value
+        self.min_confidence = self.get_parameter('min_confidence').value
         self.iou_threshold = self.get_parameter('iou_threshold').value
+        self.footprint_x_min = self.get_parameter('footprint_x_min').value
+        self.footprint_x_max = self.get_parameter('footprint_x_max').value
+        self.footprint_y_min = self.get_parameter('footprint_y_min').value
+        self.footprint_y_max = self.get_parameter('footprint_y_max').value
 
         # 深度优化服务
         self.declare_parameter('depth_optimizer_url', 'http://192.168.112.14:8082')
-        self.declare_parameter('enable_depth_optimizer', True)
+        self.declare_parameter('enable_depth_optimizer', False)
         self.depth_optimizer_url = self.get_parameter('depth_optimizer_url').value
         self.enable_depth_optimizer = self.get_parameter('enable_depth_optimizer').value
+
+        # FoundationStereo 被动双目深度估计（适用于所有相机）
+        self.declare_parameter('depth_source', 'foundation_stereo')  # 'raw' | 'foundation_stereo'
+        self.declare_parameter('foundation_stereo_url', 'http://192.168.112.14:8084')
+        self.depth_source = self.get_parameter('depth_source').value
+        self.foundation_stereo_url = self.get_parameter('foundation_stereo_url').value
 
         # 坐标系配置
         self.declare_parameter('target_frame', 'base_link')
@@ -220,9 +284,22 @@ class MultiCameraPerceptionNode(Node):
         self.declare_parameter('distance_offset', 0.0)
         self.distance_offset_default = self.get_parameter('distance_offset').value
 
-        # 自动检测配置
-        self.declare_parameter('auto_detect_rate', 6.0)  # 默认 6Hz
-        self.auto_detect_rate = self.get_parameter('auto_detect_rate').value
+        # 自动检测配置 — 每相机独立检测频率，与硬件帧率对齐
+        self.declare_parameter('top_detect_rate', 5.0)      # D455 native: 5fps
+        self.declare_parameter('chassis_detect_rate', 6.0)  # D435 native: 6fps
+        # 兼容旧参数：>0 时覆盖所有相机检测频率
+        self.declare_parameter('auto_detect_rate', 0.0)
+        _legacy = self.get_parameter('auto_detect_rate').value
+        top_rate = _legacy if _legacy > 0 else self.get_parameter('top_detect_rate').value
+        chassis_rate = _legacy if _legacy > 0 else self.get_parameter('chassis_detect_rate').value
+        self._camera_detect_rates: Dict[str, float] = {
+            'top': top_rate,
+            'chassis': chassis_rate,
+        }
+        self.auto_detect_rate = max(self._camera_detect_rates.values())  # for log compat
+        # 融合发布频率（独立于检测频率，控制 fused 输出速率）
+        self.declare_parameter('fusion_publish_rate', 5.0)
+        self.fusion_publish_rate = self.get_parameter('fusion_publish_rate').value
 
         # 时间同步参数
         self.declare_parameter('sync_slop', 0.1)
@@ -265,30 +342,30 @@ class MultiCameraPerceptionNode(Node):
         )
 
         # 初始化 ByteTracker3D 跟踪器（跟踪融合后的结果）
-        # 频率关系: 每个相机 ~auto_detect_rate Hz，融合回调 ~2×auto_detect_rate Hz
-        # tracker.update() 每次融合回调调用一次，frame_id 按此计数
-        n_cameras = int(self.enable_top) + int(self.enable_chassis)
-        fusion_rate = max(self.auto_detect_rate * max(n_cameras, 1), 1.0)
-        track_buffer = int(fusion_rate * 3.0)    # 3秒丢失容忍
-        confirm_frames = max(2, int(fusion_rate * 0.3))  # 0.3秒确认，至少2帧
-        reid_buffer = int(fusion_rate * 10.0)    # 10秒 Re-ID 窗口 (+ Lost 3秒 = 总计13秒)
-
+        # 确认时间基于 wall-clock，不再依赖 fusion_rate 计算帧数
         tracker_cfg = TrackerConfig(
             match_thresh=0.15,       # 第一阶段: 15cm 匹配阈值
             second_thresh=0.25,      # 第二阶段: 25cm (ByteTrack低置信度恢复)
-            track_buffer=track_buffer,
-            confirm_frames=confirm_frames,
+            track_buffer_s=3.0,      # Lost轨迹保留3秒
+            confirm_time_s=0.8,      # 新轨迹确认：持续观测0.8s（@5Hz≈4帧，防ghost 0.4s内抢占）
+            min_confirm_hits=2,      # 新轨迹确认：至少匹配2次（防单帧误检）
+            age_penalty_weight=0.15, # 年轻轨迹匹配惩罚权重（ghost vs 老轨迹竞争时起效）
+            age_stable_frames=10,    # 10次匹配后视为稳定（@5Hz≈2s）
+            lost_velocity_decay=0.7, # Lost轨迹速度衰减（防遮挡边缘深度腐蚀注入伪速度）
             reid_thresh=0.3,         # Re-ID: 30cm (比匹配更宽松)
-            reid_buffer=reid_buffer,
+            reid_buffer_s=10.0,      # Re-ID窗口10秒
+            cost_debug=True,         # 开启匹配代价日志（配合 _cc_track_debug.py --cost）
         )
         self._tracker = ByteTracker3D(tracker_cfg, self.get_logger())
         self.get_logger().info(
             f"[TRACKER] ByteTracker3D 已初始化: "
             f"match_thresh={tracker_cfg.match_thresh}m, "
             f"second_thresh={tracker_cfg.second_thresh}m, "
-            f"buffer={track_buffer} ({fusion_rate:.0f}Hz×3s), "
-            f"confirm={confirm_frames}, "
-            f"reid_thresh={tracker_cfg.reid_thresh}m, reid_buf={reid_buffer}"
+            f"buffer={tracker_cfg.track_buffer_s}s, "
+            f"confirm={tracker_cfg.confirm_time_s}s(min {tracker_cfg.min_confirm_hits}hits), "
+            f"age_penalty={tracker_cfg.age_penalty_weight}(stable@{tracker_cfg.age_stable_frames}hits), "
+            f"lost_vel_decay={tracker_cfg.lost_velocity_decay}, "
+            f"reid_thresh={tracker_cfg.reid_thresh}m, reid_buf={tracker_cfg.reid_buffer_s}s"
         )
 
     def _health_check(self):
@@ -306,15 +383,18 @@ class MultiCameraPerceptionNode(Node):
         # 根据 detector_type 检查对应服务
         if self.detector_type == 'sam3':
             if not check_service(self.sam3_url, timeout=5.0):
-                self.get_logger().error(f'SAM3 服务不可用: {self.sam3_url}')
-                raise RuntimeError('SAM3 服务不可用')
-            self.get_logger().info('  SAM3 service: OK')
+                self.get_logger().warn(f'SAM3 服务不可用: {self.sam3_url}，检测器禁用，仅发布空结果')
+                self._detector_available = False
+            else:
+                self.get_logger().info('  SAM3 service: OK')
+                self._detector_available = True
         else:
             # 默认检查 DINO-X
             if not check_service(self.detector_url, timeout=5.0):
                 self.get_logger().error(f'DINO-X 服务不可用: {self.detector_url}')
                 raise RuntimeError('DINO-X 服务不可用')
             self.get_logger().info('  DINO-X service: OK')
+            self._detector_available = True
 
         # CDM 服务可选
         if self.enable_depth_optimizer:
@@ -323,6 +403,16 @@ class MultiCameraPerceptionNode(Node):
                 self.enable_depth_optimizer = False
             else:
                 self.get_logger().info('  CDM service: OK')
+
+        # FoundationStereo 服务检查
+        if self.depth_source == 'foundation_stereo':
+            if not check_service(self.foundation_stereo_url, timeout=5.0):
+                self.get_logger().warn(
+                    f'FoundationStereo 服务不可用: {self.foundation_stereo_url}，回退到原始深度'
+                )
+                self.depth_source = 'raw'
+            else:
+                self.get_logger().info(f'  FoundationStereo service: OK ({self.foundation_stereo_url})')
 
     def _init_components(self):
         """初始化双相机组件"""
@@ -352,6 +442,8 @@ class MultiCameraPerceptionNode(Node):
             self.get_logger().info(f'初始化 {cfg.name} 相机...')
             
             # 同步传感器订阅器
+            # FoundationStereo: 所有相机都需要IR流，从相机名自动派生topic
+            use_ir = self.depth_source == 'foundation_stereo'
             sensor = SyncedSensorSubscriber(
                 node=self,
                 color_topic=cfg.color_topic,
@@ -360,9 +452,14 @@ class MultiCameraPerceptionNode(Node):
                 lidar_topic=self.lidar_topic if cfg.name == 'top' else '',  # LiDAR 只给 top 用
                 enable_lidar=self.enable_lidar and cfg.name == 'top',
                 sync_slop=self.sync_slop,
+                ir_left_topic=f'/camera/{cfg.name}/infra1/image_rect_raw' if use_ir else '',
+                ir_right_topic=f'/camera/{cfg.name}/infra2/image_rect_raw' if use_ir else '',
+                ir_info_topic=f'/camera/{cfg.name}/infra2/camera_info' if use_ir else '',
             )
 
-            if not sensor.connect(timeout=30.0):
+            # FS模式启用IR流，D455/D435需要更长时间完成硬件重配置
+            connect_timeout = 60.0 if use_ir else 30.0
+            if not sensor.connect(timeout=connect_timeout):
                 self.get_logger().error(f'{cfg.name} 相机连接失败')
                 continue
 
@@ -392,14 +489,18 @@ class MultiCameraPerceptionNode(Node):
 
         # 共享的检测器（根据 detector_type 选择）
         if self.detector_type == 'sam3':
-            detector_cfg = SimpleConfig(
-                url=self.sam3_url,
-                min_score=self.min_score,  # SAM3Online 会映射为 confidence
-                resize=(1280, 720),
-                return_mask=True,
-            )
-            self.detector = SAM3Online(detector_cfg)
-            self.get_logger().info(f'使用 SAM3 检测器: {self.sam3_url}')
+            if getattr(self, '_detector_available', True):
+                detector_cfg = SimpleConfig(
+                    url=self.sam3_url,
+                    min_score=self.min_score,  # SAM3Online 会映射为 confidence
+                    resize=(1280, 720),
+                    return_mask=True,
+                )
+                self.detector = SAM3Online(detector_cfg)
+                self.get_logger().info(f'使用 SAM3 检测器: {self.sam3_url}')
+            else:
+                self.detector = None
+                self.get_logger().warn('SAM3 检测器未初始化，感知节点以无检测模式运行')
         else:
             detector_cfg = SimpleConfig(
                 url=self.detector_url,
@@ -409,7 +510,7 @@ class MultiCameraPerceptionNode(Node):
             self.detector = DinoXDetectorOnline(detector_cfg)
             self.get_logger().info(f'使用 DINO-X 检测器: {self.detector_url}')
 
-        # 共享的深度优化器
+        # 共享的深度优化器 (CDM)
         self.depth_optimizer = None
         if self.enable_depth_optimizer:
             optimizer_cfg = SimpleConfig(
@@ -420,6 +521,15 @@ class MultiCameraPerceptionNode(Node):
             # 给每个 core 设置共享的优化器
             for core in self.cores.values():
                 core.depth_optimizer = self.depth_optimizer
+
+        # FoundationStereo 深度估计器（独立于CDM，所有相机共用）
+        self.fs_optimizer = None
+        if self.depth_source == 'foundation_stereo':
+            fs_cfg = SimpleConfig(url=self.foundation_stereo_url)
+            self.fs_optimizer = DepthOptimizerOnline(fs_cfg)
+            self.get_logger().info(
+                f'FoundationStereo 深度估计器已初始化: {self.foundation_stereo_url}'
+            )
 
     def _init_publishers(self):
         """初始化发布器"""
@@ -446,24 +556,38 @@ class MultiCameraPerceptionNode(Node):
         self.pub_fused = self.create_publisher(Object3DArray, '~/fused/objects_3d', latched_qos)
 
     def _init_worker_threads(self):
-        """初始化 Timer + Queue + Worker 线程"""
-        if not self.cameras or self.auto_detect_rate <= 0:
+        """初始化 per-camera Timer + Queue + Worker 线程"""
+        if not self.cameras:
             return
 
-        # 每相机一个 Queue(maxsize=1)：满时 Timer 跳过，不堆积
+        # 每相机独立 Timer，频率与硬件帧率对齐
+        self._auto_detect_timers: Dict[str, Any] = {}
         for camera_name in self.cameras.keys():
+            rate = self._camera_detect_rates.get(camera_name, 0.0)
+            if rate <= 0:
+                continue
             self._task_queues[camera_name] = queue.Queue(maxsize=1)
             self._timer_last_stamps[camera_name] = 0.0
+            self._auto_detect_timers[camera_name] = self.create_timer(
+                1.0 / rate,
+                lambda cn=camera_name: self._on_camera_timer(cn),
+                callback_group=ReentrantCallbackGroup()
+            )
 
-        # Timer：按 auto_detect_rate 频率采集数据 → 放入 Queue
-        timer_period = 1.0 / self.auto_detect_rate
-        self._auto_detect_timer = self.create_timer(
-            timer_period, self._on_camera_timer,
-            callback_group=ReentrantCallbackGroup()
-        )
+        if not self._auto_detect_timers:
+            return
+
+        # 独立 Fusion Timer：以固定频率发布融合结果（解耦检测频率与融合频率）
+        self._fusion_timer = None
+        if self.fusion_publish_rate > 0:
+            self._fusion_timer = self.create_timer(
+                1.0 / self.fusion_publish_rate,
+                self._try_publish_fusion,
+                callback_group=ReentrantCallbackGroup()
+            )
 
         # 每相机一个 Worker 线程，阻塞消费 Queue
-        for camera_name in self.cameras.keys():
+        for camera_name in self._auto_detect_timers.keys():
             t = threading.Thread(
                 target=self._detection_worker,
                 args=(camera_name,),
@@ -473,8 +597,12 @@ class MultiCameraPerceptionNode(Node):
             t.start()
             self._worker_threads[camera_name] = t
 
+        rates_str = ', '.join(
+            f'{cn}={self._camera_detect_rates[cn]}Hz'
+            for cn in self._auto_detect_timers
+        )
         self.get_logger().info(
-            f'Timer+Queue 架构启动: {self.auto_detect_rate}Hz timer, '
+            f'Timer+Queue 架构启动: detect=[{rates_str}] fusion={self.fusion_publish_rate}Hz, '
             f'{len(self._worker_threads)} workers: {list(self._worker_threads.keys())}'
         )
 
@@ -491,60 +619,74 @@ class MultiCameraPerceptionNode(Node):
             f'min_score={self._current_min_score:.2f}'
         )
 
-    def _on_camera_timer(self):
+    def _on_camera_timer(self, camera_name: str):
         """
-        Timer 回调：采集各相机最新帧 → 放入 Queue。
+        Timer 回调（per-camera）：采集该相机最新帧 → 放入 Queue。
         Queue 满（Worker 还在处理上一帧）时跳过，实现自然背压。
         """
-        for camera_name, q in self._task_queues.items():
-            sensor = self.cameras.get(camera_name)
-            if not sensor:
-                continue
+        q = self._task_queues.get(camera_name)
+        sensor = self.cameras.get(camera_name)
+        if not q or not sensor:
+            return
 
-            data = sensor.get_latest_data()
-            if data is None:
-                continue
+        data = sensor.get_latest_data()
+        if data is None:
+            return
 
-            # 数据过旧
-            if data.get('age', 0) > 3.0:
-                continue
+        # 数据过旧
+        if data.get('age', 0) > 3.0:
+            return
 
-            # 帧去重
-            ts = data.get('timestamp')
-            if ts is not None:
-                stamp = stamp_to_sec(ts) if hasattr(ts, 'sec') else float(ts)
-            else:
-                stamp = time.time()
+        # 帧去重
+        ts = data.get('timestamp')
+        if ts is not None:
+            stamp = stamp_to_sec(ts) if hasattr(ts, 'sec') else float(ts)
+        else:
+            stamp = time.time()
 
-            if stamp <= self._timer_last_stamps[camera_name]:
-                continue
-            self._timer_last_stamps[camera_name] = stamp
+        if stamp <= self._timer_last_stamps[camera_name]:
+            return
+        self._timer_last_stamps[camera_name] = stamp
 
-            # TF 查询
-            transformer = self.transformers.get(camera_name)
-            optical_to_base = None
-            if transformer:
-                try:
-                    optical_to_base = transformer.get_transform('optical_to_base')
-                except Exception:
-                    optical_to_base = None
-
-            task = DetectionTask(
-                camera_name=camera_name,
-                rgb=data['rgb'],
-                depth=data['depth'],
-                intrinsics=sensor.intrinsics,
-                prompt=self._current_prompt,
-                optical_to_base_matrix=optical_to_base,
-                timestamp_sec=time.time(),
-                frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame')
-            )
-
+        # TF 查询
+        transformer = self.transformers.get(camera_name)
+        optical_to_base = None
+        if transformer:
             try:
-                q.put_nowait(task)
-            except queue.Full:
-                # Worker 还在处理上一帧，跳过此 tick（自然背压）
-                pass
+                optical_to_base = transformer.get_transform('optical_to_base')
+            except Exception:
+                optical_to_base = None
+
+        # base_link→map 变换（定位就绪时）
+        base_to_map = self._get_base_to_map_matrix()
+
+        # FoundationStereo IR data (all cameras when depth_source == 'foundation_stereo')
+        ir_left = ir_right = ir_intr = None
+        if self.depth_source == 'foundation_stereo':
+            ir_left = data.get('ir_left')
+            ir_right = data.get('ir_right')
+            ir_intr = sensor.ir_intrinsics
+
+        task = DetectionTask(
+            camera_name=camera_name,
+            rgb=data['rgb'],
+            depth=data['depth'],
+            intrinsics=sensor.intrinsics,
+            prompt=self._current_prompt,
+            optical_to_base_matrix=optical_to_base,
+            base_to_map_matrix=base_to_map,
+            timestamp_sec=time.time(),
+            frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame'),
+            ir_left=ir_left,
+            ir_right=ir_right,
+            ir_intrinsics=ir_intr,
+        )
+
+        try:
+            q.put_nowait(task)
+        except queue.Full:
+            # Worker 还在处理上一帧，跳过此 tick（自然背压）
+            pass
 
     def _detection_worker(self, camera_name: str):
         """
@@ -584,15 +726,14 @@ class MultiCameraPerceptionNode(Node):
 
                     _tw2 = time.time()
 
-                    # 线程安全地更新结果并尝试融合
+                    # 线程安全地更新结果（fusion 由独立 timer 触发）
                     with self._results_lock:
                         self._last_results[camera_name] = result
-                        self._try_publish_fusion()
 
                     _tw3 = time.time()
                     self._publish_status()
 
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f'[{camera_name}] WORKER: '
                         f'qwait={_tw_age:.0f}ms '
                         f'detect={(_tw1-_tw0)*1000:.0f}ms '
@@ -635,6 +776,8 @@ class MultiCameraPerceptionNode(Node):
         _cdm_timing = {}  # cdm_http
 
         def _timed_detection():
+            if self.detector is None:
+                return []
             _dt0 = time.time()
             # SAM3/DINOX forward (HTTP call)
             _timing_inner = {}
@@ -648,8 +791,9 @@ class MultiCameraPerceptionNode(Node):
             _det_timing['api_http'] = _dt1 - _dt0
             _det_timing.update(_timing_inner)
 
-            # Mask decode
+            # Mask decode — 本地过滤 (API 可能未严格执行 min_score)
             objects = raw_result.result.get('objects', [])
+            objects = [o for o in objects if o.get('score', 0) >= self._current_min_score]
             if not objects:
                 _det_timing['mask_decode'] = 0
                 _det_timing['n_objects'] = 0
@@ -711,14 +855,24 @@ class MultiCameraPerceptionNode(Node):
         def _timed_depth_optimize():
             _ct_start = time.time()
             _cdm_inner = {}
-            if core.depth_optimizer:
-                # 必须转换为 uint16 mm（CDM 服务要求的格式）
+            result = None
+
+            # FoundationStereo mode: use passive stereo depth for all cameras
+            if (self.depth_source == 'foundation_stereo'
+                    and self.fs_optimizer is not None
+                    and task.ir_left is not None
+                    and task.ir_right is not None):
+                ir_intr = task.ir_intrinsics or {}
+                result = self.fs_optimizer.forward_stereo(
+                    task.ir_left, task.ir_right, ir_intr, _timing=_cdm_inner
+                )
+            elif core.depth_optimizer:
+                # CDM mode: 必须转换为 uint16 mm（CDM 服务要求的格式）
                 depth_mm = (depth * 1000).astype(np.uint16) if depth.dtype != np.uint16 else depth
                 result = core.depth_optimizer.forward(
                     rgb, depth_mm, chosen_policy='dn', _timing=_cdm_inner
                 )
-            else:
-                result = None
+
             _ct_end = time.time()
             _cdm_timing['api_total'] = _ct_end - _ct_start
             _cdm_timing.update(_cdm_inner)
@@ -751,7 +905,7 @@ class MultiCameraPerceptionNode(Node):
                         _opt_in_mask = optimized_depth[_m_ys, _m_xs]
                         _raw_valid = _raw_in_mask[_raw_in_mask > 0.1]
                         _opt_valid = _opt_in_mask[_opt_in_mask > 0.1]
-                        self.get_logger().warn(
+                        self.get_logger().debug(
                             f'[DEBUG-CDM][{camera_name}] {_dbg_det["object_id"]} '
                             f'bbox_center=({_dbg_cx},{_dbg_cy}) '
                             f'raw_center={_raw_z:.4f}m opt_center={_opt_z:.4f}m delta={(_opt_z-_raw_z)*1000:.1f}mm | '
@@ -784,11 +938,17 @@ class MultiCameraPerceptionNode(Node):
         sam3_pre = _det_timing.get('sam3_preprocess', 0)
         sam3_enc = _det_timing.get('sam3_encode', 0)
         sam3_http = _det_timing.get('sam3_http', 0)
-        # CDM 内部 timing（已是 ms）
-        cdm_pre = _cdm_timing.get('cdm_preprocess', 0)
-        cdm_enc = _cdm_timing.get('cdm_encode', 0)
-        cdm_http = _cdm_timing.get('cdm_http', 0)
-        cdm_post = _cdm_timing.get('cdm_postprocess', 0)
+        # 深度优化内部 timing（FS: fs_encode/fs_http/fs_total；CDM: cdm_*）
+        if self.depth_source == 'foundation_stereo':
+            cdm_pre  = 0
+            cdm_enc  = _cdm_timing.get('fs_encode', 0)
+            cdm_http = _cdm_timing.get('fs_http', 0)
+            cdm_post = 0
+        else:
+            cdm_pre  = _cdm_timing.get('cdm_preprocess', 0)
+            cdm_enc  = _cdm_timing.get('cdm_encode', 0)
+            cdm_http = _cdm_timing.get('cdm_http', 0)
+            cdm_post = _cdm_timing.get('cdm_postprocess', 0)
         # 并行 wall 及各线程总耗时
         parallel_ms = (_t1 - _t_submit) * 1000
         threadA_ms = det_http_ms + mask_ms   # SAM3 + mask_decode
@@ -891,6 +1051,20 @@ class MultiCameraPerceptionNode(Node):
 
             result.objects.append(obj)
 
+        result.objects = self._filter_footprint(result.objects)
+
+        # base_link → map 变换（定位就绪时）
+        if task.base_to_map_matrix is not None and len(result.objects) > 0:
+            base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
+            ones = np.ones((len(base_pts), 1))
+            map_pts = (task.base_to_map_matrix @ np.hstack([base_pts, ones]).T).T[:, :3]
+            for i, obj in enumerate(result.objects):
+                obj.position.x = float(map_pts[i, 0])
+                obj.position.y = float(map_pts[i, 1])
+                obj.position.z = float(map_pts[i, 2])
+                # distance 保持不变（仍是 base_link 下到机器人的距离）
+            result.header.frame_id = 'map'
+
         _t3 = time.time()
         coord_tf_ms = (_t_tf1 - _t_tf0) * 1000
         obj_build_ms = (_t3 - _t_tf1) * 1000
@@ -948,6 +1122,9 @@ class MultiCameraPerceptionNode(Node):
                 if len(results) >= 2:
                     fused = self._fuse_results(results)
                     if fused:
+                        fused.objects = [o for o in fused.objects
+                                         if o.confidence >= self.min_confidence
+                                         and o.score >= self._current_min_score]
                         self.pub_fused.publish(fused)
 
             self._publish_status()
@@ -1020,11 +1197,21 @@ class MultiCameraPerceptionNode(Node):
         rgb = data['rgb']
         depth = data['depth']
 
-        # 2. 并行调用 DINO-X 检测 和 CDM 深度优化
+        # 2. 并行调用检测 和 深度优化（FS 或 CDM）
         def _timed_detection():
             return self._detect_objects(prompt, rgb)
 
         def _timed_depth_optimize():
+            if (self.depth_source == 'foundation_stereo'
+                    and self.fs_optimizer is not None
+                    and data.get('ir_left') is not None
+                    and data.get('ir_right') is not None):
+                ir_intr = sensor.ir_intrinsics or {}
+                result = self.fs_optimizer.forward_stereo(
+                    data['ir_left'], data['ir_right'], ir_intr
+                )
+                if result and result.get('success') and 'depth' in result:
+                    return result['depth'].astype(np.float32) / 1000.0
             return core.optimize_depth(rgb, depth)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1110,6 +1297,8 @@ class MultiCameraPerceptionNode(Node):
 
             result.objects.append(obj)
 
+        result.objects = self._filter_footprint(result.objects)
+
         self.get_logger().info(f'[{camera_name}] DETECT: Measured {len(result.objects)} objects')
         return result
 
@@ -1164,6 +1353,13 @@ class MultiCameraPerceptionNode(Node):
                 if result and len(result.objects) > 0:
                     valid_results[camera_name] = result
 
+            # 帧一致性检查：两个相机必须在同一坐标系下才能融合
+            if len(valid_results) > 1:
+                frames = set(r.header.frame_id for r in valid_results.values())
+                if len(frames) > 1:
+                    self.get_logger().warn(f'[FUSION] 帧不一致: {frames}, 跳过本轮')
+                    return
+
             # 如果有任意相机的结果，进行融合
             if len(valid_results) >= 1:
                 _tf0 = time.time()
@@ -1172,7 +1368,9 @@ class MultiCameraPerceptionNode(Node):
                 if fused and len(fused.objects) > 0:
                     tracked_result = self._apply_tracking(fused)
                     _tf2 = time.time()
-
+                    tracked_result.objects = [o for o in tracked_result.objects
+                                              if o.confidence >= self.min_confidence
+                                              and o.score >= self._current_min_score]
                     self.pub_fused.publish(tracked_result)
                     self._last_results['fused'] = tracked_result
                     n_in = sum(len(r.objects) for r in valid_results.values())
@@ -1274,7 +1472,8 @@ class MultiCameraPerceptionNode(Node):
         """
         fused = Object3DArray()
         fused.header.stamp = self.get_clock().now().to_msg()
-        fused.header.frame_id = self.target_frame
+        actual_frame = next(iter(results.values())).header.frame_id
+        fused.header.frame_id = actual_frame
 
         # 分离两个相机的检测结果
         chassis_objects = list(results.get('chassis', Object3DArray()).objects)
@@ -1323,7 +1522,7 @@ class MultiCameraPerceptionNode(Node):
                 fused.objects.append(top_objects[idx])
 
             total_input = len(chassis_objects) + len(top_objects)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'[FUSION] 匈牙利匹配: {total_input} objects -> {len(fused.objects)} unique '
                 f'(matched:{len(matches)}, unmatched_c:{len(unmatched_c_idx)}, unmatched_t:{len(unmatched_t_idx)})'
             )
@@ -1402,12 +1601,15 @@ class MultiCameraPerceptionNode(Node):
 
     def _detect_objects(self, prompt: str, rgb: np.ndarray) -> list:
         """检测物体并解码 mask（复用原代码逻辑）"""
+        if self.detector is None:
+            return []
         result = self.detector.forward(
             text=prompt, rgb=rgb,
             min_score=self._current_min_score,
             iou_threshold=self._current_iou_threshold
         )
         objects = result.result.get('objects', [])
+        objects = [o for o in objects if o.get('score', 0) >= self._current_min_score]
 
         if not objects:
             return []
@@ -1469,6 +1671,21 @@ class MultiCameraPerceptionNode(Node):
 
         return detections
 
+    def _filter_footprint(self, objects: list) -> list:
+        """过滤掉落在 base_link footprint 矩形区域内的检测结果（剔除机器人本体误检）"""
+        filtered = []
+        for obj in objects:
+            x, y = obj.position.x, obj.position.y
+            if (self.footprint_x_min <= x <= self.footprint_x_max and
+                    self.footprint_y_min <= y <= self.footprint_y_max):
+                self.get_logger().debug(
+                    f'[FOOTPRINT] 过滤本体误检: {obj.category} '
+                    f'x={x:.2f} y={y:.2f} (footprint内)'
+                )
+            else:
+                filtered.append(obj)
+        return filtered
+
     def _publish_status(self):
         """发布当前状态"""
         status = PerceptionStatus()
@@ -1485,9 +1702,11 @@ class MultiCameraPerceptionNode(Node):
         self.get_logger().info('正在停止 Timer + Worker...')
         self._shutdown = True
 
-        # 停止 Timer
-        if hasattr(self, '_auto_detect_timer'):
-            self._auto_detect_timer.cancel()
+        # 停止 per-camera Timers 和 fusion Timer
+        for t in getattr(self, '_auto_detect_timers', {}).values():
+            t.cancel()
+        if getattr(self, '_fusion_timer', None):
+            self._fusion_timer.cancel()
 
         # 向每个 Queue 投入 sentinel 解除阻塞
         for q in self._task_queues.values():
