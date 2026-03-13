@@ -13,8 +13,11 @@ Usage:
 
 import sys
 import os
+import glob
 import time
 import statistics
+import threading
+import yaml
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -22,8 +25,55 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from perception.percept import DinoXDetectorOnline, SAM3Online, GraspAnythingOnline, DepthOptimizerOnline
-from perception.scene_perception_core import SimpleConfig
+# 支持直接 python3 执行（无需 ROS2 环境）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from percept import DinoXDetectorOnline, SAM3Online, GraspAnythingOnline, DepthOptimizerOnline
+
+
+class SimpleConfig:
+    """简单的配置类，用于初始化服务客户端"""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def load_camera_data(base_dir):
+    """Load all frames from a camera capture directory.
+
+    Returns: (frames_list, intrinsics_dict)
+      frames_list: [{'rgb': ndarray, 'depth': ndarray, 'ir_left': ndarray, 'ir_right': ndarray}, ...]
+      intrinsics_dict: parsed intrinsics.yaml content
+    """
+    rgb_files = sorted(glob.glob(os.path.join(base_dir, 'rgb', '???.png')))
+    if not rgb_files:
+        raise FileNotFoundError(f"No rgb frames found in {base_dir}/rgb/")
+
+    frames = []
+    for rgb_path in rgb_files:
+        idx = os.path.splitext(os.path.basename(rgb_path))[0]  # e.g. '000'
+        rgb = cv2.imread(rgb_path)
+        depth = cv2.imread(os.path.join(base_dir, 'depth', f'{idx}.png'), cv2.IMREAD_UNCHANGED)
+        ir_left = cv2.imread(os.path.join(base_dir, 'ir_left', f'{idx}.png'), cv2.IMREAD_GRAYSCALE)
+        ir_right = cv2.imread(os.path.join(base_dir, 'ir_right', f'{idx}.png'), cv2.IMREAD_GRAYSCALE)
+
+        if rgb is None or ir_left is None or ir_right is None:
+            print(f"  Warning: skipping frame {idx} in {base_dir} (missing data)")
+            continue
+
+        frames.append({'rgb': rgb, 'depth': depth, 'ir_left': ir_left, 'ir_right': ir_right, 'idx': idx})
+
+    intr_path = os.path.join(base_dir, 'intrinsics.yaml')
+    with open(intr_path) as f:
+        intrinsics = yaml.safe_load(f)
+
+    if not frames:
+        raise RuntimeError(f"No valid frames loaded from {base_dir}")
+
+    print(f"  Loaded {len(frames)} frames from {base_dir}")
+    return frames, intrinsics
 
 
 # ========== 可视化函数 ==========
@@ -630,12 +680,9 @@ def benchmark_with_timing(func, args_list, kwargs, name, num_runs=10, warmup_run
     }
 
 
-def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
-                              num_runs=10, warmup_runs=3):
-    """4路并发 benchmark: 模拟双相机 (2x SAM3 + 2x CDM) 同时调用
-
-    参考 scene_perception_3d_node.py 的 ThreadPoolExecutor 并行模式，
-    模拟双相机场景下 4 个 API 同时打满的情况。
+def benchmark_concurrent_sam3_cdm_2way(sam3_service, cdm_service, all_data, text_prompt,
+                                        num_runs=10, warmup_runs=3):
+    """双路并发 benchmark: 模拟双相机 (SAM3 + CDM) × 2 同时调用
 
     Args:
         sam3_service: SAM3Online 实例
@@ -650,7 +697,7 @@ def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
     detail_times = {k: [] for k in ['SAM3-cam1', 'SAM3-cam2', 'CDM-cam1', 'CDM-cam2']}
 
     print(f"\n{'='*70}")
-    print(f"[并发4路] 2x SAM3 + 2x CDM 同时调用 ({num_runs} 次, 预热 {warmup_runs} 次)")
+    print(f"[SAM3+CDM 双路] 2x SAM3 + 2x CDM 同时调用 ({num_runs} 次, 预热 {warmup_runs} 次)")
     print(f"{'='*70}")
 
     def call_sam3(rgb):
@@ -709,7 +756,7 @@ def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
     max_time = max(times)
     std_time = statistics.stdev(times) if len(times) > 1 else 0
 
-    print(f"\n[并发4路] 统计结果:")
+    print(f"\n[SAM3+CDM 双路] 统计结果:")
     print(f"  总耗时: 平均={avg_time*1000:.1f}ms  最小={min_time*1000:.1f}ms  "
           f"最大={max_time*1000:.1f}ms  标准差={std_time*1000:.1f}ms")
     print(f"  理论最大频率: {1/(avg_time):.1f} Hz")
@@ -726,13 +773,308 @@ def benchmark_concurrent_4way(sam3_service, cdm_service, all_data, text_prompt,
     print(f"    {'加速比':<12}: {serial_sum / (avg_time * 1000):.2f}x")
 
     return {
-        'name': '并发4路 (2xSAM3+2xCDM)',
+        'name': 'SAM3+CDM 双路并发',
         'avg': avg_time,
         'min': min_time,
         'max': max_time,
         'std': std_time,
         'detail_times': detail_times,
     }
+
+
+def benchmark_concurrent_sam3_stereo_2way(sam3_service, fs_service,
+                                           top_frames, top_intrinsics,
+                                           chassis_frames, chassis_intrinsics,
+                                           text_prompt='pen,box,phone,bottle,toy',
+                                           num_runs=10, warmup_runs=3):
+    """双路并发 benchmark: 模拟双相机 (SAM3 + Stereo) × 2 同时调用
+
+    Args:
+        sam3_service: SAM3Online 实例
+        fs_service: DepthOptimizerOnline 实例 (FoundationStereo)
+        top_frames: top 相机帧列表
+        top_intrinsics: top 相机内参
+        chassis_frames: chassis 相机帧列表
+        chassis_intrinsics: chassis 相机内参
+        text_prompt: SAM3 text prompt
+        num_runs: 测试次数
+        warmup_runs: 预热次数
+    """
+    n_top = len(top_frames)
+    n_chassis = len(chassis_frames)
+    times = []
+    detail_times = {k: [] for k in ['SAM3-top', 'SAM3-chassis', 'FS-top', 'FS-chassis']}
+
+    print(f"\n{'='*70}")
+    print(f"[SAM3+Stereo 双路] 2x SAM3 + 2x Stereo 同时调用 "
+          f"({num_runs} 次, 预热 {warmup_runs} 次)")
+    print(f"{'='*70}")
+
+    def call_sam3(rgb):
+        t0 = time.perf_counter()
+        sam3_service.forward(text_prompt, rgb)
+        return time.perf_counter() - t0
+
+    def call_stereo(ir_left, ir_right, intrinsics):
+        t0 = time.perf_counter()
+        fs_service.forward_stereo(ir_left, ir_right, intrinsics)
+        return time.perf_counter() - t0
+
+    def run_once(d_top, d_chassis):
+        """一次 4 路并发：top(SAM3+FS) + chassis(SAM3+FS)"""
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            f_sam_top = executor.submit(call_sam3, d_top['rgb'])
+            f_sam_chassis = executor.submit(call_sam3, d_chassis['rgb'])
+            f_fs_top = executor.submit(call_stereo,
+                                       d_top['ir_left'], d_top['ir_right'], top_intrinsics)
+            f_fs_chassis = executor.submit(call_stereo,
+                                           d_chassis['ir_left'], d_chassis['ir_right'],
+                                           chassis_intrinsics)
+
+            r_sam_top = f_sam_top.result(timeout=60)
+            r_sam_chassis = f_sam_chassis.result(timeout=60)
+            r_fs_top = f_fs_top.result(timeout=60)
+            r_fs_chassis = f_fs_chassis.result(timeout=60)
+
+        wall = time.perf_counter() - t0
+        return wall, r_sam_top, r_sam_chassis, r_fs_top, r_fs_chassis
+
+    # 预热
+    for i in range(warmup_runs):
+        d_top = top_frames[i % n_top]
+        d_chassis = chassis_frames[i % n_chassis]
+        wall, s1, s2, f1, f2 = run_once(d_top, d_chassis)
+        print(f"  [预热] 第 {i+1} 次 [top:{d_top['idx']}+chassis:{d_chassis['idx']}]: "
+              f"{wall*1000:.1f}ms | SAM3:{s1*1000:.0f}/{s2*1000:.0f} "
+              f"FS:{f1*1000:.0f}/{f2*1000:.0f}")
+
+    # 正式测试
+    for i in range(num_runs):
+        d_top = top_frames[i % n_top]
+        d_chassis = chassis_frames[i % n_chassis]
+        wall, s1, s2, f1, f2 = run_once(d_top, d_chassis)
+
+        times.append(wall)
+        detail_times['SAM3-top'].append(s1)
+        detail_times['SAM3-chassis'].append(s2)
+        detail_times['FS-top'].append(f1)
+        detail_times['FS-chassis'].append(f2)
+
+        print(f"  第 {i+1:2d} 次 [top:{d_top['idx']}+chassis:{d_chassis['idx']}]: "
+              f"{wall*1000:.1f}ms | SAM3:{s1*1000:.0f}/{s2*1000:.0f} "
+              f"FS:{f1*1000:.0f}/{f2*1000:.0f}")
+
+    # 统计
+    avg_time = statistics.mean(times)
+    min_time = min(times)
+    max_time = max(times)
+    std_time = statistics.stdev(times) if len(times) > 1 else 0
+
+    print(f"\n[SAM3+Stereo 双路] 统计结果:")
+    print(f"  总耗时: 平均={avg_time*1000:.1f}ms  最小={min_time*1000:.1f}ms  "
+          f"最大={max_time*1000:.1f}ms  标准差={std_time*1000:.1f}ms")
+    print(f"  理论最大频率: {1/(avg_time):.1f} Hz")
+
+    print(f"\n  各服务耗时 (平均):")
+    for label in ['SAM3-top', 'SAM3-chassis', 'FS-top', 'FS-chassis']:
+        avg = statistics.mean(detail_times[label]) * 1000
+        print(f"    {label:<14}: {avg:6.1f} ms")
+
+    serial_sum = sum(statistics.mean(v) for v in detail_times.values()) * 1000
+    print(f"    {'─'*30}")
+    print(f"    {'串行理论':<14}: {serial_sum:6.1f} ms")
+    print(f"    {'并行实际':<14}: {avg_time*1000:6.1f} ms")
+    print(f"    {'加速比':<14}: {serial_sum / (avg_time * 1000):.2f}x")
+
+    return {
+        'name': 'SAM3+Stereo 双路并发',
+        'avg': avg_time,
+        'min': min_time,
+        'max': max_time,
+        'std': std_time,
+        'detail_times': detail_times,
+    }
+
+
+def benchmark_parallel_pipeline(sam3_service, fs_service,
+                                top_frames, top_intrinsics,
+                                chassis_frames, chassis_intrinsics,
+                                text_prompt='pen,box,phone,bottle,toy',
+                                num_cycles=20, warmup_cycles=3):
+    """Dual-camera parallel SAM3+FoundationStereo benchmark.
+
+    Simulates multi_camera_perception_node architecture: two cameras each
+    running SAM3 + FS in parallel via a shared thread pool.
+    """
+    executor = ThreadPoolExecutor(max_workers=4)
+    results_lock = threading.Lock()
+    results = {'top': [], 'chassis': []}
+    total_cycles = warmup_cycles + num_cycles
+
+    print(f"\n{'='*80}")
+    print(f"[Parallel Pipeline] 2 cameras × (SAM3 + FS) — "
+          f"{num_cycles} cycles, {warmup_cycles} warmup")
+    print(f"  Top: {len(top_frames)} frames, Chassis: {len(chassis_frames)} frames")
+    print(f"  Prompt: {text_prompt}")
+    print(f"{'='*80}")
+
+    def camera_worker(cam_name, frames, intrinsics, res_list):
+        n = len(frames)
+        for i in range(total_cycles):
+            frame = frames[i % n]
+            det_timing, fs_timing = {}, {}
+            is_warmup = i < warmup_cycles
+            cycle_num = i - warmup_cycles + 1
+
+            try:
+                t0 = time.perf_counter()
+                fut_det = executor.submit(sam3_service.forward, text_prompt, frame['rgb'],
+                                          _timing=det_timing)
+                fut_fs = executor.submit(fs_service.forward_stereo,
+                                         frame['ir_left'], frame['ir_right'], intrinsics,
+                                         _timing=fs_timing)
+                det_result = fut_det.result(timeout=30)
+                fs_result = fut_fs.result(timeout=60)
+                wall_s = time.perf_counter() - t0
+            except Exception as e:
+                print(f"  [{cam_name:>7}] ERROR cycle {i}: {e}")
+                continue
+            wall_ms = wall_s * 1000
+
+            sam3_pre = det_timing.get('sam3_preprocess', 0)
+            sam3_enc = det_timing.get('sam3_encode', 0)
+            sam3_http = det_timing.get('sam3_http', 0)
+            sam3_total = sam3_pre + sam3_enc + sam3_http
+            fs_enc = fs_timing.get('fs_encode', 0)
+            fs_http = fs_timing.get('fs_http', 0)
+            fs_total_ms = fs_enc + fs_http
+            parallel_ms = wall_ms - max(sam3_total, fs_total_ms)
+
+            tag = 'WARM' if is_warmup else 'PERF'
+            num = i + 1 if is_warmup else cycle_num
+            print(f"  [{cam_name:>7}] {tag} #{num:03d}: "
+                  f"parallel={wall_ms:.0f}ms(idle={max(0,parallel_ms):.0f}ms) "
+                  f"A=[pre:{sam3_pre:.0f}+enc:{sam3_enc:.0f}+http:{sam3_http:.0f}={sam3_total:.0f}ms] "
+                  f"B=[enc:{fs_enc:.0f}+http:{fs_http:.0f}={fs_total_ms:.0f}ms] "
+                  f"wall={wall_ms:.0f}ms")
+
+            if not is_warmup:
+                record = {
+                    'wall_ms': wall_ms,
+                    'sam3_preprocess': sam3_pre,
+                    'sam3_encode': sam3_enc, 'sam3_http': sam3_http, 'sam3_total': sam3_total,
+                    'fs_encode': fs_enc, 'fs_http': fs_http, 'fs_total': fs_total_ms,
+                    'idle_ms': max(0, parallel_ms),
+                }
+                with results_lock:
+                    res_list.append(record)
+
+    # Run both cameras in parallel threads
+    t_top = threading.Thread(target=camera_worker, name='cam-top',
+                             args=('top', top_frames, top_intrinsics, results['top']))
+    t_chassis = threading.Thread(target=camera_worker, name='cam-chassis',
+                                 args=('chassis', chassis_frames, chassis_intrinsics,
+                                       results['chassis']))
+
+    t_global_start = time.perf_counter()
+    t_top.start()
+    t_chassis.start()
+    t_top.join()
+    t_chassis.join()
+    total_wall = time.perf_counter() - t_global_start
+    executor.shutdown(wait=False)
+
+    # ========== Summary statistics ==========
+    def stats_for(vals):
+        if not vals:
+            return {'avg': 0, 'p50': 0, 'p95': 0, 'min': 0, 'max': 0}
+        s = sorted(vals)
+        n = len(s)
+        return {
+            'avg': statistics.mean(s),
+            'p50': s[n // 2],
+            'p95': s[min(int((n - 1) * 0.95), n - 1)],
+            'min': s[0],
+            'max': s[-1],
+        }
+
+    print(f"\n{'='*80}")
+    print(f"[Summary] Dual-Camera Parallel SAM3+FS  ({num_cycles} cycles each)")
+    print(f"{'='*80}")
+
+    stages = ['wall_ms', 'sam3_preprocess', 'sam3_encode', 'sam3_http', 'sam3_total',
+              'fs_encode', 'fs_http', 'fs_total', 'idle_ms']
+    stage_labels = {
+        'wall_ms': 'Wall', 'sam3_preprocess': 'SAM3 pre', 'sam3_encode': 'SAM3 enc',
+        'sam3_http': 'SAM3 http', 'sam3_total': 'SAM3 total',
+        'fs_encode': 'FS enc', 'fs_http': 'FS http',
+        'fs_total': 'FS total', 'idle_ms': 'Idle',
+    }
+
+    for cam_name in ['top', 'chassis']:
+        recs = results[cam_name]
+        print(f"\n  [{cam_name}] ({len(recs)} cycles)")
+        print(f"    {'Stage':<12} {'avg':>7} {'p50':>7} {'p95':>7} {'min':>7} {'max':>7}")
+        print(f"    {'─'*47}")
+        for stage in stages:
+            vals = [r[stage] for r in recs]
+            s = stats_for(vals)
+            print(f"    {stage_labels[stage]:<12} {s['avg']:7.1f} {s['p50']:7.1f} "
+                  f"{s['p95']:7.1f} {s['min']:7.1f} {s['max']:7.1f}")
+
+    # System-wide combined statistics (both cameras merged)
+    all_recs = results['top'] + results['chassis']
+    if all_recs:
+        print(f"\n  [system] Both cameras combined ({len(all_recs)} cycles)")
+        print(f"    {'Stage':<12} {'avg':>7} {'p50':>7} {'p95':>7} {'min':>7} {'max':>7}")
+        print(f"    {'─'*47}")
+        for stage in stages:
+            vals = [r[stage] for r in all_recs]
+            s = stats_for(vals)
+            print(f"    {stage_labels[stage]:<12} {s['avg']:7.1f} {s['p50']:7.1f} "
+                  f"{s['p95']:7.1f} {s['min']:7.1f} {s['max']:7.1f}")
+
+    # Bottleneck analysis
+    print(f"\n  Bottleneck analysis:")
+    for cam_name in ['top', 'chassis']:
+        recs = results[cam_name]
+        sam3_wins = sum(1 for r in recs if r['sam3_total'] > r['fs_total'])
+        fs_wins = len(recs) - sam3_wins
+        print(f"    [{cam_name}] SAM3 slower: {sam3_wins}/{len(recs)} "
+              f"({100*sam3_wins/max(1,len(recs)):.0f}%)  "
+              f"FS slower: {fs_wins}/{len(recs)} "
+              f"({100*fs_wins/max(1,len(recs)):.0f}%)")
+    if all_recs:
+        sam3_wins_all = sum(1 for r in all_recs if r['sam3_total'] > r['fs_total'])
+        fs_wins_all = len(all_recs) - sam3_wins_all
+        print(f"    [system] SAM3 slower: {sam3_wins_all}/{len(all_recs)} "
+              f"({100*sam3_wins_all/len(all_recs):.0f}%)  "
+              f"FS slower: {fs_wins_all}/{len(all_recs)} "
+              f"({100*fs_wins_all/len(all_recs):.0f}%)")
+
+    # Frequency analysis
+    print(f"\n  Detection frequency:")
+    for cam_name in ['top', 'chassis']:
+        recs = results[cam_name]
+        avg_wall = statistics.mean([r['wall_ms'] for r in recs])
+        hz = 1000.0 / avg_wall if avg_wall > 0 else 0
+        print(f"    [{cam_name}] avg={avg_wall:.1f}ms → {hz:.2f} Hz")
+
+    if all_recs:
+        avg_per_cam = statistics.mean([r['wall_ms'] for r in all_recs])
+        interleaved_hz = 2 * 1000.0 / avg_per_cam if avg_per_cam > 0 else 0
+        serial_sum = statistics.mean([r['sam3_total'] + r['fs_total'] for r in all_recs])
+        speedup = serial_sum / avg_per_cam if avg_per_cam > 0 else 0
+        print(f"    [system] per-cycle avg={avg_per_cam:.1f}ms → "
+              f"per-cam {1000.0/avg_per_cam:.2f} Hz, "
+              f"interleaved {interleaved_hz:.2f} Hz")
+        print(f"    [system] serial would be {serial_sum:.1f}ms → "
+              f"parallel speedup {speedup:.2f}x")
+
+    # Total wall time
+    print(f"\n  Total benchmark wall time: {total_wall:.1f}s")
+    print(f"{'='*80}")
 
 
 def compute_centroid_from_mask(depth_m, mask, bbox, intrinsics,
@@ -1031,6 +1373,17 @@ def main():
     parser.add_argument('--grasp-config', type=str,
                        default='/data/workspace/MobileManipulator2/src/perception/config/server_grasp.json',
                        help='GraspAnything 服务器配置文件路径')
+    parser.add_argument('--sam3-url', type=str, default='http://192.168.112.14:8081',
+                       help='SAM3 service URL (default: http://192.168.112.14:8081)')
+    parser.add_argument('--fs-url', type=str, default='http://192.168.112.14:8084',
+                       help='FoundationStereo service URL (default: http://192.168.112.14:8084)')
+    parser.add_argument('--top-dir', type=str, default='/home/didi/capture/output_top',
+                       help='Top camera capture directory')
+    parser.add_argument('--chassis-dir', type=str,
+                       default='/home/didi/capture/data/chassis_captures/20260309_152956',
+                       help='Chassis camera capture directory')
+    parser.add_argument('--text-prompt', type=str, default='pen,box,phone,bottle,toy',
+                       help='SAM3 text prompt for parallel mode')
     args = parser.parse_args()
 
     # 如果没有指定任何模式，默认运行 benchmark
@@ -1070,6 +1423,25 @@ def main():
         sys.exit(1)
 
     print(f"\n共加载 {len(all_data)} 组数据")
+
+    # 加载立体相机数据 (Stereo 测试需要)
+    stereo_available = False
+    top_frames = chassis_frames = top_intrinsics = chassis_intrinsics = None
+    if os.path.isdir(args.top_dir) and os.path.isdir(args.chassis_dir):
+        try:
+            print("\n加载立体相机数据...")
+            top_frames, top_intrinsics = load_camera_data(args.top_dir)
+            chassis_frames, chassis_intrinsics = load_camera_data(args.chassis_dir)
+            stereo_available = True
+        except Exception as e:
+            print(f"加载立体相机数据失败, 跳过 Stereo 测试: {e}")
+    else:
+        missing = []
+        if not os.path.isdir(args.top_dir):
+            missing.append(args.top_dir)
+        if not os.path.isdir(args.chassis_dir):
+            missing.append(args.chassis_dir)
+        print(f"\n[Stereo] 跳过 - 目录不存在: {', '.join(missing)}")
 
     text_prompt_dinox = 'pen.box.phone.bottle.toy'
     text_prompt_sam3 = 'pen,box,phone,bottle,toy'
@@ -1206,8 +1578,38 @@ def main():
         import traceback
         traceback.print_exc()
 
-    # ========== 5. 并发 4 路测试 (2x SAM3 + 2x CDM) ==========
-    concurrent_result = None
+    # ========== 5. Stereo (FoundationStereo) 测试 ==========
+    fs_service = None
+    if stereo_available:
+        try:
+            fs_service = DepthOptimizerOnline(SimpleConfig(fs_url=args.fs_url, warmup=0))
+
+            stereo_args_list = []
+            for f in top_frames:
+                stereo_args_list.append(
+                    (f'top:{f["idx"]}', (f['ir_left'], f['ir_right'], top_intrinsics)))
+            for f in chassis_frames:
+                stereo_args_list.append(
+                    (f'chassis:{f["idx"]}', (f['ir_left'], f['ir_right'], chassis_intrinsics)))
+
+            result = benchmark_with_timing(
+                func=fs_service.forward_stereo,
+                args_list=stereo_args_list,
+                kwargs={},
+                name='Stereo(FS)',
+                num_runs=num_runs,
+                warmup_runs=warmup_runs
+            )
+            all_results.append(result)
+        except Exception as e:
+            print(f"\n[Stereo] 测试失败: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"\n[Stereo] 跳过 - 无立体相机数据")
+
+    # ========== 6. 并发 SAM3+CDM 双路测试 ==========
+    cdm_concurrent_result = None
     try:
         # 复用已有的 SAM3 和 CDM 服务实例
         if 'sam3_service' not in dir():
@@ -1227,7 +1629,7 @@ def main():
             )
             cdm_service = DepthOptimizerOnline(cfg)
 
-        concurrent_result = benchmark_concurrent_4way(
+        cdm_concurrent_result = benchmark_concurrent_sam3_cdm_2way(
             sam3_service=sam3_service,
             cdm_service=cdm_service,
             all_data=all_data,
@@ -1236,9 +1638,41 @@ def main():
             warmup_runs=warmup_runs,
         )
     except Exception as e:
-        print(f"\n[并发4路] 测试失败: {e}")
+        print(f"\n[SAM3+CDM 双路] 测试失败: {e}")
         import traceback
         traceback.print_exc()
+
+    # ========== 7. 并发 SAM3+Stereo 双路测试 ==========
+    stereo_concurrent_result = None
+    if stereo_available and fs_service is not None:
+        try:
+            # 复用已有的 SAM3 服务
+            if 'sam3_service' not in dir():
+                cfg = SimpleConfig(
+                    url=args.sam3_url,
+                    min_score=0.30,
+                    return_mask=False,
+                    warmup=0
+                )
+                sam3_service = SAM3Online(cfg)
+
+            stereo_concurrent_result = benchmark_concurrent_sam3_stereo_2way(
+                sam3_service=sam3_service,
+                fs_service=fs_service,
+                top_frames=top_frames,
+                top_intrinsics=top_intrinsics,
+                chassis_frames=chassis_frames,
+                chassis_intrinsics=chassis_intrinsics,
+                text_prompt=text_prompt_sam3,
+                num_runs=num_runs,
+                warmup_runs=warmup_runs,
+            )
+        except Exception as e:
+            print(f"\n[SAM3+Stereo 双路] 测试失败: {e}")
+            import traceback
+            traceback.print_exc()
+    elif not stereo_available:
+        print(f"\n[SAM3+Stereo 双路] 跳过 - 无立体相机数据")
 
     # ========== 汇总对比 ==========
     if all_results:
@@ -1278,31 +1712,41 @@ def main():
         print(f"串行 vs 并行加速比: {total_time / max_service_time:.2f}x")
 
     # 并发 vs 串行总结
-    if concurrent_result:
-        sam3_serial = next((r for r in all_results if r['name'] == 'SAM3'), None)
-        cdm_serial = next((r for r in all_results if r['name'] == 'CDM'), None)
+    sam3_serial = next((r for r in all_results if r['name'] == 'SAM3'), None)
+    cdm_serial = next((r for r in all_results if r['name'] == 'CDM'), None)
+    stereo_serial = next((r for r in all_results if r['name'] == 'Stereo(FS)'), None)
 
+    def print_concurrent_summary(label, conc_result, service_a, service_b, a_name, b_name):
+        """打印并发测试 vs 串行对比"""
         print(f"\n{'='*70}")
-        print(f"并发 4 路 vs 串行 对比")
+        print(f"{label} vs 串行 对比")
         print(f"{'='*70}")
 
-        if sam3_serial and cdm_serial:
-            serial_2sam3_2cdm = (sam3_serial['avg'] * 2 + cdm_serial['avg'] * 2) * 1000
-            print(f"  串行 2xSAM3+2xCDM: {serial_2sam3_2cdm:.1f} ms")
+        if service_a and service_b:
+            serial_total = (service_a['avg'] * 2 + service_b['avg'] * 2) * 1000
+            print(f"  串行 2x{a_name}+2x{b_name}: {serial_total:.1f} ms")
 
-        print(f"  并发 4路实际:      {concurrent_result['avg']*1000:.1f} ms")
-        print(f"  并发最小:          {concurrent_result['min']*1000:.1f} ms")
-        print(f"  并发最大:          {concurrent_result['max']*1000:.1f} ms")
+        print(f"  并发实际:          {conc_result['avg']*1000:.1f} ms")
+        print(f"  并发最小:          {conc_result['min']*1000:.1f} ms")
+        print(f"  并发最大:          {conc_result['max']*1000:.1f} ms")
 
-        if sam3_serial and cdm_serial:
-            print(f"  加速比:            {serial_2sam3_2cdm / (concurrent_result['avg']*1000):.2f}x")
+        if service_a and service_b:
+            print(f"  加速比:            {serial_total / (conc_result['avg']*1000):.2f}x")
 
-        print(f"\n  双相机融合频率:    {1/concurrent_result['avg']:.1f} Hz")
+        print(f"\n  双相机融合频率:    {1/conc_result['avg']:.1f} Hz")
         target_hz = 10.0
         target_ms = 1000.0 / target_hz
-        ok = concurrent_result['avg'] * 1000 < target_ms
+        ok = conc_result['avg'] * 1000 < target_ms
         print(f"  {target_hz:.0f}Hz 可达性:        {'可达' if ok else '不可达'} "
-              f"(需 <{target_ms:.0f}ms, 实际 {concurrent_result['avg']*1000:.1f}ms)")
+              f"(需 <{target_ms:.0f}ms, 实际 {conc_result['avg']*1000:.1f}ms)")
+
+    if cdm_concurrent_result:
+        print_concurrent_summary('SAM3+CDM 双路并发', cdm_concurrent_result,
+                                 sam3_serial, cdm_serial, 'SAM3', 'CDM')
+
+    if stereo_concurrent_result:
+        print_concurrent_summary('SAM3+Stereo 双路并发', stereo_concurrent_result,
+                                 sam3_serial, stereo_serial, 'SAM3', 'Stereo')
 
 
 if __name__ == '__main__':
