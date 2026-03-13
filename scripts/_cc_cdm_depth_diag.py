@@ -1,67 +1,55 @@
 #!/usr/bin/env python3
 """
-CDM 深度诊断工具 - chassis 相机
+深度诊断工具 - chassis 相机
 =====================================
-用于排查 CDM (Camera Depth Mapper) 深度优化前后的差异问题。
-对 chassis 相机的 RGB + 深度图，依次调用 SAM3 检测和 CDM 深度优化，
-并通过四格可视化界面直观对比原始深度与 CDM 优化深度的差异。
+支持两种深度模式，通过 Tab 键在线切换：
+
+  CDM 模式：RGB + RealSense 原始深度 → CDM 优化深度（深度去噪）
+  FS  模式：IR-left + IR-right      → FoundationStereo 双目估计深度
+
+两者输出均以 RealSense 原始深度作为对照基准，四格布局不变，
+右列内容随模式切换。
 
 【前置条件】
-  1. chassis 相机已启动（make cam-dual 或 make cam-chassis）
+  1. chassis 相机已启动，且开启 IR 流（FS 模式必须）：
+       make cam-chassis  # 需确认 enable_infra1/2:=true
   2. SAM3 服务可访问：http://192.168.112.14:8081
-  3. CDM  服务可访问：http://192.168.112.14:8082
+  3. CDM  服务可访问：http://192.168.112.14:8082（CDM 模式）
+  4. FS   服务可访问：http://192.168.112.14:8084（FS 模式）
+  5. FS 模式需通过 --intrinsics 指定相机内参 YAML 文件
 
 【启动方式】
-  # 默认参数（prompt="bottle.cup.box"，置信度 0.30）
+  # 默认 CDM 模式
   export PATH="/usr/bin:$PATH" && python3 scripts/_cc_cdm_depth_diag.py
 
-  # 自定义检测目标和置信度
-  python3 scripts/_cc_cdm_depth_diag.py --prompt "bottle.cup" --conf 0.25
+  # 启动时直接进入 FS 模式
+  python3 scripts/_cc_cdm_depth_diag.py --mode fs \\
+      --intrinsics /home/didi/capture/data/chassis_captures/20260309_152956/intrinsics.yaml
 
-  # 自定义面板宽度（默认 640px，两列共 1280px）
-  python3 scripts/_cc_cdm_depth_diag.py --panel-w 800
-
-  # 自定义服务地址
-  python3 scripts/_cc_cdm_depth_diag.py --sam3-url http://x.x.x.x:8081 --cdm-url http://x.x.x.x:8082
+  # 自定义检测目标和服务地址
+  python3 scripts/_cc_cdm_depth_diag.py --prompt "bottle.cup" --conf 0.25 \\
+      --sam3-url http://x.x.x.x:8081 --cdm-url http://x.x.x.x:8082 --fs-url http://x.x.x.x:8084
 
 【四格可视化布局】
   ┌─────────────────────┬─────────────────────┐
   │  左上：RGB + SAM3   │  右上：深度差异热图  │
-  │  分割掩码 + 质心    │  (CDM - Raw)        │
+  │  分割掩码 + 质心    │  (Algo - Raw)       │
   ├─────────────────────┼─────────────────────┤
-  │  左下：原始深度     │  右下：CDM 优化深度  │
-  │  伪彩色 (JET)       │  伪彩色 (JET)       │
+  │  左下：原始深度     │  右下：算法深度      │
+  │  伪彩色 (JET)       │  CDM 或 FS 深度     │
   └─────────────────────┴─────────────────────┘
-  底部状态栏：显示鼠标点击像素的 3D 坐标
+  底部状态栏：显示鼠标点击像素的 3D 坐标 + 当前模式
 
 【差异热图颜色约定】
-  蓝色  → CDM 深度更大（比原始深）
-  红色  → CDM 深度更小（比原始浅）
+  蓝色  → 算法深度更大（比原始深）
+  红色  → 算法深度更小（比原始浅）
   深灰  → 差异 ≤ 5mm（基本一致）
   黑色  → 无效像素（深度为 0）
 
-【左上格标注说明】
-  - 彩色矩形框：SAM3 检测到的目标 BBox
-  - 半透明彩色区域：SAM3 分割掩码
-  - 十字标记：质心像素位置
-  - CDM Z: x.xxxm  → 使用 CDM 深度计算的质心 Z 轴距离
-  - Raw Z: x.xxxm  → 使用原始深度计算的质心 Z 轴距离
-  - raw:xxxmm cdm:xxxmm → 质心像素处的单点深度值（直接读取，未平均）
-
-【质心 3D 计算方法（与正式 pipeline 一致）】
-  1. 对分割掩码做 5×5 腐蚀（去除边缘噪声）
-  2. IQR 异常值过滤（去除深度离群点）
-  3. 对所有有效点反投影到相机光学坐标系
-  4. 取 X/Y/Z 各自中值作为最终质心（鲁棒中值法）
-
-【鼠标点击 3D 坐标】
-  在任意面板单击左键，状态栏显示：
-    Pixel(px,py)  Raw:深度mm -> (X,Y,Z)m  CDM:深度mm -> (X,Y,Z)m  Diff:差值mm
-  注：点击为单点直读，未做滤波，噪声像素结果可能不准。
-
 【键盘操作】
-  d      - 触发 SAM3 检测 + CDM 优化（同时进行，结果刷新四格）
-  s      - 仅运行 CDM 优化（不检测，适合纯深度对比）
+  d      - SAM3 检测 + 当前深度算法
+  s      - 仅运行当前深度算法（不检测）
+  Tab    - 切换模式（CDM ↔ FS）
   q/ESC  - 退出
 """
 
@@ -73,6 +61,7 @@ import time
 import cv2
 import numpy as np
 import requests
+import yaml
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
@@ -82,13 +71,17 @@ import message_filters
 # ─── Defaults ───────────────────────────────────────────────────────────────
 SAM3_URL     = "http://192.168.112.14:8081"
 CDM_URL      = "http://192.168.112.14:8082"
+FS_URL       = "http://192.168.112.14:8084"
 PROMPT       = "bottle.cup.box"
 CONF         = 0.30
-PANEL_W      = 640   # width of each panel (total canvas = PANEL_W*2)
+PANEL_W      = 640
 STATUS_H     = 72
-DEPTH_VIS_MM = 3000  # colormap range (mm)
-DIFF_CLIP_MM = 300   # diff heatmap clip range (mm)
+DEPTH_VIS_MM = 3000
+DIFF_CLIP_MM = 300
 MASK_ERODE_K = 5
+
+IR_LEFT_TOPIC  = "/camera/chassis/infra1/image_rect_raw"
+IR_RIGHT_TOPIC = "/camera/chassis/infra2/image_rect_raw"
 
 COLORS = [
     (0, 255, 0), (0, 128, 255), (255, 128, 0),
@@ -134,7 +127,6 @@ def rle_to_mask(rle, h, w):
         pass
     counts = rle.get("counts", [])
     if isinstance(counts, str):
-        # compressed RLE - need pycocotools; fall back to empty
         return np.zeros((h, w), dtype=bool)
     m = np.zeros(h * w, dtype=np.uint8)
     pos, val = 0, 0
@@ -188,8 +180,8 @@ def call_sam3(bgr, url, prompt, conf):
 def call_cdm(bgr, depth_mm, url):
     """Returns optimized depth (uint16 ndarray, mm) or None on failure."""
     orig_h, orig_w = bgr.shape[:2]
-    rgb_lb, scale, pt, pl = letterbox(bgr,   798, 448, fill=0)
-    dpt_lb, _,     _,  _  = letterbox(depth_mm, 798, 448, fill=0)
+    rgb_lb, scale, pt, pl = letterbox(bgr,       798, 448, fill=0)
+    dpt_lb, _,     _,  _  = letterbox(depth_mm,  798, 448, fill=0)
 
     _, buf_rgb = cv2.imencode(".jpg", rgb_lb, [cv2.IMWRITE_JPEG_QUALITY, 85])
     _, buf_dpt = cv2.imencode(".png", dpt_lb)
@@ -221,9 +213,58 @@ def call_cdm(bgr, depth_mm, url):
     return result.astype(np.uint16)
 
 
+# ─── FoundationStereo HTTP call ────────────────────────────────────────────
+def call_fs(ir_left, ir_right, intrinsics_path, url):
+    """
+    Returns FS stereo depth (uint16 ndarray, mm) or None on failure.
+
+    Args:
+        ir_left:         grayscale IR image (numpy array)
+        ir_right:        grayscale IR image (numpy array)
+        intrinsics_path: path to YAML file with baseline + ir_profiles
+        url:             FoundationStereo service base URL
+    """
+    if ir_left is None or ir_right is None:
+        print("[FS] IR images not available. "
+              "Enable infra streams: enable_infra1:=true enable_infra2:=true")
+        return None
+    if not intrinsics_path:
+        print("[FS] --intrinsics not specified.")
+        return None
+
+    try:
+        _, buf_l = cv2.imencode(".png", ir_left)
+        _, buf_r = cv2.imencode(".png", ir_right)
+        with open(intrinsics_path, "rb") as f:
+            intr_bytes = f.read()
+    except Exception as e:
+        print(f"[FS] encode/read failed: {e}")
+        return None
+
+    files = {
+        "left_ir":    ("left_ir.png",     buf_l.tobytes(),  "image/png"),
+        "right_ir":   ("right_ir.png",    buf_r.tobytes(),  "image/png"),
+        "intrinsics": ("intrinsics.yaml", intr_bytes,       "application/octet-stream"),
+    }
+    try:
+        resp = requests.post(f"{url}/api/predict", files=files,
+                             timeout=60,
+                             proxies={"http": None, "https": None})
+        resp.raise_for_status()
+        arr = np.frombuffer(resp.content, np.uint8)
+        depth_out = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    except Exception as e:
+        print(f"[FS] request failed: {e}")
+        return None
+
+    if depth_out is None:
+        print("[FS] failed to decode depth PNG from response")
+        return None
+    return depth_out.astype(np.uint16)
+
+
 # ─── 3D geometry ───────────────────────────────────────────────────────────
 def pixel_to_3d(px, py, depth_mm_val, intr):
-    """Pixel + scalar depth (mm) -> (X,Y,Z) in camera optical frame (m)."""
     if depth_mm_val <= 0 or depth_mm_val > 60000:
         return None
     d = depth_mm_val / 1000.0
@@ -233,10 +274,6 @@ def pixel_to_3d(px, py, depth_mm_val, intr):
 
 
 def mask_centroid_3d(mask, depth_mm, intr):
-    """
-    Returns (centroid_xyz_m, centroid_pixel) for a boolean mask.
-    Uses eroded mask + IQR filtering + median, matching pipeline logic.
-    """
     k      = np.ones((MASK_ERODE_K, MASK_ERODE_K), np.uint8)
     eroded = cv2.erode(mask.astype(np.uint8), k)
     ys, xs = np.where(eroded > 0)
@@ -264,23 +301,22 @@ def mask_centroid_3d(mask, depth_mm, intr):
 
 # ─── Visualization helpers ─────────────────────────────────────────────────
 def depth_colormap(depth_mm, max_mm=DEPTH_VIS_MM):
-    d      = np.clip(depth_mm, 0, max_mm).astype(np.float32)
-    norm   = (d / max_mm * 255).astype(np.uint8)
-    color  = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-    # black out invalid pixels
+    d     = np.clip(depth_mm, 0, max_mm).astype(np.float32)
+    norm  = (d / max_mm * 255).astype(np.uint8)
+    color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
     color[depth_mm <= 0] = 0
     return color
 
 
-def diff_colormap(raw_mm, cdm_mm, clip_mm=DIFF_CLIP_MM):
+def diff_colormap(raw_mm, algo_mm, clip_mm=DIFF_CLIP_MM):
     """
-    Blue  = CDM deeper than raw  (diff > 0)
-    Red   = CDM shallower (diff < 0)
+    Blue  = algo deeper than raw  (diff > 0)
+    Red   = algo shallower        (diff < 0)
     Gray  = near-zero difference
-    Black = invalid (either depth missing)
+    Black = invalid
     """
-    valid = (raw_mm > 0) & (cdm_mm > 0) & (raw_mm < 60000) & (cdm_mm < 60000)
-    diff  = cdm_mm.astype(np.int32) - raw_mm.astype(np.int32)
+    valid = (raw_mm > 0) & (algo_mm > 0) & (raw_mm < 60000) & (algo_mm < 60000)
+    diff  = algo_mm.astype(np.int32) - raw_mm.astype(np.int32)
     vis   = np.zeros((*raw_mm.shape, 3), dtype=np.uint8)
     neg   = valid & (diff < -5)
     pos   = valid & (diff > 5)
@@ -298,14 +334,17 @@ def put_text(img, text, pos, scale=0.45, color=(220, 220, 220), thickness=1):
 
 # ─── ROS2 Node ─────────────────────────────────────────────────────────────
 class ChassisListener(Node):
-    def __init__(self):
-        super().__init__("cdm_diag")
-        self.bridge = CvBridge()
-        self._lock  = threading.Lock()
-        self._rgb   = None
-        self._depth = None
-        self._intr  = None
+    def __init__(self, ir_left_topic, ir_right_topic):
+        super().__init__("depth_diag")
+        self.bridge   = CvBridge()
+        self._lock    = threading.Lock()
+        self._rgb     = None
+        self._depth   = None
+        self._intr    = None
+        self._ir_left  = None
+        self._ir_right = None
 
+        # ── Colour + depth + camera_info (synchronized) ──────────────────
         color_sub = message_filters.Subscriber(
             self, Image, "/camera/chassis/color/image_raw")
         depth_sub = message_filters.Subscriber(
@@ -314,10 +353,17 @@ class ChassisListener(Node):
             self, CameraInfo, "/camera/chassis/color/camera_info")
         sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub, info_sub], queue_size=5, slop=0.05)
-        sync.registerCallback(self._cb)
-        self.get_logger().info("Waiting for chassis camera data...")
+        sync.registerCallback(self._cb_color)
 
-    def _cb(self, color_msg, depth_msg, info_msg):
+        # ── IR frames (latest-frame, independent of sync) ─────────────────
+        self.create_subscription(Image, ir_left_topic,  self._cb_ir_left,  5)
+        self.create_subscription(Image, ir_right_topic, self._cb_ir_right, 5)
+
+        self.get_logger().info("Waiting for chassis camera data...")
+        self.get_logger().info(
+            f"IR topics: {ir_left_topic}  |  {ir_right_topic}")
+
+    def _cb_color(self, color_msg, depth_msg, info_msg):
         bgr   = self.bridge.imgmsg_to_cv2(color_msg, "bgr8")
         depth = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
         intr  = {
@@ -329,26 +375,54 @@ class ChassisListener(Node):
             self._depth = depth.copy()
             self._intr  = intr
 
+    def _cb_ir_left(self, msg):
+        img = self.bridge.imgmsg_to_cv2(msg, "mono8")
+        with self._lock:
+            self._ir_left = img.copy()
+
+    def _cb_ir_right(self, msg):
+        img = self.bridge.imgmsg_to_cv2(msg, "mono8")
+        with self._lock:
+            self._ir_right = img.copy()
+
     def get_latest(self):
+        """Returns (rgb, depth, intrinsics, ir_left, ir_right)."""
         with self._lock:
             if self._rgb is None:
-                return None, None, None
-            return self._rgb.copy(), self._depth.copy(), dict(self._intr)
+                return None, None, None, None, None
+            return (
+                self._rgb.copy(),
+                self._depth.copy(),
+                dict(self._intr),
+                self._ir_left.copy()  if self._ir_left  is not None else None,
+                self._ir_right.copy() if self._ir_right is not None else None,
+            )
 
 
 # ─── Main Visualizer ───────────────────────────────────────────────────────
 class Visualizer:
-    WIN = "CDM Depth Diagnostic  [d=detect  s=CDM-only  q=quit  LClick=3D]"
+    WIN = "Depth Diagnostic  [d=detect  s=depth-only  Tab=CDM/FS  q=quit  LClick=3D]"
 
     def __init__(self, panel_w):
-        self.pw          = panel_w
-        self.result      = None        # last full detection+CDM result
-        self.status_line = "Click on any panel to show 3D coordinates."
-        self._panel_h    = panel_w * 9 // 16   # initial estimate
+        self.pw           = panel_w
+        self.result       = None
+        self.algo_mode    = "cdm"        # "cdm" or "fs"
+        self.status_line  = "Click on any panel to show 3D coordinates."
+        self._panel_h     = panel_w * 9 // 16
+        self.ir_available = False        # updated each frame by main loop
 
         cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.WIN, panel_w * 2, panel_w * 9 // 8 + STATUS_H)
         cv2.setMouseCallback(self.WIN, self._on_mouse)
+
+    # ── algo label ──────────────────────────────────────────────────────────
+    @property
+    def algo_label(self):
+        return "CDM" if self.algo_mode == "cdm" else "FS"
+
+    def set_mode(self, mode):
+        self.algo_mode = mode
+        print(f"[MODE] Switched to {mode.upper()}")
 
     def update(self, result):
         self.result = result
@@ -363,28 +437,28 @@ class Visualizer:
         col = 0 if x < pw else 1
         row = 0 if y < ph else 1
 
-        # map click -> original image pixel
         px_panel = x - col * pw
         py_panel = y - row * ph
         img_h, img_w = r["rgb"].shape[:2]
-        px = int(np.clip(px_panel * img_w / pw,   0, img_w - 1))
-        py = int(np.clip(py_panel * img_h / ph,   0, img_h - 1))
+        px = int(np.clip(px_panel * img_w / pw, 0, img_w - 1))
+        py = int(np.clip(py_panel * img_h / ph, 0, img_h - 1))
 
-        raw_d = int(r["raw_depth"][py, px])
-        cdm_d = int(r["cdm_depth"][py, px])
-        intr  = r["intrinsics"]
+        raw_d  = int(r["raw_depth"][py, px])
+        algo_d = int(r["algo_depth"][py, px])
+        intr   = r["intrinsics"]
+        label  = r["algo_label"]
 
-        pt_raw = pixel_to_3d(px, py, raw_d, intr)
-        pt_cdm = pixel_to_3d(px, py, cdm_d, intr)
+        pt_raw  = pixel_to_3d(px, py, raw_d,  intr)
+        pt_algo = pixel_to_3d(px, py, algo_d, intr)
 
         def fmt(pt):
             return f"({pt[0]:+.3f},{pt[1]:+.3f},{pt[2]:.3f})m" if pt else "invalid"
 
-        diff_mm = cdm_d - raw_d if raw_d > 0 and cdm_d > 0 else 0
+        diff_mm = algo_d - raw_d if raw_d > 0 and algo_d > 0 else 0
         self.status_line = (
-            f"Pixel({px},{py})  "
+            f"[{label}]  Pixel({px},{py})  "
             f"Raw:{raw_d}mm -> {fmt(pt_raw)}  "
-            f"CDM:{cdm_d}mm -> {fmt(pt_cdm)}  "
+            f"{label}:{algo_d}mm -> {fmt(pt_algo)}  "
             f"Diff: {diff_mm:+d}mm"
         )
         print(f"[CLICK] {self.status_line}")
@@ -393,10 +467,10 @@ class Visualizer:
     def _panel_rgb(self, r, pw, ph):
         img_orig = r["rgb"].copy()
         orig_h, orig_w = img_orig.shape[:2]
-        sx = pw / orig_w   # scale factors for coordinate mapping
+        sx = pw / orig_w
         sy = ph / orig_h
+        label = r["algo_label"]
 
-        # Collect annotation info and apply mask overlay (in original space)
         annotations = []
         for i, det in enumerate(r["detections"]):
             c  = COLORS[i % len(COLORS)]
@@ -410,52 +484,50 @@ class Visualizer:
                 ).astype(np.uint8)
                 img_orig = overlay
 
-                cen_cdm, cpx = mask_centroid_3d(det["mask"], r["cdm_depth"], r["intrinsics"])
-                cen_raw, _   = mask_centroid_3d(det["mask"], r["raw_depth"], r["intrinsics"])
+                cen_algo, cpx = mask_centroid_3d(det["mask"], r["algo_depth"], r["intrinsics"])
+                cen_raw,  _   = mask_centroid_3d(det["mask"], r["raw_depth"],  r["intrinsics"])
             else:
-                cen_cdm, cen_raw, cpx = None, None, None
+                cen_algo, cen_raw, cpx = None, None, None
 
             annotations.append((c, x1, y1, x2, y2, det["class_name"], det["score"],
-                                 cen_cdm, cen_raw, cpx))
+                                 cen_algo, cen_raw, cpx))
 
-        # Resize FIRST, then draw all text/markers in panel space
         img = cv2.resize(img_orig, (pw, ph))
 
-        for c, x1, y1, x2, y2, cls, score, cen_cdm, cen_raw, cpx in annotations:
-            # bbox in panel coords
+        for c, x1, y1, x2, y2, cls, score, cen_algo, cen_raw, cpx in annotations:
             px1 = int(x1 * sx); py1 = int(y1 * sy)
             px2 = int(x2 * sx); py2 = int(y2 * sy)
             cv2.rectangle(img, (px1, py1), (px2, py2), c, 2)
             put_text(img, f"{cls} {score:.2f}", (px1, max(py1 - 6, 14)), 0.50, c, 1)
 
             if cpx is not None:
-                # centroid in panel coords
                 cx_p = int(cpx[0] * sx)
                 cy_p = int(cpx[1] * sy)
                 cv2.drawMarker(img, (cx_p, cy_p), c, cv2.MARKER_CROSS, 16, 2)
-                raw_d_at_cen = int(r["raw_depth"][cpx[1], cpx[0]])
-                cdm_d_at_cen = int(r["cdm_depth"][cpx[1], cpx[0]])
-                tx = min(cx_p + 8, pw - 150)
-                if cen_cdm is not None:
-                    put_text(img, f"CDM Z:{cen_cdm[2]:.3f}m",
+                raw_d_at_cen  = int(r["raw_depth"][cpx[1], cpx[0]])
+                algo_d_at_cen = int(r["algo_depth"][cpx[1], cpx[0]])
+                tx = min(cx_p + 8, pw - 160)
+                if cen_algo is not None:
+                    put_text(img, f"{label} Z:{cen_algo[2]:.3f}m",
                              (tx, max(cy_p - 6, 14)), 0.50, c)
                 if cen_raw is not None:
                     put_text(img, f"Raw Z:{cen_raw[2]:.3f}m",
                              (tx, cy_p + 16), 0.50, (180, 180, 180))
-                put_text(img, f"raw:{raw_d_at_cen}mm cdm:{cdm_d_at_cen}mm",
+                put_text(img, f"raw:{raw_d_at_cen}mm {label.lower()}:{algo_d_at_cen}mm",
                          (tx, cy_p + 34), 0.42, (200, 200, 100))
 
-        put_text(img, f"RGB + SAM3 Masks ({len(r['detections'])} objects)",
+        put_text(img, f"RGB + SAM3 [{label} mode]  ({len(r['detections'])} objects)",
                  (6, 18), 0.48, (255, 255, 255))
         return img
 
     def _panel_diff(self, r, pw, ph):
-        vis = diff_colormap(r["raw_depth"], r["cdm_depth"], DIFF_CLIP_MM)
+        label = r["algo_label"]
+        vis = diff_colormap(r["raw_depth"], r["algo_depth"], DIFF_CLIP_MM)
         vis = cv2.resize(vis, (pw, ph))
-        put_text(vis, f"Depth Diff = CDM - Raw  (Blue>0 Red<0  clip={DIFF_CLIP_MM}mm)",
+        put_text(vis, f"Diff = {label} - Raw  (Blue>0 Red<0  clip={DIFF_CLIP_MM}mm)",
                  (6, 18), 0.42, (255, 255, 255))
-        # legend
-        items = [("CDM deeper", (200, 0, 0)), ("same", (60, 60, 60)), ("CDM shallower", (0, 0, 200))]
+        items = [(f"{label} deeper", (200, 0, 0)), ("same", (60, 60, 60)),
+                 (f"{label} shallower", (0, 0, 200))]
         for i, (lbl, col) in enumerate(items):
             lx = 8 + i * (pw // 3)
             cv2.rectangle(vis, (lx, ph - 22), (lx + 14, ph - 8), col, -1)
@@ -470,8 +542,16 @@ class Visualizer:
         return vis
 
     def _status_bar(self, total_w):
+        mode_tag = f"[{self.algo_label} mode]"
         bar = np.full((STATUS_H, total_w, 3), 25, dtype=np.uint8)
-        # split long line at double-space boundaries
+        # mode indicator (top-right corner)
+        mode_color = (0, 200, 255) if self.algo_mode == "fs" else (100, 255, 100)
+        put_text(bar, mode_tag, (total_w - 140, 20), 0.50, mode_color, 2)
+        # IR availability indicator (only relevant in FS mode)
+        if self.algo_mode == "fs":
+            ir_tag   = "IR: recv" if self.ir_available else "IR: no data!"
+            ir_color = (0, 255, 0) if self.ir_available else (0, 0, 255)
+            put_text(bar, ir_tag, (total_w - 140, 44), 0.44, ir_color, 1)
         parts = self.status_line.split("  ")
         y = 22
         line = ""
@@ -497,30 +577,33 @@ class Visualizer:
         pw = self.pw
         r  = self.result
 
-        # Always compute panel height from current image
         img_h, img_w = live_bgr.shape[:2]
         ph = pw * img_h // img_w
         self._panel_h = ph
 
+        label = self.algo_label
+
         if r is None:
-            # 4-panel with live data where available, placeholders otherwise
             p0 = cv2.resize(live_bgr, (pw, ph))
-            put_text(p0, "Live RGB  |  press 'd' to detect, 's' for CDM only",
-                     (6, 18), 0.45, (0, 255, 255))
-
-            p1 = self._placeholder(pw, ph, "Depth Diff (CDM-Raw)  -- run CDM first ('s' or 'd')")
-
+            put_text(p0,
+                     f"Live RGB  [{label} mode]  |  press 'd' to detect, 's' for depth-only",
+                     (6, 18), 0.42, (0, 255, 255))
+            p1 = self._placeholder(pw, ph, f"Diff ({label}-Raw)  -- run depth first")
             if live_depth is not None:
                 p2 = self._panel_depth(live_depth, "Raw Depth (live)", pw, ph)
             else:
                 p2 = self._placeholder(pw, ph, "Raw Depth -- waiting for camera...")
-
-            p3 = self._placeholder(pw, ph, "CDM Depth  -- run CDM first ('s' or 'd')")
+            p3 = self._placeholder(pw, ph, f"{label} Depth  -- run depth first")
         else:
             p0 = self._panel_rgb(r, pw, ph)
             p1 = self._panel_diff(r, pw, ph)
-            p2 = self._panel_depth(r["raw_depth"], "Raw Depth",  pw, ph)
-            p3 = self._panel_depth(r["cdm_depth"], "CDM Depth",  pw, ph)
+            p2 = self._panel_depth(r["raw_depth"],  "Raw Depth", pw, ph)
+            algo_label = r["algo_label"]
+            if r.get("is_fallback"):
+                algo_label = f"{algo_label} Depth  [!! FALLBACK = RAW !!]"
+            else:
+                algo_label = f"{algo_label} Depth"
+            p3 = self._panel_depth(r["algo_depth"], algo_label, pw, ph)
 
         row0   = np.hstack([p0, p1])
         row1   = np.hstack([p2, p3])
@@ -545,40 +628,81 @@ class TaskRunner:
     def _busy(self):
         return self._thread is not None and self._thread.is_alive()
 
-    def run(self, mode):
+    def run(self, trigger):
+        """
+        trigger: "detect" (SAM3 + depth algo) or "depth" (depth algo only)
+        """
         if self._busy():
             print("[WARN] Previous task still running, please wait.")
             return
 
+        algo_mode = self.vis.algo_mode
+
         def _task():
-            rgb, raw_d, intr = self.node.get_latest()
+            rgb, raw_d, intr, ir_left, ir_right = self.node.get_latest()
             if rgb is None:
                 print("[WARN] No camera data yet.")
                 return
 
+            # ── SAM3 detection ────────────────────────────────────────────
             detections = []
-            if mode == "detect":
+            if trigger == "detect":
                 print(f"[SAM3] Calling detector, prompt='{self.args.prompt}'...")
                 t0 = time.time()
                 detections = call_sam3(rgb, self.args.sam3_url,
                                        self.args.prompt, self.args.conf)
                 print(f"[SAM3] {len(detections)} objects  ({time.time()-t0:.2f}s)")
 
-            print("[CDM]  Calling depth optimizer...")
-            t0    = time.time()
-            cdm_d = call_cdm(rgb, raw_d, self.args.cdm_url)
-            if cdm_d is None:
-                print("[CDM]  Failed, using raw depth as fallback.")
-                cdm_d = raw_d.copy()
-            else:
-                print(f"[CDM]  Done  ({time.time()-t0:.2f}s)")
+            # ── Depth algorithm ───────────────────────────────────────────
+            if algo_mode == "cdm":
+                print("[CDM]  Calling depth optimizer...")
+                t0    = time.time()
+                algo_d = call_cdm(rgb, raw_d, self.args.cdm_url)
+                if algo_d is None:
+                    print("[CDM]  Failed, using raw depth as fallback.")
+                    algo_d = raw_d.copy()
+                else:
+                    print(f"[CDM]  Done  ({time.time()-t0:.2f}s)")
+                label = "CDM"
+                is_fallback = False
+
+            else:  # fs
+                print("[FS]   Calling FoundationStereo...")
+                t0     = time.time()
+                algo_d = call_fs(ir_left, ir_right,
+                                 self.args.intrinsics, self.args.fs_url)
+                is_fallback = algo_d is None
+                if is_fallback:
+                    print("[FS]   Failed, using raw depth as fallback.")
+                    algo_d = raw_d.copy()
+                    self.vis.status_line = (
+                        "[FS] Failed or IR unavailable — showing raw depth as fallback")
+                else:
+                    print(f"[FS]   Done  ({time.time()-t0:.2f}s)")
+                label = "FS"
+
+                # FS depth is in IR camera frame — use IR intrinsics for 3D
+                # backprojection (color camera intrinsics would give ~39% error).
+                try:
+                    with open(self.args.intrinsics) as f:
+                        intr_yaml = yaml.safe_load(f)
+                    ir_prof = intr_yaml.get("ir_profiles", [{}])[0]
+                    intr = {
+                        "fx": ir_prof["fx"], "fy": ir_prof["fy"],
+                        "cx": ir_prof["cx"], "cy": ir_prof["cy"],
+                    }
+                except Exception as e:
+                    print(f"[FS]   Could not parse IR intrinsics: {e}, "
+                          "falling back to color intrinsics")
 
             self.vis.update({
-                "rgb":        rgb,
-                "raw_depth":  raw_d,
-                "cdm_depth":  cdm_d,
-                "detections": detections,
-                "intrinsics": intr,
+                "rgb":         rgb,
+                "raw_depth":   raw_d,
+                "algo_depth":  algo_d,
+                "algo_label":  label,
+                "detections":  detections,
+                "intrinsics":  intr,
+                "is_fallback": is_fallback if algo_mode == "fs" else False,
             })
 
         self._thread = threading.Thread(target=_task, daemon=True)
@@ -587,46 +711,83 @@ class TaskRunner:
 
 # ─── Entry point ───────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="CDM Depth Diagnostic Tool")
-    parser.add_argument("--sam3-url", default=SAM3_URL)
-    parser.add_argument("--cdm-url",  default=CDM_URL)
-    parser.add_argument("--prompt",   default=PROMPT)
-    parser.add_argument("--conf",     type=float, default=CONF)
-    parser.add_argument("--panel-w",  type=int,   default=PANEL_W)
+    parser = argparse.ArgumentParser(description="Depth Diagnostic Tool (CDM / FS modes)")
+    parser.add_argument("--mode",           default="cdm",       choices=["cdm", "fs"],
+                        help="Initial depth mode (default: cdm)")
+    parser.add_argument("--sam3-url",       default=SAM3_URL)
+    parser.add_argument("--cdm-url",        default=CDM_URL)
+    parser.add_argument("--fs-url",         default=FS_URL)
+    parser.add_argument("--intrinsics",     default=None,
+                        help="Path to intrinsics YAML (required for FS mode)")
+    parser.add_argument("--ir-left-topic",  default=IR_LEFT_TOPIC)
+    parser.add_argument("--ir-right-topic", default=IR_RIGHT_TOPIC)
+    parser.add_argument("--prompt",         default=PROMPT)
+    parser.add_argument("--conf",           type=float, default=CONF)
+    parser.add_argument("--panel-w",        type=int,   default=PANEL_W)
     args = parser.parse_args()
 
     rclpy.init()
-    node   = ChassisListener()
+    node   = ChassisListener(args.ir_left_topic, args.ir_right_topic)
     vis    = Visualizer(args.panel_w)
+    vis.set_mode(args.mode)
     runner = TaskRunner(node, vis, args)
 
     spin_t = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_t.start()
 
-    print("=== CDM Depth Diagnostic ===")
-    print(f"  SAM3 : {args.sam3_url}")
-    print(f"  CDM  : {args.cdm_url}")
+    print("=== Depth Diagnostic ===")
+    print(f"  Mode  : {args.mode.upper()}  (Tab to switch)")
+    print(f"  SAM3  : {args.sam3_url}")
+    print(f"  CDM   : {args.cdm_url}")
+    print(f"  FS    : {args.fs_url}")
+    if args.intrinsics:
+        print(f"  Intr  : {args.intrinsics}")
+    else:
+        print("  Intr  : (not set — required for FS mode)")
+    print(f"  IR L  : {args.ir_left_topic}")
+    print(f"  IR R  : {args.ir_right_topic}")
     print(f"  Prompt: '{args.prompt}'  conf={args.conf}")
-    print("  Keys: d=detect  s=CDM-only  q/ESC=quit  LClick=3D coords")
+    print("  Keys  : d=detect  s=depth-only  Tab=switch-mode  q/ESC=quit  LClick=3D")
 
     try:
         while rclpy.ok():
-            rgb, depth, _ = node.get_latest()
+            rgb, depth, _, ir_l, ir_r = node.get_latest()
+            vis.ir_available = (ir_l is not None and ir_r is not None)
             if rgb is not None:
                 vis.show(rgb, depth)
+            else:
+                # Show waiting screen instead of black
+                ph = vis._panel_h
+                pw = vis.pw
+                wait_img = np.zeros((ph * 2 + STATUS_H, pw * 2, 3), dtype=np.uint8)
+                import os as _os
+                domain_id = _os.environ.get("ROS_DOMAIN_ID", "0 (未设置!)")
+                put_text(wait_img, "[WARN] 等待相机数据...", (pw // 2 - 120, ph - 30), 0.7, (0, 200, 255), 2)
+                put_text(wait_img, f"ROS_DOMAIN_ID = {domain_id}  (相机使用 42)",
+                         (pw // 2 - 180, ph + 10), 0.55, (150, 150, 0), 1)
+                put_text(wait_img, "请确认: export ROS_DOMAIN_ID=42  &&  make cam-chassis enable_infra=true",
+                         (pw // 2 - 280, ph + 40), 0.50, (100, 100, 100), 1)
+                cv2.imshow(vis.WIN, wait_img)
             key = cv2.waitKey(50) & 0xFF
             if key in (ord("q"), 27):
                 break
             elif key == ord("d"):
                 runner.run("detect")
             elif key == ord("s"):
-                runner.run("cdm")
+                runner.run("depth")
+            elif key == 9:  # Tab
+                new_mode = "fs" if vis.algo_mode == "cdm" else "cdm"
+                vis.set_mode(new_mode)
+                vis.result = None   # clear stale result from previous mode
     except KeyboardInterrupt:
         pass
     finally:
         vis.destroy()
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

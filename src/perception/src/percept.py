@@ -994,7 +994,7 @@ class DepthOptimizerOnline:
                 img = cv2.imread(img, cv2.IMREAD_UNCHANGED)
             elif isinstance(img, bytes):
                 img = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-            _, buf = cv2.imencode('.png', img)
+            _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 95])
             return buf.tobytes()
 
         def _encode_color(img):
@@ -1029,8 +1029,8 @@ class DepthOptimizerOnline:
             intrinsics_bytes = _encode_intrinsics(intrinsics)
 
             files = {
-                'left_ir':    ('left_ir.png',     ir_left_bytes,     'image/png'),
-                'right_ir':   ('right_ir.png',    ir_right_bytes,    'image/png'),
+                'left_ir':    ('left_ir.jpg',     ir_left_bytes,     'image/jpeg'),
+                'right_ir':   ('right_ir.jpg',    ir_right_bytes,    'image/jpeg'),
                 'intrinsics': ('intrinsics.yaml', intrinsics_bytes, 'application/octet-stream'),
             }
             if rgb is not None:
