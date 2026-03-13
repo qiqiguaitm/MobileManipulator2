@@ -17,7 +17,6 @@ import hashlib
 import json
 import math
 import os
-
 import sys
 import time
 from io import BytesIO
@@ -1054,12 +1053,10 @@ class DepthOptimizerOnline:
             if resp_hash:
                 self._intr_hash = resp_hash
 
-            # 解码 depth PNG (uint16)
+            # 解码 PNG uint16 depth
             depth_arr = cv2.imdecode(
                 np.frombuffer(resp.content, dtype=np.uint8),
                 cv2.IMREAD_UNCHANGED)
-            if depth_arr is None:
-                return {'success': False, 'error': 'Failed to decode depth PNG'}
 
             result = {
                 'success': True,
