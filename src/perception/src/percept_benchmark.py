@@ -1368,7 +1368,7 @@ def main():
     parser.add_argument('--num-runs', type=int, default=10, help='每组数据测试次数 (default: 10)')
     parser.add_argument('--warmup', type=int, default=3, help='预热次数 (default: 3)')
     parser.add_argument('--samples-dir', type=str,
-                       default='/data/workspace/MobileManipulator2/src/perception/samples',
+                       default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'samples'),
                        help='样本数据目录')
     parser.add_argument('--grasp-config', type=str,
                        default='/data/workspace/MobileManipulator2/src/perception/config/server_grasp.json',
@@ -1378,7 +1378,8 @@ def main():
     parser.add_argument('--fs-url', type=str, default='http://192.168.112.14:8084',
                        help='FoundationStereo service URL (default: http://192.168.112.14:8084)')
     parser.add_argument('--data-dir', type=str,
-                       default='/data/workspace/MobileManipulator2/data/robot_captures',
+                       default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            '../../../data/robot_captures'),
                        help='Capture data directory (auto-discovers timestamped subdirs)')
     parser.add_argument('--text-prompt', type=str, default='pen,box,phone,bottle,toy',
                        help='SAM3 text prompt for parallel mode')
