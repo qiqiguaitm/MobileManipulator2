@@ -52,7 +52,7 @@ from perception.srv import DetectObjects
 
 from perception.coordinate_transformer import CoordinateTransformer
 from perception.scene_perception_core import ScenePerceptionCore, SimpleConfig
-from perception.percept import DinoXDetectorOnline, SAM3Online, DepthOptimizerOnline
+from perception.percept import DinoXDetectorOnline, SAM3Online, DepthOptimizerOnline, CombinedPerceptionClient
 from perception.intelligent_fusion import fuse_dual_camera_positions
 from perception.dual_camera_matcher import DualCameraMatcher, DetectionWithDepth
 from perception.byte_tracker_3d import ByteTracker3D, TrackerConfig
@@ -271,10 +271,16 @@ class MultiCameraPerceptionNode(Node):
         self.enable_depth_optimizer = self.get_parameter('enable_depth_optimizer').value
 
         # FoundationStereo 被动双目深度估计（适用于所有相机）
-        self.declare_parameter('depth_source', 'foundation_stereo')  # 'raw' | 'foundation_stereo'
+        self.declare_parameter('depth_source', 'foundation_stereo')  # 'raw' | 'foundation_stereo' | 'combined'
         self.declare_parameter('foundation_stereo_url', 'http://192.168.112.14:8084')
         self.depth_source = self.get_parameter('depth_source').value
         self.foundation_stereo_url = self.get_parameter('foundation_stereo_url').value
+
+        # Combined SAM3+FS 服务 URL（depth_source='combined' 时使用）
+        self.declare_parameter('combined_url_gpu0', 'http://192.168.112.14:8090')
+        self.declare_parameter('combined_url_gpu1', 'http://192.168.112.14:8091')
+        self.combined_url_gpu0 = self.get_parameter('combined_url_gpu0').value
+        self.combined_url_gpu1 = self.get_parameter('combined_url_gpu1').value
 
         # 坐标系配置
         self.declare_parameter('target_frame', 'base_link')
@@ -284,9 +290,9 @@ class MultiCameraPerceptionNode(Node):
         self.declare_parameter('distance_offset', 0.0)
         self.distance_offset_default = self.get_parameter('distance_offset').value
 
-        # 自动检测配置 — 每相机独立检测频率，与硬件帧率对齐
-        self.declare_parameter('top_detect_rate', 5.0)      # D455 native: 5fps
-        self.declare_parameter('chassis_detect_rate', 6.0)  # D435 native: 6fps
+        # 自动检测配置 — 每相机独立检测频率
+        self.declare_parameter('top_detect_rate', 5.0)
+        self.declare_parameter('chassis_detect_rate', 5.0)
         # 兼容旧参数：>0 时覆盖所有相机检测频率
         self.declare_parameter('auto_detect_rate', 0.0)
         _legacy = self.get_parameter('auto_detect_rate').value
@@ -414,6 +420,15 @@ class MultiCameraPerceptionNode(Node):
             else:
                 self.get_logger().info(f'  FoundationStereo service: OK ({self.foundation_stereo_url})')
 
+        # Combined SAM3+FS 服务检查
+        if self.depth_source == 'combined':
+            for label, url in [('GPU0', self.combined_url_gpu0), ('GPU1', self.combined_url_gpu1)]:
+                if not check_service(url, timeout=5.0):
+                    self.get_logger().warn(f'Combined {label} 不可用: {url}，回退到 foundation_stereo')
+                    self.depth_source = 'foundation_stereo'
+                    break
+                self.get_logger().info(f'  Combined {label}: OK ({url})')
+
     def _init_components(self):
         """初始化双相机组件"""
         self.cameras = {}
@@ -442,8 +457,8 @@ class MultiCameraPerceptionNode(Node):
             self.get_logger().info(f'初始化 {cfg.name} 相机...')
             
             # 同步传感器订阅器
-            # FoundationStereo: 所有相机都需要IR流，从相机名自动派生topic
-            use_ir = self.depth_source == 'foundation_stereo'
+            # FoundationStereo / Combined: 所有相机都需要IR流
+            use_ir = self.depth_source in ('foundation_stereo', 'combined')
             sensor = SyncedSensorSubscriber(
                 node=self,
                 color_topic=cfg.color_topic,
@@ -487,49 +502,66 @@ class MultiCameraPerceptionNode(Node):
         if not self.cameras:
             raise RuntimeError('没有可用的相机')
 
-        # 共享的检测器（根据 detector_type 选择）
-        if self.detector_type == 'sam3':
-            if getattr(self, '_detector_available', True):
-                detector_cfg = SimpleConfig(
-                    url=self.sam3_url,
-                    min_score=self.min_score,  # SAM3Online 会映射为 confidence
-                    resize=(1280, 720),
-                    return_mask=True,
-                )
-                self.detector = SAM3Online(detector_cfg)
-                self.get_logger().info(f'使用 SAM3 检测器: {self.sam3_url}')
-            else:
-                self.detector = None
-                self.get_logger().warn('SAM3 检测器未初始化，感知节点以无检测模式运行')
+        # ── Combined 模式: per-camera CombinedPerceptionClient ──
+        self._combined_clients = {}
+        if self.depth_source == 'combined':
+            camera_gpu_map = {'top': self.combined_url_gpu0, 'chassis': self.combined_url_gpu1}
+            for cam_name, url in camera_gpu_map.items():
+                if cam_name in self.cores:
+                    cfg = SimpleConfig(
+                        url=url,
+                        confidence=self.min_score,
+                        return_mask=True,
+                    )
+                    self._combined_clients[cam_name] = CombinedPerceptionClient(cfg)
+                    self.get_logger().info(f'Combined client [{cam_name}]: {url}')
+            # combined 模式不需要独立的 detector 和 fs_optimizer
+            self.detector = None
+            self.fs_optimizer = None
+            self.depth_optimizer = None
         else:
-            detector_cfg = SimpleConfig(
-                url=self.detector_url,
-                min_score=self.min_score,
-                resize=(1280, 720),
-            )
-            self.detector = DinoXDetectorOnline(detector_cfg)
-            self.get_logger().info(f'使用 DINO-X 检测器: {self.detector_url}')
+            # 共享的检测器（根据 detector_type 选择）
+            if self.detector_type == 'sam3':
+                if getattr(self, '_detector_available', True):
+                    detector_cfg = SimpleConfig(
+                        url=self.sam3_url,
+                        min_score=self.min_score,
+                        resize=(1280, 720),
+                        return_mask=True,
+                    )
+                    self.detector = SAM3Online(detector_cfg)
+                    self.get_logger().info(f'使用 SAM3 检测器: {self.sam3_url}')
+                else:
+                    self.detector = None
+                    self.get_logger().warn('SAM3 检测器未初始化，感知节点以无检测模式运行')
+            else:
+                detector_cfg = SimpleConfig(
+                    url=self.detector_url,
+                    min_score=self.min_score,
+                    resize=(1280, 720),
+                )
+                self.detector = DinoXDetectorOnline(detector_cfg)
+                self.get_logger().info(f'使用 DINO-X 检测器: {self.detector_url}')
 
-        # 共享的深度优化器 (CDM)
-        self.depth_optimizer = None
-        if self.enable_depth_optimizer:
-            optimizer_cfg = SimpleConfig(
-                url=self.depth_optimizer_url,
-                chosen_policy='dn',
-            )
-            self.depth_optimizer = DepthOptimizerOnline(optimizer_cfg)
-            # 给每个 core 设置共享的优化器
-            for core in self.cores.values():
-                core.depth_optimizer = self.depth_optimizer
+            # 共享的深度优化器 (CDM)
+            self.depth_optimizer = None
+            if self.enable_depth_optimizer:
+                optimizer_cfg = SimpleConfig(
+                    url=self.depth_optimizer_url,
+                    chosen_policy='dn',
+                )
+                self.depth_optimizer = DepthOptimizerOnline(optimizer_cfg)
+                for core in self.cores.values():
+                    core.depth_optimizer = self.depth_optimizer
 
-        # FoundationStereo 深度估计器（独立于CDM，所有相机共用）
-        self.fs_optimizer = None
-        if self.depth_source == 'foundation_stereo':
-            fs_cfg = SimpleConfig(url=self.foundation_stereo_url)
-            self.fs_optimizer = DepthOptimizerOnline(fs_cfg)
-            self.get_logger().info(
-                f'FoundationStereo 深度估计器已初始化: {self.foundation_stereo_url}'
-            )
+            # FoundationStereo 深度估计器
+            self.fs_optimizer = None
+            if self.depth_source == 'foundation_stereo':
+                fs_cfg = SimpleConfig(url=self.foundation_stereo_url)
+                self.fs_optimizer = DepthOptimizerOnline(fs_cfg)
+                self.get_logger().info(
+                    f'FoundationStereo 深度估计器已初始化: {self.foundation_stereo_url}'
+                )
 
     def _init_publishers(self):
         """初始化发布器"""
@@ -660,9 +692,9 @@ class MultiCameraPerceptionNode(Node):
         # base_link→map 变换（定位就绪时）
         base_to_map = self._get_base_to_map_matrix()
 
-        # FoundationStereo IR data (all cameras when depth_source == 'foundation_stereo')
+        # IR data (FoundationStereo / Combined 模式)
         ir_left = ir_right = ir_intr = None
-        if self.depth_source == 'foundation_stereo':
+        if self.depth_source in ('foundation_stereo', 'combined'):
             ir_left = data.get('ir_left')
             ir_right = data.get('ir_right')
             ir_intr = sensor.ir_intrinsics
@@ -748,24 +780,247 @@ class MultiCameraPerceptionNode(Node):
 
         self.get_logger().info(f'[Worker-{camera_name}] 停止')
 
+    def _decode_detections(self, objects, rgb, default_category='object'):
+        """RLE/bbox mask → binary mask, class_name/category 统一映射"""
+        rle_masks, bbox_masks, obj_indices = [], [], []
+        for i, obj in enumerate(objects):
+            mask_rle = obj.get('mask')
+            if mask_rle:
+                rle_masks.append(mask_rle)
+                obj_indices.append(i)
+            else:
+                bbox_masks.append((i, obj.get('bbox', [0, 0, 0, 0])))
+
+        decoded_masks = {}
+        if rle_masks:
+            masks_array = coco_mask.decode(rle_masks)
+            if masks_array.ndim == 2:
+                masks_array = masks_array[:, :, np.newaxis]
+            for idx, obj_idx in enumerate(obj_indices):
+                decoded_masks[obj_idx] = masks_array[:, :, idx].astype(np.uint8)
+
+        for obj_idx, bbox in bbox_masks:
+            binary_mask = np.zeros((rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+            x1, y1, x2, y2 = map(int, bbox)
+            binary_mask[y1:y2, x1:x2] = 1
+            decoded_masks[obj_idx] = binary_mask
+
+        detections = []
+        category_counts = {}
+        for i, obj in enumerate(objects):
+            binary_mask = decoded_masks.get(i)
+            if binary_mask is None or binary_mask.sum() < 300:
+                continue
+            # 兼容 combined (class_name) 和 standalone SAM3 (category)
+            category = obj.get('category') or obj.get('class_name', default_category)
+            score = obj.get('score', 0)
+            category_counts[category] = category_counts.get(category, 0) + 1
+            detections.append({
+                'object_id': f"{category}_{category_counts[category]}",
+                'category': category,
+                'score': score,
+                'bbox': obj.get('bbox', [0, 0, 0, 0]),
+                'mask': binary_mask,
+            })
+        return detections
+
+    def _run_combined_detection(self, task, core, client):
+        """Combined 模式: SAM3+FS 单次 HTTP 调用"""
+        camera_name = task.camera_name
+        rgb = task.rgb
+
+        result = Object3DArray()
+        result.header.stamp = self.get_clock().now().to_msg()
+        result.header.frame_id = self.target_frame
+
+        _t0 = time.time()
+        _timing = {}
+
+        # 1. 调用 combined server
+        resp = client.forward(
+            rgb=rgb,
+            ir_left=task.ir_left,
+            ir_right=task.ir_right,
+            intrinsics=task.ir_intrinsics or {},
+            text_prompt=task.prompt,
+            _timing=_timing,
+        )
+
+        if not resp.get('success'):
+            self.get_logger().warn(f'[{camera_name}] combined failed: {resp.get("error")}')
+            return result
+
+        _t_http = time.time()
+
+        # 2. 解析检测结果
+        objects = resp.get('detections', {}).get('objects', [])
+        objects = [o for o in objects if o.get('score', 0) >= self._current_min_score]
+        detections = self._decode_detections(objects, rgb, default_category=task.prompt)
+
+        # 3. 深度处理 (uint16 mm → float32 m)
+        depth_mm = resp.get('depth')
+        if depth_mm is not None:
+            optimized_depth = depth_mm.astype(np.float32) / 1000.0
+        else:
+            optimized_depth = task.depth.astype(np.float32) / 1000.0 if task.depth.dtype == np.uint16 else task.depth
+
+        _t_decode = time.time()
+
+        # 4. 发布优化后的深度图
+        try:
+            d_mm = (optimized_depth * 1000).astype(np.uint16)
+            depth_msg = self._bridge.cv2_to_imgmsg(d_mm, encoding='16UC1')
+            depth_msg.header.stamp = self.get_clock().now().to_msg()
+            depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
+            if camera_name in self.pubs:
+                self.pubs[camera_name]['depth'].publish(depth_msg)
+        except Exception:
+            pass
+
+        # Timing 日志
+        http_ms = _timing.get('combined_http', 0)
+        srv_total = _timing.get('server_total', 0)
+        srv_sam3 = _timing.get('server_sam3', 0)
+        srv_fs = _timing.get('server_fs', 0)
+        n_obj = len(detections)
+
+        if not detections:
+            self.get_logger().info(
+                f'[{camera_name}] COMBINED: http={http_ms:.0f}ms '
+                f'srv=[sam3:{srv_sam3:.0f}+fs:{srv_fs:.0f}={srv_total:.0f}ms] '
+                f'wall={(_t_decode-_t0)*1000:.0f}ms | 0 objs')
+            return result
+
+        # 5. 批量 3D 测量 + 坐标变换 + Object3D 构建（与现有模式相同）
+        return self._build_3d_result(
+            task, core, result, detections, optimized_depth,
+            timing_prefix=(
+                f'COMBINED: http={http_ms:.0f}ms '
+                f'srv=[sam3:{srv_sam3:.0f}+fs:{srv_fs:.0f}={srv_total:.0f}ms] '
+                f'decode={(_t_decode-_t_http)*1000:.0f}ms'
+            ),
+            t0=_t0,
+        )
+
+    def _build_3d_result(self, task, core, result, detections, optimized_depth, timing_prefix, t0):
+        """从 detections + depth 构建 Object3DArray（共用于 combined 和分离模式）"""
+        camera_name = task.camera_name
+
+        _t_3d0 = time.time()
+        measurement_results = core.batch_camera_3d_percept(
+            optimized_depth, detections, skip_transform=True
+        )
+        _t_3d1 = time.time()
+
+        valid_items = []
+        optical_centroids = []
+        for det, meas in zip(detections, measurement_results):
+            if meas.valid:
+                valid_items.append((det, meas))
+                optical_centroids.append(meas.centroid_optical)
+
+        batch_3d_ms = (_t_3d1 - _t_3d0) * 1000
+
+        if not valid_items:
+            self.get_logger().info(
+                f'[{camera_name}] {timing_prefix} '
+                f'3d={batch_3d_ms:.0f}ms '
+                f'wall={(_t_3d1-t0)*1000:.0f}ms | {len(detections)} det, 0 valid')
+            return result
+
+        _t_tf0 = time.time()
+        if task.optical_to_base_matrix is not None:
+            optical_points = np.array(optical_centroids)
+            points_h = np.hstack([optical_points, np.ones((len(optical_points), 1))])
+            target_centroids = (task.optical_to_base_matrix @ points_h.T).T[:, :3]
+        else:
+            transformer = self.transformers.get(camera_name)
+            if transformer:
+                optical_points = np.array(optical_centroids)
+                target_centroids = transformer.optical_to_target(optical_points, self.target_frame)
+            else:
+                target_centroids = np.array(optical_centroids)
+        _t_tf1 = time.time()
+
+        distance_offset = self.distance_offset_default
+        for i, (det, camera_result) in enumerate(valid_items):
+            obj = Object3D()
+            obj.object_id = f"{camera_name}_{det['object_id']}"
+            obj.category = det['category']
+            obj.score = float(det['score'])
+            obj.bbox = [float(x) for x in det['bbox']]
+
+            target_centroid = target_centroids[i]
+            original_distance = np.linalg.norm(target_centroid)
+            if original_distance > 0.01:
+                scale_factor = (original_distance + distance_offset) / original_distance
+                compensated_centroid = target_centroid * scale_factor
+            else:
+                compensated_centroid = target_centroid
+
+            obj.position = Point(
+                x=float(compensated_centroid[0]),
+                y=float(compensated_centroid[1]),
+                z=float(compensated_centroid[2])
+            )
+            obj.distance = float(np.linalg.norm(compensated_centroid))
+            obj.confidence = float(camera_result.confidence)
+
+            optical_centroid = optical_centroids[i]
+            obj.position_optical = Point(
+                x=float(optical_centroid[0]),
+                y=float(optical_centroid[1]),
+                z=float(optical_centroid[2])
+            )
+            obj.depth = float(optical_centroid[2])
+            obj.source_camera = camera_name
+            result.objects.append(obj)
+
+        result.objects = self._filter_footprint(result.objects)
+
+        if task.base_to_map_matrix is not None and len(result.objects) > 0:
+            base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
+            ones = np.ones((len(base_pts), 1))
+            map_pts = (task.base_to_map_matrix @ np.hstack([base_pts, ones]).T).T[:, :3]
+            for i, obj in enumerate(result.objects):
+                obj.position.x = float(map_pts[i, 0])
+                obj.position.y = float(map_pts[i, 1])
+                obj.position.z = float(map_pts[i, 2])
+            result.header.frame_id = 'map'
+
+        _t3 = time.time()
+        coord_tf_ms = (_t_tf1 - _t_tf0) * 1000
+        obj_build_ms = (_t3 - _t_tf1) * 1000
+        self.get_logger().info(
+            f'[{camera_name}] {timing_prefix} '
+            f'post=[3d:{batch_3d_ms:.0f}+tf:{coord_tf_ms:.0f}+build:{obj_build_ms:.0f}ms] '
+            f'wall={(_t3-t0)*1000:.0f}ms | {len(result.objects)} objs')
+        return result
+
     def _run_detection_task(self, task: DetectionTask) -> Optional[Object3DArray]:
         """
         执行单个检测任务（在后台线程）
-        
+
         与 _run_single_camera_detection 类似，但：
         - 数据已预加载，无需等待
         - TF 已预查询（可选）
         """
         camera_name = task.camera_name
         core = self.cores.get(camera_name)
-        
+
         if not core:
             return None
-        
+
+        # ── combined 模式: 单次 HTTP 调用 ──
+        combined_client = self._combined_clients.get(camera_name)
+        if combined_client is not None:
+            return self._run_combined_detection(task, core, combined_client)
+
+        # ── 原有模式: SAM3 + FS 分离并行 ──
         result = Object3DArray()
         result.header.stamp = self.get_clock().now().to_msg()
         result.header.frame_id = self.target_frame
-        
+
         rgb = task.rgb
         depth = task.depth
 
@@ -973,109 +1228,15 @@ class MultiCameraPerceptionNode(Node):
                 f'wall={(_t_dp-_t0)*1000:.0f}ms | 0 objs')
             return result
 
-        # 2. 批量 bbox-scoped 3D 测量
-        _t_3d0 = time.time()
-        measurement_results = core.batch_camera_3d_percept(
-            optimized_depth, detections, skip_transform=True
+        # 2. 3D 测量 + 坐标变换 + Object3D 构建（复用 _build_3d_result）
+        timing_prefix = (
+            f'PERF: parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
+            f'{_a_str} {_b_str} dpub={depth_pub_ms:.0f}ms'
         )
-        _t_3d1 = time.time()
-
-        # 过滤无效测量
-        valid_items = []
-        optical_centroids = []
-        for det, meas in zip(detections, measurement_results):
-            if meas.valid:
-                valid_items.append((det, meas))
-                optical_centroids.append(meas.centroid_optical)
-
-        batch_3d_ms = (_t_3d1 - _t_3d0) * 1000
-
-        if not valid_items:
-            self.get_logger().info(
-                f'[{camera_name}] PERF: '
-                f'parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
-                f'{_a_str} {_b_str} '
-                f'3d={batch_3d_ms:.0f}ms '
-                f'wall={(_t_3d1-_t0)*1000:.0f}ms | {n_obj} det, 0 valid')
-            return result
-
-        # 3. 批量坐标变换到 base_link
-        _t_tf0 = time.time()
-        if task.optical_to_base_matrix is not None:
-            optical_points = np.array(optical_centroids)
-            points_h = np.hstack([optical_points, np.ones((len(optical_points), 1))])
-            target_centroids = (task.optical_to_base_matrix @ points_h.T).T[:, :3]
-        else:
-            transformer = self.transformers.get(camera_name)
-            if transformer:
-                optical_points = np.array(optical_centroids)
-                target_centroids = transformer.optical_to_target(optical_points, self.target_frame)
-            else:
-                target_centroids = np.array(optical_centroids)
-        _t_tf1 = time.time()
-
-        # 4. 构建 Object3D 消息
-        distance_offset = self.distance_offset_default
-
-        for i, (det, camera_result) in enumerate(valid_items):
-            obj = Object3D()
-            obj.object_id = f"{camera_name}_{det['object_id']}"
-            obj.category = det['category']
-            obj.score = float(det['score'])
-            obj.bbox = [float(x) for x in det['bbox']]
-
-            target_centroid = target_centroids[i]
-            original_distance = np.linalg.norm(target_centroid)
-            if original_distance > 0.01:
-                scale_factor = (original_distance + distance_offset) / original_distance
-                compensated_centroid = target_centroid * scale_factor
-            else:
-                compensated_centroid = target_centroid
-
-            obj.position = Point(
-                x=float(compensated_centroid[0]),
-                y=float(compensated_centroid[1]),
-                z=float(compensated_centroid[2])
-            )
-            obj.distance = float(np.linalg.norm(compensated_centroid))
-            obj.confidence = float(camera_result.confidence)
-
-            optical_centroid = optical_centroids[i]
-            obj.position_optical = Point(
-                x=float(optical_centroid[0]),
-                y=float(optical_centroid[1]),
-                z=float(optical_centroid[2])
-            )
-            obj.depth = float(optical_centroid[2])
-            obj.source_camera = camera_name
-
-            result.objects.append(obj)
-
-        result.objects = self._filter_footprint(result.objects)
-
-        # base_link → map 变换（定位就绪时）
-        if task.base_to_map_matrix is not None and len(result.objects) > 0:
-            base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
-            ones = np.ones((len(base_pts), 1))
-            map_pts = (task.base_to_map_matrix @ np.hstack([base_pts, ones]).T).T[:, :3]
-            for i, obj in enumerate(result.objects):
-                obj.position.x = float(map_pts[i, 0])
-                obj.position.y = float(map_pts[i, 1])
-                obj.position.z = float(map_pts[i, 2])
-                # distance 保持不变（仍是 base_link 下到机器人的距离）
-            result.header.frame_id = 'map'
-
-        _t3 = time.time()
-        coord_tf_ms = (_t_tf1 - _t_tf0) * 1000
-        obj_build_ms = (_t3 - _t_tf1) * 1000
-        post_ms = depth_pub_ms + batch_3d_ms + coord_tf_ms + obj_build_ms
-        self.get_logger().info(
-            f'[{camera_name}] PERF: '
-            f'parallel={parallel_ms:.0f}ms(idle={idle_ms:.0f}ms) '
-            f'{_a_str} {_b_str} '
-            f'post=[dpub:{depth_pub_ms:.0f}+3d:{batch_3d_ms:.0f}+tf:{coord_tf_ms:.0f}+build:{obj_build_ms:.0f}={post_ms:.0f}ms] '
-            f'wall={(_t3-_t0)*1000:.0f}ms | {len(result.objects)} objs')
-        return result
+        return self._build_3d_result(
+            task, core, result, detections, optimized_depth,
+            timing_prefix=timing_prefix, t0=_t0,
+        )
 
     def handle_detect(self, request, response):
         """处理检测服务请求 - 支持指定相机（简化版：无融合）"""
@@ -1339,11 +1500,9 @@ class MultiCameraPerceptionNode(Node):
         """
         尝试融合并发布多相机结果（用于auto_detect模式）
 
-        流程：
-        1. 收集各相机最新结果
-        2. 匈牙利融合去重
-        3. ByteTracker3D 跟踪（分配持久 track_id）
-        4. 发布跟踪后的结果
+        流程（取决于定位状态）：
+        有定位(map系):  融合 → 跟踪(距离+类别) → 发布
+        无定位(base_link): 融合 → 直接发布（不跟踪）
         """
         try:
             # 收集有效的最新结果（只考虑相机，排除 'fused' 键）
@@ -1357,33 +1516,48 @@ class MultiCameraPerceptionNode(Node):
             if len(valid_results) > 1:
                 frames = set(r.header.frame_id for r in valid_results.values())
                 if len(frames) > 1:
-                    self.get_logger().warn(f'[FUSION] 帧不一致: {frames}, 跳过本轮')
+                    self._log.warn(f'[FUSION] 帧不一致: {frames}, 跳过本轮', period=5.0)
                     return
 
-            # 如果有任意相机的结果，进行融合
-            if len(valid_results) >= 1:
-                _tf0 = time.time()
-                fused = self._fuse_results(valid_results)
-                _tf1 = time.time()
-                if fused and len(fused.objects) > 0:
-                    tracked_result = self._apply_tracking(fused)
-                    _tf2 = time.time()
-                    tracked_result.objects = [o for o in tracked_result.objects
-                                              if o.confidence >= self.min_confidence
-                                              and o.score >= self._current_min_score]
-                    self.pub_fused.publish(tracked_result)
-                    self._last_results['fused'] = tracked_result
-                    n_in = sum(len(r.objects) for r in valid_results.values())
-                    self.get_logger().info(
-                        f'[FUSION] in={n_in} fused={len(fused.objects)} tracked={len(tracked_result.objects)} '
-                        f'match={(_tf1-_tf0)*1000:.0f}ms track={(_tf2-_tf1)*1000:.0f}ms '
-                        f'total={(_tf2-_tf0)*1000:.0f}ms'
-                    )
-                else:
-                    self.get_logger().warn(
-                        f'[FUSION] fused 结果为空或无效: '
-                        f'fused={fused is not None}, count={len(fused.objects) if fused else 0}'
-                    )
+            if len(valid_results) < 1:
+                return
+
+            _tf0 = time.time()
+            fused = self._fuse_results(valid_results)
+            _tf1 = time.time()
+
+            if not fused or len(fused.objects) == 0:
+                return
+
+            in_map = (fused.header.frame_id == 'map')
+            n_in = sum(len(r.objects) for r in valid_results.values())
+
+            if in_map:
+                # 有定位：融合(map) → 跟踪(map) → 发布
+                tracked_result = self._apply_tracking(fused)
+                _tf2 = time.time()
+                tracked_result.objects = [o for o in tracked_result.objects
+                                          if o.confidence >= self.min_confidence
+                                          and o.score >= self._current_min_score]
+                self.pub_fused.publish(tracked_result)
+                self._last_results['fused'] = tracked_result
+                self.get_logger().info(
+                    f'[FUSION] in={n_in} fused={len(fused.objects)} tracked={len(tracked_result.objects)} '
+                    f'match={(_tf1-_tf0)*1000:.0f}ms track={(_tf2-_tf1)*1000:.0f}ms '
+                    f'total={(_tf2-_tf0)*1000:.0f}ms frame=map'
+                )
+            else:
+                # 无定位：融合(base_link) → 直接发布（不跟踪）
+                fused.objects = [o for o in fused.objects
+                                 if o.confidence >= self.min_confidence
+                                 and o.score >= self._current_min_score]
+                self.pub_fused.publish(fused)
+                self._last_results['fused'] = fused
+                self.get_logger().info(
+                    f'[FUSION] in={n_in} fused={len(fused.objects)} '
+                    f'match={(_tf1-_tf0)*1000:.0f}ms '
+                    f'total={(_tf1-_tf0)*1000:.0f}ms frame=base_link (no tracking)'
+                )
         except Exception as e:
             import traceback
             self.get_logger().error(f'[AUTO] 融合发布失败: {e}')
@@ -1451,7 +1625,7 @@ class MultiCameraPerceptionNode(Node):
                 y=float(track['position'][1]),
                 z=float(track['position'][2])
             )
-            obj.distance = float(np.linalg.norm(track['position']))
+            obj.distance = original_obj.distance  # 保留 base_link 下的距离（map 系下 norm 无意义）
             obj.confidence = track.get('confidence', original_obj.confidence)
             obj.position_optical = original_obj.position_optical
             obj.depth = original_obj.depth
@@ -1580,7 +1754,8 @@ class MultiCameraPerceptionNode(Node):
                 y=float(fused_pos[1]),
                 z=float(fused_pos[2])
             )
-            fused_obj.distance = float(np.linalg.norm(fused_pos))
+            # distance 取两相机的均值（base_link 下到机器人的真实距离，不受 map 变换影响）
+            fused_obj.distance = (obj_chassis.distance + obj_top.distance) / 2.0
             fused_obj.depth = fused_obj.distance
 
             # 融合置信度

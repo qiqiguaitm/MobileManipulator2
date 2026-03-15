@@ -66,7 +66,7 @@ def generate_launch_description():
         description='Top camera (D455) detection rate in Hz'
     )
     chassis_detect_rate_arg = DeclareLaunchArgument(
-        'chassis_detect_rate', default_value='6.0',
+        'chassis_detect_rate', default_value='5.0',
         description='Chassis camera (D435) detection rate in Hz'
     )
 
@@ -98,10 +98,32 @@ def generate_launch_description():
         description='Detector type: sam3 or dinox'
     )
 
+    # 深度源
+    depth_source_arg = DeclareLaunchArgument(
+        'depth_source', default_value='combined',
+        description='Depth source: raw | foundation_stereo | combined'
+    )
+
+    # Combined SAM3+FS 服务 URL
+    combined_url_gpu0_arg = DeclareLaunchArgument(
+        'combined_url_gpu0', default_value='http://192.168.112.14:8090',
+        description='Combined server URL for GPU0 (top camera)'
+    )
+    combined_url_gpu1_arg = DeclareLaunchArgument(
+        'combined_url_gpu1', default_value='http://192.168.112.14:8091',
+        description='Combined server URL for GPU1 (chassis camera)'
+    )
+
     # ==================== Included Launches ====================
     
     # 包含相机驱动启动（条件：use_camera_driver:=true）
     # 警告：如果相机驱动已在运行，请勿启动，否则会导致设备冲突
+    # 当 depth_source 需要 IR 流时，自动启用 infra
+    _need_infra = PythonExpression([
+        "'true' if '", LaunchConfiguration('depth_source'),
+        "' in ('foundation_stereo', 'combined') else 'false'"
+    ])
+
     camera_driver_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(camera_driver_share, 'launch', 'camera_driver.launch.py')
@@ -113,6 +135,8 @@ def generate_launch_description():
             'hand_enable': 'false',
             'top_serial_no': LaunchConfiguration('top_serial_no'),
             'chassis_serial_no': LaunchConfiguration('chassis_serial_no'),
+            'top_enable_infra': _need_infra,
+            'chassis_enable_infra': _need_infra,
         }.items()
     )
 
@@ -164,6 +188,13 @@ def generate_launch_description():
             # 检测器类型
             {'detector_type': LaunchConfiguration('detector_type')},
 
+            # 深度源
+            {'depth_source': LaunchConfiguration('depth_source')},
+
+            # Combined 服务 URL
+            {'combined_url_gpu0': LaunchConfiguration('combined_url_gpu0')},
+            {'combined_url_gpu1': LaunchConfiguration('combined_url_gpu1')},
+
             # 外参目录
             {'extrinsics_dir': config_dir},
         ],
@@ -192,6 +223,9 @@ def generate_launch_description():
         lidar_topic_arg,
         target_frame_arg,
         detector_type_arg,
+        depth_source_arg,
+        combined_url_gpu0_arg,
+        combined_url_gpu1_arg,
 
         # 1. 条件启动相机驱动（默认不启动，避免冲突）
         camera_driver_launch,

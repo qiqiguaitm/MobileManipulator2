@@ -61,22 +61,21 @@ def generate_launch_description():
         description='Chassis camera serial number (D435, 底盘)'
     )
 
-    # Image configuration (1280x720 matching LiDAR calibration)
-    # D435 supports 6fps, D455 supports 5fps — no common low-fps value
+    # Image configuration (1280x720)
     depth_profile_arg = DeclareLaunchArgument(
-        'depth_profile', default_value='1280,720,6',
+        'depth_profile', default_value='1280,720,15',
         description='Depth stream profile for D435 cameras (width,height,fps)'
     )
     color_profile_arg = DeclareLaunchArgument(
-        'color_profile', default_value='1280,720,6',
+        'color_profile', default_value='1280,720,15',
         description='Color stream profile for D435 cameras (width,height,fps)'
     )
     top_depth_profile_arg = DeclareLaunchArgument(
-        'top_depth_profile', default_value='1280,720,5',
+        'top_depth_profile', default_value='1280,720,15',
         description='Depth stream profile for D455 top camera (width,height,fps)'
     )
     top_color_profile_arg = DeclareLaunchArgument(
-        'top_color_profile', default_value='1280,720,5',
+        'top_color_profile', default_value='1280,720,15',
         description='Color stream profile for D455 top camera (width,height,fps)'
     )
 
@@ -193,7 +192,7 @@ def generate_launch_description():
                     'enable_infra2': top_enable_infra,
                     # Match infra profile to depth profile when infra is enabled
                     'depth_module.infra_profile': PythonExpression(
-                        ["'1280,720,5' if '", top_enable_infra, "' == 'true' else '0,0,0'"]
+                        ["'1280,720,15' if '", top_enable_infra, "' == 'true' else '0,0,0'"]
                     ),
                 }.items()
             )
