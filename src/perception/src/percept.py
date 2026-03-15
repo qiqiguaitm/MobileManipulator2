@@ -15,8 +15,13 @@
 import base64
 import hashlib
 import json
+try:
+    import orjson as _json_fast
+except ImportError:
+    _json_fast = json  # fallback
 import math
 import os
+import struct
 import sys
 import time
 from io import BytesIO
@@ -1278,3 +1283,245 @@ class SAM3Online:
         except json.JSONDecodeError as e:
             print(f"[SAM3Online] JSON decode failed: {e}")
             return LocalTaskResult({'objects': [], 'error': str(e)})
+
+
+# ─────────────────── Combined Perception Client ───────────────────
+
+def _make_fast_session():
+    """Create requests.Session with TCP_NODELAY and large send buffer."""
+    import socket
+    import urllib3
+
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {'http': None, 'https': None}
+
+    _orig_connect = urllib3.util.connection.create_connection
+
+    def _patched_connect(*args, **kwargs):
+        sock = _orig_connect(*args, **kwargs)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+        except OSError:
+            pass
+        return sock
+
+    urllib3.util.connection.create_connection = _patched_connect
+    return session
+
+
+class CombinedPerceptionClient:
+    """Combined SAM3+FS 服务客户端
+
+    对接 combined_server.py 的 /api/perceive 端点。
+    Binary framing 协议: [4B json_len LE][json_bytes][depth_bytes]
+    """
+
+    def __init__(self, cfg):
+        url = getattr(cfg, 'url', 'http://192.168.112.14:8090')
+        self.api_url = f'{url}/api/perceive'
+        self.health_url = f'{url}/api/health'
+        self.confidence = getattr(cfg, 'confidence', 0.30)
+        self.return_mask = getattr(cfg, 'return_mask', False)
+        self.session = _make_fast_session()
+        self._intr_hash = None
+        self._intr_bytes = None
+        # (connect_timeout, read_timeout) — cap WiFi spikes, normal P90<160ms
+        self._timeout = (2.0, 0.25)
+
+    def check_health(self):
+        try:
+            return self.session.get(self.health_url, timeout=5).json()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    @staticmethod
+    def encode_images(rgb, ir_left, ir_right, intrinsics, intr_bytes_cache=None):
+        """Encode images to JPEG bytes. Can be called from a background thread.
+
+        Returns: (rgb_bytes, ir_l_bytes, ir_r_bytes, intr_bytes)
+        """
+        _, rgb_buf = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        _, ir_l_buf = cv2.imencode('.jpg', ir_left, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        _, ir_r_buf = cv2.imencode('.jpg', ir_right, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        if intr_bytes_cache is not None:
+            intr_bytes = intr_bytes_cache
+        elif isinstance(intrinsics, bytes):
+            intr_bytes = intrinsics
+        elif isinstance(intrinsics, str):
+            with open(intrinsics, 'rb') as f:
+                intr_bytes = f.read()
+        elif isinstance(intrinsics, dict):
+            intr_bytes = yaml.dump(intrinsics).encode()
+        else:
+            intr_bytes = yaml.dump(intrinsics).encode()
+
+        return rgb_buf.tobytes(), ir_l_buf.tobytes(), ir_r_buf.tobytes(), intr_bytes
+
+    def forward(self, rgb, ir_left, ir_right, intrinsics,
+                text_prompt='object', _timing=None, _encoded=None):
+        """Send perceive request.
+
+        Args:
+            _encoded: pre-encoded (rgb_bytes, ir_l_bytes, ir_r_bytes, intr_bytes)
+                      from encode_images(). Skips encoding if provided.
+
+        Returns: {'success': bool, 'detections': dict, 'depth': ndarray|None}
+        """
+        t0 = time.time()
+
+        if _encoded:
+            rgb_bytes, ir_l_bytes, ir_r_bytes, intr_bytes = _encoded
+        else:
+            rgb_bytes, ir_l_bytes, ir_r_bytes, intr_bytes = self.encode_images(
+                rgb, ir_left, ir_right, intrinsics,
+                intr_bytes_cache=self._intr_bytes)
+        t_enc = time.time()
+
+        files = {
+            'rgb': ('rgb.jpg', rgb_bytes, 'image/jpeg'),
+            'ir_left': ('ir_l.jpg', ir_l_bytes, 'image/jpeg'),
+            'ir_right': ('ir_r.jpg', ir_r_bytes, 'image/jpeg'),
+        }
+        data = {
+            'text_prompt': text_prompt,
+            'confidence': str(self.confidence),
+            'return_mask': 'true' if self.return_mask else 'false',
+        }
+
+        headers = {}
+        if (self._intr_hash is not None
+                and self._intr_bytes is not None
+                and intr_bytes == self._intr_bytes):
+            headers['X-Intrinsics-Hash'] = self._intr_hash
+        else:
+            files['intrinsics'] = ('intrinsics.yaml', intr_bytes,
+                                   'application/octet-stream')
+            self._intr_bytes = intr_bytes
+
+        try:
+            resp = self.session.post(self.api_url, files=files, data=data,
+                                     headers=headers, timeout=self._timeout)
+            t_http = time.time()
+            resp.raise_for_status()
+
+            resp_hash = resp.headers.get('X-Intrinsics-Hash')
+            if resp_hash:
+                self._intr_hash = resp_hash
+
+            # Parse binary framing
+            raw = resp.content
+            upload_kb = resp.request.body
+            if hasattr(upload_kb, '__len__'):
+                upload_kb = len(upload_kb) / 1024
+            elif hasattr(resp.request, 'headers'):
+                cl = resp.request.headers.get('Content-Length', 0)
+                upload_kb = int(cl) / 1024 if cl else 0
+            else:
+                upload_kb = 0
+
+            json_len = struct.unpack('<I', raw[:4])[0]
+            det_json = _json_fast.loads(raw[4:4 + json_len])
+            depth_bytes = raw[4 + json_len:]
+
+            # Decode depth — format: [4B H_half LE][4B W_half LE][zlib_data]
+            # Fallback to PNG for backward compat
+            depth = None
+            if len(depth_bytes) > 4:
+                try:
+                    import zlib
+                    dh, dw = struct.unpack('<HH', depth_bytes[:4])
+                    raw_depth = zlib.decompress(depth_bytes[4:])
+                    depth_half = np.frombuffer(raw_depth, dtype=np.uint16).reshape(dh, dw)
+                    depth = cv2.resize(depth_half, (dw * 2, dh * 2),
+                                       interpolation=cv2.INTER_NEAREST)
+                except Exception:
+                    # Fallback: PNG
+                    depth = cv2.imdecode(np.frombuffer(depth_bytes, dtype=np.uint8),
+                                         cv2.IMREAD_UNCHANGED)
+                    if depth is not None and depth.shape[0] < 540:
+                        depth = cv2.resize(depth, (depth.shape[1] * 2, depth.shape[0] * 2),
+                                           interpolation=cv2.INTER_NEAREST)
+
+            t_dec = time.time()
+
+            # Server timing from header
+            srv_timing = {}
+            try:
+                srv_timing = _json_fast.loads(resp.headers.get('X-Timing', '{}'))
+            except Exception:
+                pass
+
+            if _timing is not None:
+                _timing['combined_encode'] = (t_enc - t0) * 1000
+                _timing['combined_http'] = (t_http - t0) * 1000
+                _timing['combined_decode'] = (t_dec - t_http) * 1000
+                _timing['upload_kb'] = upload_kb
+                _timing['download_kb'] = len(resp.content) / 1024
+                _timing['server_total'] = srv_timing.get('total_ms', 0)
+                _timing['server_sam3'] = srv_timing.get('sam3_ms', 0)
+                _timing['server_fs'] = srv_timing.get('fs_ms', 0)
+
+            return {
+                'success': True,
+                'detections': det_json,
+                'depth': depth,
+            }
+
+        except Exception as e:
+            t_err = time.time()
+            if _timing is not None:
+                _timing['combined_encode'] = (t_enc - t0) * 1000
+                _timing['combined_http'] = (t_err - t_enc) * 1000
+                _timing['combined_decode'] = 0
+            print(f'[CombinedPerceptionClient] Error: {e}')
+            return {'success': False, 'error': str(e)}
+
+
+class DualPerceptionClient:
+    """双 GPU 并行感知客户端
+
+    cam0 → GPU0, cam1 → GPU1, ThreadPoolExecutor 并行。
+    优化 B: JPEG 编码与 HTTP 传输并行。
+    """
+
+    def __init__(self, cfg0, cfg1):
+        self._clients = [CombinedPerceptionClient(cfg0),
+                         CombinedPerceptionClient(cfg1)]
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=4)
+
+    def check_health(self):
+        futs = [self._pool.submit(c.check_health) for c in self._clients]
+        return [f.result(timeout=5) for f in futs]
+
+    def forward(self, rgb0, ir_l0, ir_r0, intr0,
+                rgb1, ir_l1, ir_r1, intr1,
+                text_prompt='object', _timing=None):
+        """双相机并行感知。
+
+        Opt B: 编码和 HTTP 在 pool 中并行执行。
+        Returns: (result0, result1)
+        """
+        def _run(idx, rgb, ir_l, ir_r, intr):
+            client = self._clients[idx]
+            t = {}
+            result = client.forward(rgb, ir_l, ir_r, intr,
+                                    text_prompt=text_prompt, _timing=t)
+            return result, t
+
+        f0 = self._pool.submit(_run, 0, rgb0, ir_l0, ir_r0, intr0)
+        f1 = self._pool.submit(_run, 1, rgb1, ir_l1, ir_r1, intr1)
+
+        r0, t0 = f0.result(timeout=60)
+        r1, t1 = f1.result(timeout=60)
+
+        if _timing is not None:
+            for k, v in t0.items():
+                _timing[f'gpu0_{k}'] = v
+            for k, v in t1.items():
+                _timing[f'gpu1_{k}'] = v
+
+        return r0, r1

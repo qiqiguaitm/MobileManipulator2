@@ -103,6 +103,8 @@ class DetectionTask:
     ir_left: Optional[np.ndarray] = None
     ir_right: Optional[np.ndarray] = None
     ir_intrinsics: Optional[Dict] = None
+    # Pre-encoded JPEG data (from timer thread, parallel with worker)
+    encoded_data: Optional[tuple] = None  # (rgb_bytes, ir_l_bytes, ir_r_bytes, intr_bytes)
 
 
 class MultiCameraPerceptionNode(Node):
@@ -129,6 +131,16 @@ class MultiCameraPerceptionNode(Node):
         self._last_results = {'top': None, 'chassis': None, 'fused': None}
         self._results_lock = threading.Lock()  # 保护 _last_results 和 fusion 的线程安全
         self._fused_counter = 0  # 融合对象顺序计数器（替代 id(obj) % 10000）
+
+        # 端到端帧率追踪
+        self._fusion_pub_times = []  # rolling window of publish timestamps
+        self._fusion_rate_log_interval = 30.0  # 每30秒输出一次统计
+        self._fusion_rate_last_log = 0.0
+        self._fusion_latency_sum = 0.0
+        self._fusion_latency_count = 0
+        self._fusion_latency_max = 0.0
+        # 每相机检测完成时间戳（worker更新，fusion读取算新鲜度）
+        self._last_detect_timestamps = {}  # camera_name → time.time() when result was produced
 
         # CV Bridge
         self._bridge = CvBridge()
@@ -699,6 +711,16 @@ class MultiCameraPerceptionNode(Node):
             ir_right = data.get('ir_right')
             ir_intr = sensor.ir_intrinsics
 
+        # Pre-encode: JPEG 编码前移到 Timer 线程，与 Worker 处理上一帧并行
+        encoded_data = None
+        if self.depth_source == 'combined' and ir_left is not None and ir_right is not None:
+            combined_client = self._combined_clients.get(camera_name)
+            if combined_client:
+                encoded_data = CombinedPerceptionClient.encode_images(
+                    data['rgb'], ir_left, ir_right,
+                    ir_intr or {},
+                    intr_bytes_cache=combined_client._intr_bytes)
+
         task = DetectionTask(
             camera_name=camera_name,
             rgb=data['rgb'],
@@ -712,6 +734,7 @@ class MultiCameraPerceptionNode(Node):
             ir_left=ir_left,
             ir_right=ir_right,
             ir_intrinsics=ir_intr,
+            encoded_data=encoded_data,
         )
 
         try:
@@ -761,6 +784,7 @@ class MultiCameraPerceptionNode(Node):
                     # 线程安全地更新结果（fusion 由独立 timer 触发）
                     with self._results_lock:
                         self._last_results[camera_name] = result
+                        self._last_detect_timestamps[camera_name] = time.time()
 
                     _tw3 = time.time()
                     self._publish_status()
@@ -836,7 +860,7 @@ class MultiCameraPerceptionNode(Node):
         _t0 = time.time()
         _timing = {}
 
-        # 1. 调用 combined server
+        # 1. 调用 combined server (pre-encoded data from timer thread if available)
         resp = client.forward(
             rgb=rgb,
             ir_left=task.ir_left,
@@ -844,11 +868,12 @@ class MultiCameraPerceptionNode(Node):
             intrinsics=task.ir_intrinsics or {},
             text_prompt=task.prompt,
             _timing=_timing,
+            _encoded=task.encoded_data,
         )
 
         if not resp.get('success'):
             self.get_logger().warn(f'[{camera_name}] combined failed: {resp.get("error")}')
-            return result
+            return None  # None → worker skips _last_results update, fusion keeps previous valid data
 
         _t_http = time.time()
 
@@ -858,7 +883,7 @@ class MultiCameraPerceptionNode(Node):
         detections = self._decode_detections(objects, rgb, default_category=task.prompt)
 
         # 3. 深度处理 (uint16 mm → float32 m)
-        depth_mm = resp.get('depth')
+        depth_mm = resp.get('depth')  # uint16 mm or None
         if depth_mm is not None:
             optimized_depth = depth_mm.astype(np.float32) / 1000.0
         else:
@@ -866,10 +891,10 @@ class MultiCameraPerceptionNode(Node):
 
         _t_decode = time.time()
 
-        # 4. 发布优化后的深度图
+        # 4. 发布优化后的深度图（直接用 depth_mm 避免 float32→uint16 反转换）
         try:
-            d_mm = (optimized_depth * 1000).astype(np.uint16)
-            depth_msg = self._bridge.cv2_to_imgmsg(d_mm, encoding='16UC1')
+            d_pub = depth_mm if depth_mm is not None else (optimized_depth * 1000).astype(np.uint16)
+            depth_msg = self._bridge.cv2_to_imgmsg(d_pub, encoding='16UC1')
             depth_msg.header.stamp = self.get_clock().now().to_msg()
             depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
             if camera_name in self.pubs:
@@ -1523,6 +1548,14 @@ class MultiCameraPerceptionNode(Node):
                 return
 
             _tf0 = time.time()
+
+            # 检测数据新鲜度（worker 产生结果到 fusion 消费的延迟）
+            det_ages = {}
+            for cn in valid_results:
+                dt = self._last_detect_timestamps.get(cn)
+                if dt:
+                    det_ages[cn] = (_tf0 - dt) * 1000
+
             fused = self._fuse_results(valid_results)
             _tf1 = time.time()
 
@@ -1541,10 +1574,12 @@ class MultiCameraPerceptionNode(Node):
                                           and o.score >= self._current_min_score]
                 self.pub_fused.publish(tracked_result)
                 self._last_results['fused'] = tracked_result
+
+                age_str = ' '.join(f'{cn}={ms:.0f}ms' for cn, ms in det_ages.items())
                 self.get_logger().info(
                     f'[FUSION] in={n_in} fused={len(fused.objects)} tracked={len(tracked_result.objects)} '
                     f'match={(_tf1-_tf0)*1000:.0f}ms track={(_tf2-_tf1)*1000:.0f}ms '
-                    f'total={(_tf2-_tf0)*1000:.0f}ms frame=map'
+                    f'total={(_tf2-_tf0)*1000:.0f}ms age=[{age_str}] frame=map'
                 )
             else:
                 # 无定位：融合(base_link) → 直接发布（不跟踪）
@@ -1553,11 +1588,39 @@ class MultiCameraPerceptionNode(Node):
                                  and o.score >= self._current_min_score]
                 self.pub_fused.publish(fused)
                 self._last_results['fused'] = fused
+
+                age_str = ' '.join(f'{cn}={ms:.0f}ms' for cn, ms in det_ages.items())
                 self.get_logger().info(
                     f'[FUSION] in={n_in} fused={len(fused.objects)} '
                     f'match={(_tf1-_tf0)*1000:.0f}ms '
-                    f'total={(_tf1-_tf0)*1000:.0f}ms frame=base_link (no tracking)'
+                    f'total={(_tf1-_tf0)*1000:.0f}ms age=[{age_str}] frame=base_link (no tracking)'
                 )
+
+            # 端到端帧率统计
+            now = time.time()
+            self._fusion_pub_times.append(now)
+            # 保留最近60秒的数据
+            cutoff = now - 60.0
+            self._fusion_pub_times = [t for t in self._fusion_pub_times if t > cutoff]
+
+            if now - self._fusion_rate_last_log >= self._fusion_rate_log_interval:
+                self._fusion_rate_last_log = now
+                n = len(self._fusion_pub_times)
+                if n >= 2:
+                    span = self._fusion_pub_times[-1] - self._fusion_pub_times[0]
+                    rate = (n - 1) / span if span > 0 else 0
+                    # 计算间隔分布
+                    intervals = [self._fusion_pub_times[i+1] - self._fusion_pub_times[i]
+                                 for i in range(n - 1)]
+                    intervals.sort()
+                    p50 = intervals[len(intervals) // 2] * 1000
+                    p99 = intervals[int(len(intervals) * 0.99)] * 1000
+                    self.get_logger().warn(
+                        f'[PIPELINE] fused_rate={rate:.1f}Hz '
+                        f'interval_P50={p50:.0f}ms P99={p99:.0f}ms '
+                        f'frames={n}/60s'
+                    )
+
         except Exception as e:
             import traceback
             self.get_logger().error(f'[AUTO] 融合发布失败: {e}')

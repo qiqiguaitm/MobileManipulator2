@@ -62,12 +62,12 @@ def generate_launch_description():
 
     # 自动检测频率 — 每相机独立，与硬件帧率对齐
     top_detect_rate_arg = DeclareLaunchArgument(
-        'top_detect_rate', default_value='5.0',
-        description='Top camera (D455) detection rate in Hz'
+        'top_detect_rate', default_value='5.5',
+        description='Top camera (D455) detection rate in Hz (pre-encode enables >5Hz)'
     )
     chassis_detect_rate_arg = DeclareLaunchArgument(
-        'chassis_detect_rate', default_value='5.0',
-        description='Chassis camera (D435) detection rate in Hz'
+        'chassis_detect_rate', default_value='5.5',
+        description='Chassis camera (D435) detection rate in Hz (pre-encode enables >5Hz)'
     )
 
     # 融合距离阈值
