@@ -441,6 +441,22 @@ class MultiCameraPerceptionNode(Node):
                     break
                 self.get_logger().info(f'  Combined {label}: OK ({url})')
 
+    def _get_ir_intrinsics_file(self, camera_name: str) -> str:
+        """查找固定内参文件（含 IR 内参 + IR→Color 外参 + baseline）"""
+        name_map = {'top': 'intrinsics_top_d455.yaml', 'chassis': 'intrinsics_chassis_d435.yaml'}
+        fname = name_map.get(camera_name)
+        if not fname:
+            return ''
+        # 优先 extrinsics_dir（与外参同目录），其次 src/perception/config/
+        candidates = []
+        if self.extrinsics_dir:
+            candidates.append(os.path.join(self.extrinsics_dir, fname))
+        candidates.append(os.path.join('/data/workspace/MobileManipulator2/src/perception/config', fname))
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return ''
+
     def _init_components(self):
         """初始化双相机组件"""
         self.cameras = {}
@@ -482,6 +498,7 @@ class MultiCameraPerceptionNode(Node):
                 ir_left_topic=f'/camera/{cfg.name}/infra1/image_rect_raw' if use_ir else '',
                 ir_right_topic=f'/camera/{cfg.name}/infra2/image_rect_raw' if use_ir else '',
                 ir_info_topic=f'/camera/{cfg.name}/infra2/camera_info' if use_ir else '',
+                ir_intrinsics_file=self._get_ir_intrinsics_file(cfg.name) if use_ir else '',
             )
 
             # FS模式启用IR流，D455/D435需要更长时间完成硬件重配置
@@ -1362,6 +1379,32 @@ class MultiCameraPerceptionNode(Node):
         if not sensor or not transformer or not core:
             return None
 
+        # ── combined 模式: 复用 _run_combined_detection (与 Timer+Queue 路径统一) ──
+        combined_client = self._combined_clients.get(camera_name)
+        if combined_client is not None:
+            data = sensor.get_latest_data()
+            if data is None or data.get('age', 0) > 3.0:
+                return None
+            try:
+                optical_to_base = transformer.get_transform('optical_to_base')
+            except Exception:
+                optical_to_base = None
+            task = DetectionTask(
+                camera_name=camera_name,
+                rgb=data['rgb'],
+                depth=data['depth'],
+                intrinsics=sensor.intrinsics,
+                prompt=prompt or self._current_prompt,
+                optical_to_base_matrix=optical_to_base,
+                base_to_map_matrix=self._get_base_to_map_matrix(),
+                timestamp_sec=time.time(),
+                frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame'),
+                ir_left=data.get('ir_left'),
+                ir_right=data.get('ir_right'),
+                ir_intrinsics=sensor.ir_intrinsics,
+            )
+            return self._run_combined_detection(task, core, combined_client)
+
         result = Object3DArray()
         result.header.stamp = self.get_clock().now().to_msg()
         result.frame_id = self.target_frame
@@ -1485,7 +1528,20 @@ class MultiCameraPerceptionNode(Node):
 
         result.objects = self._filter_footprint(result.objects)
 
-        self.get_logger().info(f'[{camera_name}] DETECT: Measured {len(result.objects)} objects')
+        # base_link → map 变换（与 _build_3d_result 对齐，确保 service 路径也输出 map 系）
+        base_to_map = self._get_base_to_map_matrix()
+        if base_to_map is not None and len(result.objects) > 0:
+            base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
+            ones = np.ones((len(base_pts), 1))
+            map_pts = (base_to_map @ np.hstack([base_pts, ones]).T).T[:, :3]
+            for i, obj in enumerate(result.objects):
+                obj.position.x = float(map_pts[i, 0])
+                obj.position.y = float(map_pts[i, 1])
+                obj.position.z = float(map_pts[i, 2])
+            result.header.frame_id = 'map'
+            result.frame_id = 'map'
+
+        self.get_logger().info(f'[{camera_name}] DETECT: Measured {len(result.objects)} objects (frame={result.frame_id})')
         return result
 
     def _simple_merge_results(self, results: Dict[str, Object3DArray]) -> Object3DArray:
