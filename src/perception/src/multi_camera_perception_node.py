@@ -96,6 +96,8 @@ class DetectionTask:
     # 预计算的变换（在主线程查询，避免后台线程TF竞争）
     optical_to_base_matrix: Optional[np.ndarray] = None
     base_to_map_matrix: Optional[np.ndarray] = None  # 定位就绪时的 base_link→map 4x4 矩阵
+    # 图像诞生时间戳（用于检测后精确查询 TF）
+    image_stamp: Optional['builtin_interfaces.msg.Time'] = None
     # 元数据
     timestamp_sec: float = 0.0
     frame_id: str = ''
@@ -198,13 +200,32 @@ class MultiCameraPerceptionNode(Node):
     def _localization_status_cb(self, msg: Bool):
         self._localization_ready = msg.data
 
-    def _get_base_to_map_matrix(self) -> Optional[np.ndarray]:
-        """查询 base_link→map 变换，定位未就绪或查询失败时返回 None"""
+    def _get_base_to_map_matrix(self, image_stamp=None) -> Optional[np.ndarray]:
+        """查询 base_link→map 变换，定位未就绪或查询失败时返回 None
+
+        Args:
+            image_stamp: 图像诞生时间戳 (builtin_interfaces.msg.Time)。
+                         非阻塞尝试用该时刻查询（tf2 自动插值），buffer 中无数据时
+                         回退到最新 TF，确保始终输出 map 坐标系。
+        """
         if not self._localization_ready:
             return None
         try:
-            ts = self._tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.05))
+            ts = None
+            # 优先用 image_stamp 精确查询（非阻塞：buffer 中有就用）
+            if image_stamp is not None:
+                try:
+                    query_time = rclpy.time.Time.from_msg(image_stamp)
+                    ts = self._tf_buffer.lookup_transform(
+                        'map', 'base_link', query_time,
+                        timeout=Duration(seconds=0.0))
+                except Exception:
+                    pass  # buffer 中无该时刻数据，回退到 latest
+            # 回退到最新 TF（几乎总是可用）
+            if ts is None:
+                ts = self._tf_buffer.lookup_transform(
+                    'map', 'base_link', rclpy.time.Time(),
+                    timeout=Duration(seconds=0.05))
             t = ts.transform.translation
             q = ts.transform.rotation
             # quaternion → rotation matrix (无 scipy 依赖)
@@ -718,8 +739,8 @@ class MultiCameraPerceptionNode(Node):
             except Exception:
                 optical_to_base = None
 
-        # base_link→map 变换（定位就绪时）
-        base_to_map = self._get_base_to_map_matrix()
+        # base_link→map: 延迟到 worker 线程检测完成后用 image_stamp 精确查询
+        image_stamp = data.get('timestamp')  # builtin_interfaces.msg.Time
 
         # IR data (FoundationStereo / Combined 模式)
         ir_left = ir_right = ir_intr = None
@@ -745,7 +766,8 @@ class MultiCameraPerceptionNode(Node):
             intrinsics=sensor.intrinsics,
             prompt=self._current_prompt,
             optical_to_base_matrix=optical_to_base,
-            base_to_map_matrix=base_to_map,
+            base_to_map_matrix=None,  # 延迟到 worker 检测完成后查询
+            image_stamp=image_stamp,
             timestamp_sec=time.time(),
             frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame'),
             ir_left=ir_left,
@@ -891,6 +913,10 @@ class MultiCameraPerceptionNode(Node):
         if not resp.get('success'):
             self.get_logger().warn(f'[{camera_name}] combined failed: {resp.get("error")}')
             return None  # None → worker skips _last_results update, fusion keeps previous valid data
+
+        # 检测完成后用图像诞生时间戳查询 TF（优先精确，回退到 latest）
+        if task.base_to_map_matrix is None and task.image_stamp is not None:
+            task.base_to_map_matrix = self._get_base_to_map_matrix(task.image_stamp)
 
         _t_http = time.time()
 
@@ -1185,6 +1211,10 @@ class MultiCameraPerceptionNode(Node):
         detections = future_detection.result(timeout=10.0)
         optimized_depth = future_depth.result(timeout=10.0)
 
+        # 检测完成后用 image_stamp 查询 TF（优先精确，回退到 latest）
+        if task.base_to_map_matrix is None and task.image_stamp is not None:
+            task.base_to_map_matrix = self._get_base_to_map_matrix(task.image_stamp)
+
         # === DEBUG: 对比 raw depth vs CDM-optimized depth (仅在CDM启用时) ===
         if self.enable_depth_optimizer:
             _raw_depth_f32 = depth.astype(np.float32) / 1000.0 if depth.dtype == np.uint16 else depth.astype(np.float32)
@@ -1396,7 +1426,8 @@ class MultiCameraPerceptionNode(Node):
                 intrinsics=sensor.intrinsics,
                 prompt=prompt or self._current_prompt,
                 optical_to_base_matrix=optical_to_base,
-                base_to_map_matrix=self._get_base_to_map_matrix(),
+                base_to_map_matrix=None,  # 延迟到检测完成后用 image_stamp 查询
+                image_stamp=data.get('timestamp'),
                 timestamp_sec=time.time(),
                 frame_id=data.get('frame_id', f'{camera_name}_camera_optical_frame'),
                 ir_left=data.get('ir_left'),
@@ -1528,8 +1559,8 @@ class MultiCameraPerceptionNode(Node):
 
         result.objects = self._filter_footprint(result.objects)
 
-        # base_link → map 变换（与 _build_3d_result 对齐，确保 service 路径也输出 map 系）
-        base_to_map = self._get_base_to_map_matrix()
+        # base_link → map 变换（检测完成后用 image_stamp 精确查询，回退到 latest）
+        base_to_map = self._get_base_to_map_matrix(data.get('timestamp'))
         if base_to_map is not None and len(result.objects) > 0:
             base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
             ones = np.ones((len(base_pts), 1))
