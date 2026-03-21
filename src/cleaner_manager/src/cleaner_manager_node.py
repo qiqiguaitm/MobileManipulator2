@@ -17,8 +17,10 @@ from rclpy.time import Time
 
 import tf2_ros
 from geometry_msgs.msg import Point
-from std_msgs.msg import Bool
+from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import Bool, ColorRGBA
 from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker, MarkerArray
 
 import time as _time
 
@@ -50,8 +52,6 @@ class CleanerManagerNode(Node):
 
         # --- Declare parameters ---
         self.declare_parameter('tracked_objects_topic', '/multi_camera_perception/fused/objects_3d')
-        self.declare_parameter('min_distance', 0.3)
-        self.declare_parameter('max_distance', 3.0)
         self.declare_parameter('max_attempts', 3)
         self.declare_parameter('max_picks_per_nav', 10)
         self.declare_parameter('pick_speed', 30)
@@ -69,27 +69,39 @@ class CleanerManagerNode(Node):
         self.declare_parameter('match_threshold', 0.20)
         self.declare_parameter('min_observations', 2)
         self.declare_parameter('wait_for_first_target_timeout', 15.0)
+        self.declare_parameter('scan_duration', 3.0)
+        self.declare_parameter('pick_clear_max_dist', 0.25)
+        self.declare_parameter('max_reapproach', 2)
+        self.declare_parameter('reapproach_max_distance_mm', 1000.0)
+        self.declare_parameter('reapproach_depth_timeout', 3.0)
+        self.declare_parameter('reapproach_xmin_mm', 350.0)
+        self.declare_parameter('reapproach_xmax_mm', 450.0)
+        self.declare_parameter('reapproach_ymax_mm', 250.0)
         self.declare_parameter('grasp_z_min',            -0.30)
         self.declare_parameter('grasp_z_max',             0.50)
+        self.declare_parameter('grasp_distance_min',      0.15)
         self.declare_parameter('grasp_distance_max',      6.0)
         self.declare_parameter('grasp_physical_min_size', 0.02)
         self.declare_parameter('grasp_physical_max_size', 0.25)
+        self.declare_parameter('detection_mode', 'topic')  # "topic" or "service"
+        self.declare_parameter('costmap_max_cost', 99)     # OccupancyGrid: 99=inscribed, 100=lethal
+        self.declare_parameter('costmap_topic', '/global_costmap/costmap')
 
-        # --- TargetFilter ---
+        # --- TargetFilter (距离/高度/尺寸/costmap 统一准入门槛) ---
         self._filter = TargetFilter(
             z_min    = self.get_parameter('grasp_z_min').value,
             z_max    = self.get_parameter('grasp_z_max').value,
+            dist_min = self.get_parameter('grasp_distance_min').value,
             dist_max = self.get_parameter('grasp_distance_max').value,
             size_min = self.get_parameter('grasp_physical_min_size').value,
             size_max = self.get_parameter('grasp_physical_max_size').value,
+            costmap_max_cost = self.get_parameter('costmap_max_cost').value,
             logger   = self._log,
         )
 
-        # --- TargetPool ---
+        # --- TargetPool (距离过滤已由 TargetFilter 统一处理) ---
         self._pool = TargetPool(
             logger=self._log,
-            min_distance=self.get_parameter('min_distance').value,
-            max_distance=self.get_parameter('max_distance').value,
             max_attempts=self.get_parameter('max_attempts').value,
             target_ttl=self.get_parameter('target_ttl').value,
             match_threshold=self.get_parameter('match_threshold').value,
@@ -104,13 +116,34 @@ class CleanerManagerNode(Node):
             callback_group=self._cb_group,
         )
 
-        # --- Subscription: tracked objects ---
-        topic = self.get_parameter('tracked_objects_topic').value
+        # --- Costmap subscription (for target filter) ---
+        costmap_topic = self.get_parameter('costmap_topic').value
         self.create_subscription(
-            Object3DArray, topic,
-            self._tracked_objects_cb, 10,
+            OccupancyGrid, costmap_topic,
+            lambda msg: self._filter.set_costmap(msg), 1,
             callback_group=self._cb_group,
         )
+        self._log.info(f"Costmap filter: topic={costmap_topic}, max_cost={self.get_parameter('costmap_max_cost').value}")
+
+        # --- Detection mode ---
+        self._detection_mode = self.get_parameter('detection_mode').value
+        self._log.info(f"检测模式: {self._detection_mode.upper()}")
+
+        if self._detection_mode == 'topic':
+            # --- Subscription: tracked objects ---
+            topic = self.get_parameter('tracked_objects_topic').value
+            self.create_subscription(
+                Object3DArray, topic,
+                self._tracked_objects_cb, 10,
+                callback_group=self._cb_group,
+            )
+        else:
+            # --- Service client: on-demand detection ---
+            from perception.srv import DetectObjects
+            self._detect_client = self.create_client(
+                DetectObjects, '/multi_camera_perception/detect',
+                callback_group=self._cb_group,
+            )
 
         # --- Subscription: grasp filter config ---
         self.create_subscription(
@@ -146,6 +179,8 @@ class CleanerManagerNode(Node):
         # --- Status publisher ---
         self._status_pub = self.create_publisher(
             CleanerManagerStatus, '~/status', 10)
+        self._marker_pub = self.create_publisher(
+            MarkerArray, '~/target_markers', 10)
         rate = self.get_parameter('status_rate').value
         self.create_timer(
             1.0 / rate, self._publish_status, callback_group=self._cb_group)
@@ -157,6 +192,13 @@ class CleanerManagerNode(Node):
         self._start_event = threading.Event()
         self._worker_thread = None
         self._running = False
+
+        # Service 模式：定时检测喂池（状态机 NAVIGATING/PICKING 暂停时自动跳过）
+        if self._detection_mode == 'service':
+            self._detect_timer = self.create_timer(
+                1.0, self._periodic_detect, callback_group=self._cb_group)
+        self._last_detect_log_n = -1   # throttle detect log
+        self._detect_log_skip = 0
 
         self._log.info("CleanerManagerNode initialized — call ~/start to begin")
 
@@ -191,6 +233,97 @@ class CleanerManagerNode(Node):
         msg.objects = self._filter.filter(msg.objects)
         self._pool.update_from_tracker(msg)
 
+    def detect_and_update_pool(self, timeout: float = 5.0) -> int:
+        """Service 模式：调 DetectObjects → 过滤 → 喂入池。返回物体数。"""
+        if not self._localization_ok:
+            return 0
+        from perception.srv import DetectObjects
+        req = DetectObjects.Request()
+        req.camera_id = 'all'
+        future = self._detect_client.call_async(req)
+        deadline = _time.time() + timeout
+        while not future.done():
+            if _time.time() > deadline:
+                self._log.warn("detect_and_update_pool: 超时")
+                return 0
+            _time.sleep(0.05)
+        resp = future.result()
+        if not resp or not resp.success:
+            return 0
+        msg = resp.result
+        msg.objects = self._filter.filter(msg.objects)
+        self._pool.update_from_tracker(msg)
+        n = len(msg.objects)
+        if n > 0:
+            # 只在数量变化时或每10次检测时打一次日志，避免刷屏
+            self._detect_log_skip += 1
+            if n != self._last_detect_log_n or self._detect_log_skip >= 10:
+                self._log.info(f"detect_and_update_pool: {n} objects")
+                self._last_detect_log_n = n
+                self._detect_log_skip = 0
+        return n
+
+    def _periodic_detect(self):
+        """Service 模式定时检测（异步，不阻塞 executor）。
+        detect_and_update_pool 的阻塞版保留给 worker 线程使用。"""
+        if self._pool.paused:
+            return
+        if not self._localization_ok:
+            return
+        if getattr(self, '_detect_pending', False):
+            return  # 上次请求还没回来，跳过
+        from perception.srv import DetectObjects
+        req = DetectObjects.Request()
+        req.camera_id = 'all'
+        self._detect_pending = True
+        future = self._detect_client.call_async(req)
+        future.add_done_callback(self._on_periodic_detect_done)
+
+    def _on_periodic_detect_done(self, future):
+        """异步检测结果回调"""
+        self._detect_pending = False
+        try:
+            resp = future.result()
+        except Exception as e:
+            self._log.warn(f"detect_and_update_pool: 异常 {e}")
+            return
+        if not resp or not resp.success:
+            return
+        msg = resp.result
+        msg.objects = self._filter.filter(msg.objects)
+        self._pool.update_from_tracker(msg)
+        n = len(msg.objects)
+        if n > 0:
+            self._detect_log_skip += 1
+            if n != self._last_detect_log_n or self._detect_log_skip >= 10:
+                self._log.info(f"detect_and_update_pool: {n} objects")
+                self._last_detect_log_n = n
+                self._detect_log_skip = 0
+
+    def _build_pick_config(self) -> PickConfig:
+        return PickConfig(
+            max_picks_per_nav=self.get_parameter('max_picks_per_nav').value,
+            pick_speed=self.get_parameter('pick_speed').value,
+            lift_height=self.get_parameter('lift_height').value,
+            observe_prompt=self.get_parameter('observe_prompt').value,
+            observe_timeout=self.get_parameter('observe_timeout').value,
+            pick_timeout=self.get_parameter('pick_timeout').value,
+            place_timeout=self.get_parameter('place_timeout').value,
+            nav_timeout=self.get_parameter('nav_timeout').value,
+            max_consecutive_failures=self.get_parameter('max_consecutive_failures').value,
+            error_cooldown=self.get_parameter('error_cooldown').value,
+            max_error_retries=self.get_parameter('max_error_retries').value,
+            wait_for_first_target_timeout=self.get_parameter('wait_for_first_target_timeout').value,
+            scan_duration=self.get_parameter('scan_duration').value,
+            pick_clear_max_dist=self.get_parameter('pick_clear_max_dist').value,
+            max_reapproach=self.get_parameter('max_reapproach').value,
+            reapproach_max_distance_mm=self.get_parameter('reapproach_max_distance_mm').value,
+            reapproach_depth_timeout=self.get_parameter('reapproach_depth_timeout').value,
+            reapproach_xmin_mm=self.get_parameter('reapproach_xmin_mm').value,
+            reapproach_xmax_mm=self.get_parameter('reapproach_xmax_mm').value,
+            reapproach_ymax_mm=self.get_parameter('reapproach_ymax_mm').value,
+        )
+
     def _start_cb(self, request, response):
         if self._running:
             response.success = False
@@ -207,20 +340,7 @@ class CleanerManagerNode(Node):
         self._abort_event.clear()
         self._running = True
 
-        cfg = PickConfig(
-            max_picks_per_nav=self.get_parameter('max_picks_per_nav').value,
-            pick_speed=self.get_parameter('pick_speed').value,
-            lift_height=self.get_parameter('lift_height').value,
-            observe_prompt=self.get_parameter('observe_prompt').value,
-            observe_timeout=self.get_parameter('observe_timeout').value,
-            pick_timeout=self.get_parameter('pick_timeout').value,
-            place_timeout=self.get_parameter('place_timeout').value,
-            nav_timeout=self.get_parameter('nav_timeout').value,
-            max_consecutive_failures=self.get_parameter('max_consecutive_failures').value,
-            error_cooldown=self.get_parameter('error_cooldown').value,
-            max_error_retries=self.get_parameter('max_error_retries').value,
-            wait_for_first_target_timeout=self.get_parameter('wait_for_first_target_timeout').value,
-        )
+        cfg = self._build_pick_config()
         self._sm = PickStateMachine(self, self._pool, self._navigator, cfg)
 
         self._worker_thread = threading.Thread(
@@ -287,12 +407,21 @@ class CleanerManagerNode(Node):
         msg.targets_remaining = stats['remaining']
 
         now = _time.time()
+        robot_pos = self.get_robot_pos_map()
         entries = []
         for t in self._pool.get_snapshot():
             e = TargetEntry()
             e.category = t.category
             e.pos_x = t.position_map.x
             e.pos_y = t.position_map.y
+            e.pos_z = t.position_map.z
+            if robot_pos is not None:
+                dx = t.position_map.x - robot_pos.x
+                dy = t.position_map.y - robot_pos.y
+                e.distance = (dx*dx + dy*dy) ** 0.5
+            else:
+                e.distance = 0.0
+            e.physical_size = t.physical_size
             e.score = t.track_score
             e.status = int(t.status)
             e.observations = t.observation_count
@@ -303,6 +432,85 @@ class CleanerManagerNode(Node):
         msg.pool_targets = entries
 
         self._status_pub.publish(msg)
+        self._publish_target_markers(entries)
+
+    # ------------------------------------------------------------------
+    # RViz target markers
+    # ------------------------------------------------------------------
+
+    # status → color: ACTIVE=green, PICKED=gray, FAILED=red
+    _STATUS_COLORS = {
+        0: ColorRGBA(r=0.2, g=0.9, b=0.2, a=0.8),   # ACTIVE
+        1: ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.4),   # PICKED
+        2: ColorRGBA(r=0.9, g=0.2, b=0.2, a=0.6),   # FAILED
+    }
+    _CURRENT_COLOR = ColorRGBA(r=1.0, g=0.6, b=0.0, a=1.0)  # 当前目标: 橙色
+
+    def _publish_target_markers(self, entries: list):
+        """发布目标池的 RViz 可视化 (球体 + 文字标签)"""
+        ma = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+
+        # 当前正在执行的目标位置 (用于匹配高亮)
+        cur = None
+        if self._sm and self._sm.context.current_target:
+            ct = self._sm.context.current_target
+            cur = (ct.position_map.x, ct.position_map.y)
+
+        for i, e in enumerate(entries):
+            is_current = (cur is not None
+                          and abs(e.pos_x - cur[0]) < 0.05
+                          and abs(e.pos_y - cur[1]) < 0.05)
+
+            # --- 球体 ---
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = 'map'
+            m.ns = 'pool'
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = e.pos_x
+            m.pose.position.y = e.pos_y
+            m.pose.position.z = e.pos_z
+            m.pose.orientation.w = 1.0
+            sz = 0.18 if is_current else 0.12
+            m.scale.x = m.scale.y = m.scale.z = sz
+            m.color = self._CURRENT_COLOR if is_current else \
+                self._STATUS_COLORS.get(e.status, self._STATUS_COLORS[0])
+            m.lifetime.sec = 2  # 2s TTL, 1Hz 刷新
+            ma.markers.append(m)
+
+            # --- 文字标签 ---
+            t = Marker()
+            t.header.stamp = stamp
+            t.header.frame_id = 'map'
+            t.ns = 'label'
+            t.id = i
+            t.type = Marker.TEXT_VIEW_FACING
+            t.action = Marker.ADD
+            t.pose.position.x = e.pos_x
+            t.pose.position.y = e.pos_y
+            t.pose.position.z = e.pos_z + 0.15
+            t.pose.orientation.w = 1.0
+            t.scale.z = 0.08  # 文字高度
+            label = e.category
+            if is_current:
+                label = f">> {label} <<"
+            if e.attempts > 0:
+                label += f" x{e.attempts}"
+            t.text = label
+            t.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
+            t.lifetime.sec = 2
+            ma.markers.append(t)
+
+        # 发布 DELETE_ALL 清除残留 marker，再发布新的
+        if not entries:
+            clear = Marker()
+            clear.action = Marker.DELETEALL
+            ma.markers.append(clear)
+
+        self._marker_pub.publish(ma)
 
     # ------------------------------------------------------------------
     # Worker thread
@@ -335,6 +543,11 @@ class CleanerManagerNode(Node):
         if self._navigator is None:
             return False, "Navigator not set"
 
+        # Detect service (service mode only)
+        if self._detection_mode == 'service':
+            if not self._detect_client.wait_for_service(timeout_sec=3.0):
+                return False, "Service /multi_camera_perception/detect not available"
+
         # Services (2s timeout each)
         for name, client in [
             ('/piper/observe', self.observe_client),
@@ -360,12 +573,18 @@ def main(args=None):
     navigator = ApproachNavigator()
     manager.set_navigator(navigator)
 
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(manager)
     executor.add_node(navigator)
 
     try:
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=1.0)
+            except rclpy._rclpy_pybind11.InvalidHandle:
+                # Known Humble race: MultiThreadedExecutor + ReentrantCallbackGroup
+                manager.get_logger().warn(
+                    "InvalidHandle race condition (known Humble bug), continuing...")
     except KeyboardInterrupt:
         pass
     finally:

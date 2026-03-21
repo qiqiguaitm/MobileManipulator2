@@ -203,16 +203,15 @@ class MultiCameraPerceptionNode(Node):
     def _get_base_to_map_matrix(self, image_stamp=None) -> Optional[np.ndarray]:
         """查询 base_link→map 变换，定位未就绪或查询失败时返回 None
 
-        Args:
-            image_stamp: 图像诞生时间戳 (builtin_interfaces.msg.Time)。
-                         非阻塞尝试用该时刻查询（tf2 自动插值），buffer 中无数据时
-                         回退到最新 TF，确保始终输出 map 坐标系。
+        优先用 image_stamp 精确查询 tf2 buffer（SLERP/LERP 插值）。
+        注意：HDL localization TF 时间戳 = 雷达扫描时间（滞后 ~400ms），
+        较新的图像可能超出 TF buffer 最新时间戳 → ExtrapolationException，
+        此时回退到最新 TF（误差 ~10-15ms，低速下可忽略）。
         """
         if not self._localization_ready:
             return None
         try:
             ts = None
-            # 优先用 image_stamp 精确查询（非阻塞：buffer 中有就用）
             if image_stamp is not None:
                 try:
                     query_time = rclpy.time.Time.from_msg(image_stamp)
@@ -220,8 +219,7 @@ class MultiCameraPerceptionNode(Node):
                         'map', 'base_link', query_time,
                         timeout=Duration(seconds=0.0))
                 except Exception:
-                    pass  # buffer 中无该时刻数据，回退到 latest
-            # 回退到最新 TF（几乎总是可用）
+                    pass  # ExtrapolationException: image 比最新TF更新
             if ts is None:
                 ts = self._tf_buffer.lookup_transform(
                     'map', 'base_link', rclpy.time.Time(),
@@ -914,10 +912,6 @@ class MultiCameraPerceptionNode(Node):
             self.get_logger().warn(f'[{camera_name}] combined failed: {resp.get("error")}')
             return None  # None → worker skips _last_results update, fusion keeps previous valid data
 
-        # 检测完成后用图像诞生时间戳查询 TF（优先精确，回退到 latest）
-        if task.base_to_map_matrix is None and task.image_stamp is not None:
-            task.base_to_map_matrix = self._get_base_to_map_matrix(task.image_stamp)
-
         _t_http = time.time()
 
         # 2. 解析检测结果
@@ -1045,6 +1039,10 @@ class MultiCameraPerceptionNode(Node):
             result.objects.append(obj)
 
         result.objects = self._filter_footprint(result.objects)
+
+        # 静态变换完成后，用 image_stamp 查询 base_link→map TF
+        if task.base_to_map_matrix is None and task.image_stamp is not None:
+            task.base_to_map_matrix = self._get_base_to_map_matrix(task.image_stamp)
 
         if task.base_to_map_matrix is not None and len(result.objects) > 0:
             base_pts = np.array([[o.position.x, o.position.y, o.position.z] for o in result.objects])
@@ -1210,10 +1208,6 @@ class MultiCameraPerceptionNode(Node):
 
         detections = future_detection.result(timeout=10.0)
         optimized_depth = future_depth.result(timeout=10.0)
-
-        # 检测完成后用 image_stamp 查询 TF（优先精确，回退到 latest）
-        if task.base_to_map_matrix is None and task.image_stamp is not None:
-            task.base_to_map_matrix = self._get_base_to_map_matrix(task.image_stamp)
 
         # === DEBUG: 对比 raw depth vs CDM-optimized depth (仅在CDM启用时) ===
         if self.enable_depth_optimizer:

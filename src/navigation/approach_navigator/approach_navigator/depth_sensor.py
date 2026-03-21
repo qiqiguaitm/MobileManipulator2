@@ -41,6 +41,7 @@ class DepthSensor:
         self._config = config
         self._tf_buffer = tf_buffer
         self._running = True
+        self._active = threading.Event()   # 仅在阶段3激活时 set()
 
         # ========== 深度数据 (回调写入) ==========
         self._depth_lock = threading.Lock()
@@ -90,27 +91,22 @@ class DepthSensor:
                 "  建议安装: pip install scikit-learn"
             )
 
-        # ========== ROS 订阅 ==========
-        sensor_qos = QoSProfile(
+        # ========== ROS 订阅 (按需创建，activate 时启用) ==========
+        self._sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
+        self._depth_topic = config.depth_topic
+        self._info_topic = config.depth_topic.replace('/image_raw', '/camera_info')
+        self._sub = None       # activate() 时创建
+        self._info_sub = None  # activate() 时创建
 
-        self._sub = node.create_subscription(
-            Image, config.depth_topic, self._depth_callback, sensor_qos
-        )
-
-        info_topic = config.depth_topic.replace('/image_raw', '/camera_info')
-        self._info_sub = node.create_subscription(
-            CameraInfo, info_topic, self._camera_info_callback, sensor_qos
-        )
-
-        # ========== 调试点云发布 ==========
-        self._debug_front_pub    = node.create_publisher(PointCloud2, '~/debug_front_cloud', 1)
-        self._debug_obstacle_pub = node.create_publisher(PointCloud2, '~/debug_obstacle_cloud', 1)
-        self._debug_ground_pub   = node.create_publisher(PointCloud2, '~/debug_ground_cloud', 1)
-        self._debug_cluster_pub  = node.create_publisher(PointCloud2, '~/debug_cluster_cloud', 1)
+        # ========== 调试点云发布 (已禁用，太卡) ==========
+        # self._debug_front_pub    = node.create_publisher(PointCloud2, '~/debug_front_cloud', 1)
+        # self._debug_obstacle_pub = node.create_publisher(PointCloud2, '~/debug_obstacle_cloud', 1)
+        # self._debug_ground_pub   = node.create_publisher(PointCloud2, '~/debug_ground_cloud', 1)
+        # self._debug_cluster_pub  = node.create_publisher(PointCloud2, '~/debug_cluster_cloud', 1)
 
         # ========== 桥接相机驱动 TF 孤岛到机器人 TF 树 ==========
         # RealSense 驱动以 chassis_link 为根发布 TF，但机器人 URDF 用 chassis_camera_link
@@ -140,16 +136,49 @@ class DepthSensor:
 
     def shutdown(self):
         self._running = False
+        self._active.clear()
         if self._perception_thread.is_alive():
             self._perception_thread.join(timeout=1.0)
+        # 仅在 shutdown 时销毁订阅 (不在 deactivate 中销毁，避免 DDS 重匹配失败)
+        if self._sub is not None:
+            self._node.destroy_subscription(self._sub)
+            self._sub = None
+        if self._info_sub is not None:
+            self._node.destroy_subscription(self._info_sub)
+            self._info_sub = None
 
     # =========================================================================
     # 感知线程 (30Hz)
     # =========================================================================
 
+    def activate(self):
+        """激活感知线程 + 订阅 (阶段2/3开始时调用)
+
+        订阅只创建一次，后续调用仅恢复感知线程。
+        避免反复 destroy/create 导致 DDS 重匹配失败。
+        """
+        if self._sub is None:
+            self._sub = self._node.create_subscription(
+                Image, self._depth_topic, self._depth_callback, self._sensor_qos)
+        if self._info_sub is None:
+            self._info_sub = self._node.create_subscription(
+                CameraInfo, self._info_topic, self._camera_info_callback, self._sensor_qos)
+        self._active.set()
+        self._node.get_logger().info("深度感知已激活")
+
+    def deactivate(self):
+        """暂停感知线程 (保留订阅，避免 DDS 重匹配问题)"""
+        self._active.clear()
+        self._clear_results()
+        with self._depth_lock:
+            self._latest_depth = None
+        self._node.get_logger().info("深度感知已暂停")
+
     def _perception_loop(self):
         interval = 1.0 / 30.0
         while self._running and rclpy.ok():
+            if not self._active.wait(timeout=0.5):
+                continue
             t0 = time.time()
             try:
                 self._do_perception()
@@ -165,12 +194,18 @@ class DepthSensor:
         # 1. 获取深度图
         with self._depth_lock:
             if self._latest_depth is None:
+                self._node.get_logger().info(
+                    "[depth] 无深度帧", throttle_duration_sec=2.0)
                 return
             if time.time() - self._depth_timestamp > self._config.depth_data_timeout:
+                self._node.get_logger().info(
+                    "[depth] 深度帧超时", throttle_duration_sec=2.0)
                 return
             depth_image = self._latest_depth.copy()
 
         if not self._has_intrinsics:
+            self._node.get_logger().info(
+                "[depth] 等待相机内参...", throttle_duration_sec=2.0)
             return
 
         t1 = time.time()
@@ -178,6 +213,9 @@ class DepthSensor:
         # 2. 深度图 → 相机坐标系点云
         points = self._depth_to_pointcloud(depth_image, self._config.depth_downsample)
         if points is None or len(points) < 100:
+            self._node.get_logger().info(
+                f"[depth] 点云不足: {0 if points is None else len(points)}点 (<100)",
+                throttle_duration_sec=2.0)
             self._clear_results()
             return
 
@@ -196,6 +234,9 @@ class DepthSensor:
         )
         front_points = points[roi_mask]
         if len(front_points) < 50:
+            self._node.get_logger().info(
+                f"[depth] ROI过滤后不足: total={len(points)} roi={len(front_points)} (<50)",
+                throttle_duration_sec=2.0)
             self._clear_results()
             return
 
@@ -204,6 +245,9 @@ class DepthSensor:
         # 3.5 去除孤立噪点 (RealSense 飞点 / 深度不连续处错误点)
         front_points = self._remove_outliers(front_points)
         if len(front_points) < 50:
+            self._node.get_logger().info(
+                f"[depth] 去噪后不足: {len(front_points)}点 (<50)",
+                throttle_duration_sec=2.0)
             self._clear_results()
             return
 
@@ -232,24 +276,22 @@ class DepthSensor:
             self._result_timestamp = time.time()
             self._processing_time_ms = (time.time() - t0) * 1000
 
-        # 8. 发布调试点云 (2Hz 节流 + 仅有订阅者时发布)
-        now_mono = time.time()
-        if now_mono - self._last_debug_publish >= self._debug_publish_interval:
-            self._last_debug_publish = now_mono
-            self._publish_debug_clouds(front_points, obstacle_points, ground_points, clusters)
+        # 8. 调试点云发布 (已禁用，太卡)
+        # now_mono = time.time()
+        # if now_mono - self._last_debug_publish >= self._debug_publish_interval:
+        #     self._last_debug_publish = now_mono
+        #     self._publish_debug_clouds(front_points, obstacle_points, ground_points, clusters)
 
         t7 = time.time()
         total_ms = (t7 - t0) * 1000
 
-        if self._log_enabled and nearest is not None:
-            self._node.get_logger().debug(
-                f"感知: front={len(front_points)} obs={len(obstacle_points)} "
-                f"ground={len(ground_points)} clusters={len(clusters)} "
-                f"nearest_z={nearest[2]:.3f}m  总{total_ms:.0f}ms "
-                f"[pc={1000*(t2-t1):.0f} roi={1000*(t3-t2):.0f} "
-                f"gnd={1000*(t4-t3):.0f} cls={1000*(t5-t4):.0f} "
-                f"pub={1000*(t7-t6):.0f}]ms",
-                throttle_duration_sec=1.0
+        if self._log_enabled:
+            nz = f"nearest_z={nearest[2]:.3f}m" if nearest else "nearest=None"
+            self._node.get_logger().info(
+                f"[depth] front={len(front_points)} obs={len(obstacle_points)} "
+                f"gnd={len(ground_points)} cls={len(clusters)} {nz}  "
+                f"{total_ms:.0f}ms",
+                throttle_duration_sec=2.0
             )
 
     def _clear_results(self):
@@ -314,7 +356,7 @@ class DepthSensor:
             return points, empty
 
         ground_max = abs(self._config.depth_ground_max_height)  # 确保正值
-        margin = 0.05  # 5cm 容差
+        margin = self._config.ground_candidate_margin
         yc = points[:, 1]
 
         potential_ground_mask = yc >= (ground_max - margin)
@@ -332,7 +374,12 @@ class DepthSensor:
             ransac_input = potential_ground
 
         # RANSAC 拟合水平面，直接返回法向量+截距，不需要 SVD 二次拟合
-        normal, d_plane = self._ransac_ground(ransac_input)
+        normal, d_plane = self._ransac_ground(
+            ransac_input,
+            distance_threshold=self._config.ransac_distance_threshold,
+            max_iterations=self._config.ransac_max_iterations,
+            min_inlier_ratio=self._config.ransac_min_inlier_ratio,
+        )
 
         # 将平面参数应用到全量地面候选点
         if normal is not None:
@@ -340,7 +387,8 @@ class DepthSensor:
             # 只将位于地面平面 1cm 以上至 3cm 以下范围内的点视为地面,
             # 避免将低矮物体顶面(可能距地面仅 2-3cm)误判为地面点而去除
             signed = potential_ground @ normal - d_plane
-            inliers = (signed >= -0.01) & (signed < 0.03)
+            inliers = (signed >= self._config.ground_inlier_min_dist) & \
+                       (signed < self._config.ground_inlier_max_dist)
         else:
             inliers = None
 
@@ -362,14 +410,14 @@ class DepthSensor:
 
         return obstacle_points, ground_points
 
-    def _remove_outliers(self, points: np.ndarray,
-                         radius: float = 0.05,
-                         min_neighbors: int = 3) -> np.ndarray:
+    def _remove_outliers(self, points: np.ndarray) -> np.ndarray:
         """去除孤立噪点 (半径异常值去除)
 
         对每个点统计 radius 球内邻居数，不足 min_neighbors 的视为噪点。
         有效去除 RealSense 飞点 (flying pixels) 和深度不连续处的错误点。
         """
+        radius = self._config.outlier_radius
+        min_neighbors = self._config.outlier_min_neighbors
         if len(points) <= min_neighbors:
             return points
         try:
@@ -424,10 +472,10 @@ class DepthSensor:
     # 聚类
     # =========================================================================
 
-    def _cluster(self, points: np.ndarray,
-                 tolerance: float = 0.05,
-                 min_size: int = 50,
-                 max_size: int = 10000) -> List[np.ndarray]:
+    def _cluster(self, points: np.ndarray) -> List[np.ndarray]:
+        tolerance = self._config.cluster_tolerance
+        min_size = self._config.cluster_min_size
+        max_size = self._config.cluster_max_size
         if len(points) < min_size:
             return []
         if self._use_sklearn:
@@ -697,6 +745,22 @@ class DepthSensor:
             if time.time() - self._result_timestamp > 1.5:
                 return None
             return self._nearest_obstacle
+
+    def get_all_cluster_centroids(self) -> List[Tuple[float, float, float]]:
+        """获取所有聚类的质心信息 (用于阶段2目标选择)
+
+        Returns:
+            list of (centroid_x, centroid_y, front_z)，空列表表示无数据
+        """
+        with self._result_lock:
+            if time.time() - self._result_timestamp > 1.5:
+                return []
+            result = []
+            for cluster in self._clusters:
+                centroid = np.mean(cluster, axis=0)
+                front_z = float(np.min(cluster[:, 2]))
+                result.append((float(centroid[0]), float(centroid[1]), front_z))
+            return result
 
     def get_target_depth(self) -> Optional[float]:
         """获取到最近障碍物前沿的距离 (相机 z 轴, 即到底盘相机的距离)"""

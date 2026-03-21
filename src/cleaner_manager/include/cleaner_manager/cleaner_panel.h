@@ -46,7 +46,9 @@ namespace cleaner_manager
 
 struct TargetInfo {
     std::string category;
-    double pos_x{0}, pos_y{0};
+    double pos_x{0}, pos_y{0}, pos_z{0};
+    double distance{0};
+    double physical_size{0};
     double score{0};
     uint8_t status{0};   // 0=ACTIVE 1=PICKED 2=FAILED
     uint32_t observations{0};

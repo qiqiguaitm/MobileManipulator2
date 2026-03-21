@@ -37,7 +37,7 @@ RUN_TEST="false"
 CUSTOM_PROMPT=""
 EXTRINSICS_SUFFIX=""
 ENABLE_CDM="false"
-ENABLE_FS="true"
+DEPTH_MODE="combined"   # combined | fs | raw
 
 # ============================================================================
 # 解析参数
@@ -71,9 +71,14 @@ for arg in "$@"; do
         --no-cdm)
             ENABLE_CDM="false"
             ;;
-        --foundation-stereo)
-            ENABLE_FS="true"
-            ENABLE_CDM="false"
+        --combined)
+            DEPTH_MODE="combined"
+            ;;
+        --foundation-stereo|--fs-only)
+            DEPTH_MODE="fs"
+            ;;
+        --raw-depth)
+            DEPTH_MODE="raw"
             ;;
         -h|--help)
             head -25 "$0" | tail -23
@@ -128,18 +133,28 @@ echo -e "${GREEN}   ✓ 环境已配置${NC}"
 # 检查外部服务
 # ============================================================================
 echo "[2/5] 检查外部服务..."
-DETECTOR_OK=false
 
-if [ "$DETECTOR_TYPE" = "sam3" ]; then
-    check_service "$SAM3_URL" "SAM3 服务" && DETECTOR_OK=true
-    if [ "$DETECTOR_OK" = false ]; then
-        echo -e "${RED}   ✗ SAM3 服务必须可用${NC}"
-        exit 1
+# Combined 模式: SAM3+FS 捆绑在 combined_server，不需要 standalone SAM3
+if [ "$DEPTH_MODE" = "combined" ]; then
+    COMBINED_OK=true
+    check_service "$COMBINED_GPU0_URL" "Combined GPU0" || COMBINED_OK=false
+    check_service "$COMBINED_GPU1_URL" "Combined GPU1" || COMBINED_OK=false
+    if [ "$COMBINED_OK" = false ]; then
+        echo -e "${YELLOW}   Combined 服务不可用，回退到 FS + standalone SAM3${NC}"
+        DEPTH_MODE="fs"
     fi
-else
-    check_service "$DINOX_URL" "DINO-X 服务" && DETECTOR_OK=true
+fi
+
+# 非 combined 模式: 需要 standalone 检测器
+if [ "$DEPTH_MODE" != "combined" ]; then
+    DETECTOR_OK=false
+    if [ "$DETECTOR_TYPE" = "sam3" ]; then
+        check_service "$SAM3_URL" "SAM3 服务" && DETECTOR_OK=true
+    else
+        check_service "$DINOX_URL" "DINO-X 服务" && DETECTOR_OK=true
+    fi
     if [ "$DETECTOR_OK" = false ]; then
-        echo -e "${RED}   ✗ DINO-X 服务必须可用${NC}"
+        echo -e "${RED}   ✗ 检测器服务必须可用${NC}"
         exit 1
     fi
 fi
@@ -170,7 +185,7 @@ if [ "$SKIP_CAMERA" = "false" ] && [ "$CAMERA_NAME" != "none" ]; then
 
     # FoundationStereo 需要启用相机的 IR 流（关闭投影仪）
     INFRA_ARGS=""
-    if [ "$ENABLE_FS" = "true" ]; then
+    if [ "$DEPTH_MODE" = "combined" ] || [ "$DEPTH_MODE" = "fs" ]; then
         INFRA_ARGS="top_enable_infra:=true chassis_enable_infra:=true"
     fi
 
@@ -274,18 +289,23 @@ if [ "$ENABLE_CDM" = "false" ]; then
     echo -e "${YELLOW}   CDM 深度优化: 已禁用 (使用原始深度)${NC}"
 fi
 
-FS_ARG=""
-if [ "$ENABLE_FS" = "true" ]; then
-    FS_ARG="depth_source:=foundation_stereo top_enable_infra:=true chassis_enable_infra:=true"
-    echo -e "${YELLOW}   FoundationStereo: 已启用 (被动双目深度估计，双相机)${NC}"
+DEPTH_ARG=""
+if [ "$DEPTH_MODE" = "combined" ]; then
+    DEPTH_ARG="depth_source:=combined top_enable_infra:=true chassis_enable_infra:=true"
+    echo -e "${YELLOW}   Combined SAM3+FS: 已启用 (单次HTTP，双GPU)${NC}"
+elif [ "$DEPTH_MODE" = "fs" ]; then
+    DEPTH_ARG="depth_source:=foundation_stereo top_enable_infra:=true chassis_enable_infra:=true"
+    echo -e "${YELLOW}   FoundationStereo: 已启用 (被动双目深度估计)${NC}"
+else
+    echo -e "${YELLOW}   深度: 原始 RealSense 深度${NC}"
 fi
 
-echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG"
+echo "   启动: ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $DEPTH_ARG"
 echo ""
 
 # 如果需要测试，后台启动
 if [ "$RUN_TEST" = "true" ]; then
-    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG > /tmp/perception_launch.log 2>&1 &
+    ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $DEPTH_ARG > /tmp/perception_launch.log 2>&1 &
     LAUNCH_PID=$!
 
     # 等待节点启动
@@ -332,5 +352,5 @@ if [ "$RUN_TEST" = "true" ]; then
     wait $LAUNCH_PID
 else
     # 前台启动
-    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $FS_ARG
+    exec ros2 launch perception $LAUNCH_FILE $RVIZ_ARG $DETECTOR_ARG $EXTRINSICS_ARG $CDM_ARG $DEPTH_ARG
 fi

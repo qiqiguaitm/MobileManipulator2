@@ -36,8 +36,8 @@ from perception.dual_camera_matcher import CategoryCompatibility
 class TrackerConfig:
     """跟踪器配置"""
     # 距离阈值
-    match_thresh: float = 0.20      # 第一阶段匹配阈值 (20cm, 适配2-3Hz低频)
-    second_thresh: float = 0.30     # 第二阶段匹配阈值 (30cm, 更宽松)
+    match_thresh: float = 0.15      # 第一阶段匹配阈值 (15cm, map系下静态物体噪声~3cm)
+    second_thresh: float = 0.25     # 第二阶段匹配阈值 (25cm, 恢复Lost轨迹)
 
     # 轨迹管理
     track_buffer_s: float = 3.0     # Lost轨迹保留时间（秒），与 update() 调用频率无关
@@ -75,9 +75,9 @@ class TrackerConfig:
                                     # 距离仍为硬门控，类别仅作排序偏好（防分类抖动导致 Re-ID 失败）
 
     # 代价函数权重（归一化代价，与 dual_camera_matcher 同构）
-    # IoU可用时(Tracked+同相机): cost = 0.70*dist_norm + 0.15*(1-iou) + 0.15*cat_cost
-    # IoU不可用时(Lost/跨相机): cost = 0.80*dist_norm + 0.20*cat_cost
+    # cost = 0.85*dist_norm + 0.15*cat_cost + age_penalty
     # cat_cost: 0.0=相同 / 0.3=兼容 / 1.0=不兼容（软门控，不再硬拦截）
+    # map 系下距离为主要判据，类别辅助区分近距离同位置目标
     cost_max: float = 0.75          # 归一化代价门槛
 
     # 类别投票：连续 N 帧检测到不同类别后更新轨迹类别（仅 Tracked 状态）
@@ -628,52 +628,29 @@ class ByteTracker3D:
         打印单次匹配的代价分解，供 _cc_track_debug.py --cost 解析。
 
         格式（key=value，便于脚本 split 解析）：
-          [COST] s=1 mode=3T trk=track_3 tcat=box dcat=can src=fused
-                 cost=0.320 d=0.183 i=0.010 c=0.127 dist=5.0 iou=0.96
+          [COST] s=1 trk=track_3 tcat=box dcat=can src=fused
+                 cost=0.320 d=0.183 c=0.127 age=0.010 dist=5.0cm
         """
-        W_DIST_3, W_IOU_3, W_CAT_3 = 0.70, 0.15, 0.15
-        W_DIST_2, W_CAT_2 = 0.80, 0.20
+        W_DIST = 0.85
+        W_CAT  = 0.15
 
         dist = float(np.linalg.norm(track.position - det['position']))
         dist_norm = min(dist / thresh, 1.0)
         cat_cost = CategoryCompatibility.compute_category_cost(
             track.category, det['category'])
 
-        iou = 0.0
-        use_iou = False
-        if track.state == TrackState.Tracked:
-            det_source = det.get('source', '')
-            det_bbox = det.get('bbox')
-            if det_source in ('fused', 'chassis', 'chassis_only'):
-                track_bbox = track.last_chassis_bbox
-            elif det_source in ('top', 'top_only'):
-                track_bbox = track.last_top_bbox
-            else:
-                track_bbox = None
-            if track_bbox is not None and det_bbox is not None:
-                iou = self._compute_iou(track_bbox, det_bbox)
-                use_iou = True
-
-        if use_iou:
-            d_term = W_DIST_3 * dist_norm
-            i_term = W_IOU_3 * (1.0 - iou)
-            c_term = W_CAT_3 * cat_cost
-            mode = '3T'
-        else:
-            d_term = W_DIST_2 * dist_norm
-            i_term = 0.0
-            c_term = W_CAT_2 * cat_cost
-            mode = 'FB'
+        d_term = W_DIST * dist_norm
+        c_term = W_CAT * cat_cost
 
         stability = min(track.tracklet_len / self.cfg.age_stable_frames, 1.0)
         age_term = self.cfg.age_penalty_weight * (1.0 - stability)
 
         tid = track.track_id if track.track_id else '?'
         self.log.info(
-            f'[COST] s={stage} mode={mode} trk={tid} tcat={track.category} '
+            f'[COST] s={stage} trk={tid} tcat={track.category} '
             f'dcat={det["category"]} src={det.get("source", "?")} '
-            f'cost={cost_total:.3f} d={d_term:.3f} i={i_term:.3f} c={c_term:.3f} age={age_term:.3f} '
-            f'hits={track.tracklet_len} dist={dist * 100:.1f} iou={iou:.2f}'
+            f'cost={cost_total:.3f} d={d_term:.3f} c={c_term:.3f} age={age_term:.3f} '
+            f'hits={track.tracklet_len} dist={dist * 100:.1f}cm'
         )
 
     @staticmethod
@@ -703,25 +680,17 @@ class ByteTracker3D:
                       detections: List[dict],
                       thresh: float) -> np.ndarray:
         """
-        计算归一化代价矩阵（双分支）
+        计算归一化代价矩阵（距离 + 类别）
 
-        IoU可用时（Tracked状态 + 同相机bbox均有效）：
-          cost = 0.70*dist_norm + 0.15*(1-iou) + 0.15*cat_cost
-          优先级：距离 >> IoU = 类别（低频场景IoU不可靠，降权）
-
-        IoU不可用时（Lost状态 / 跨相机 / bbox退化）：
-          cost = 0.80*dist_norm + 0.20*cat_cost
+        cost = 0.80*dist_norm + 0.20*cat_cost + age_penalty
 
         cat_cost: 0.0=相同 / 0.3=兼容 / 1.0=不兼容（软门控）
         最终由 cost_max=0.75 决定是否接受。
+
+        map 系下静态物体帧间距离 ~0.03m，dist_norm ≈ 0.15，区分度极好。
         """
-        # IoU可用分支权重
-        W_DIST_3 = 0.70
-        W_IOU_3  = 0.15
-        W_CAT_3  = 0.15
-        # IoU不可用回退权重
-        W_DIST_2 = 0.80
-        W_CAT_2  = 0.20
+        W_DIST = 0.85
+        W_CAT  = 0.15
 
         n_tracks = len(tracks)
         n_dets = len(detections)
@@ -735,37 +704,11 @@ class ByteTracker3D:
                     track.category, det['category']
                 )  # 0.0 / 0.3 / 1.0
 
-                # IoU: 仅 Tracked 状态 + 同相机来源时可用
-                use_iou = False
-                iou = 0.0
-                if track.state == TrackState.Tracked:
-                    det_source = det.get('source', '')
-                    det_bbox = det.get('bbox')
-                    if det_source in ('fused', 'chassis', 'chassis_only'):
-                        track_bbox = track.last_chassis_bbox
-                    elif det_source in ('top', 'top_only'):
-                        track_bbox = track.last_top_bbox
-                    else:
-                        track_bbox = None
-                    if track_bbox is not None and det_bbox is not None:
-                        iou = self._compute_iou(track_bbox, det_bbox)
-                        use_iou = True
-
-                # 年轻轨迹惩罚：tracklet_len 少的轨迹（ghost/噪声）附加代价，
-                # 防止其在位置恰好更近时抢走 Lost 老轨迹的检测。
-                # 公式：penalty = weight * (1 - min(len/stable_frames, 1))
-                # tracklet_len=1:  penalty ≈ weight * 0.9  (最大惩罚)
-                # tracklet_len=10: penalty = 0              (稳定轨迹，无惩罚)
+                # 年轻轨迹惩罚
                 stability = min(track.tracklet_len / self.cfg.age_stable_frames, 1.0)
                 age_penalty = self.cfg.age_penalty_weight * (1.0 - stability)
 
-                if use_iou:
-                    cost[i, j] = (W_DIST_3 * dist_norm
-                                  + W_IOU_3  * (1.0 - iou)
-                                  + W_CAT_3  * cat_cost
-                                  + age_penalty)
-                else:
-                    cost[i, j] = W_DIST_2 * dist_norm + W_CAT_2 * cat_cost + age_penalty
+                cost[i, j] = W_DIST * dist_norm + W_CAT * cat_cost + age_penalty
 
         return cost
 
@@ -925,8 +868,8 @@ if __name__ == '__main__':
 
     # 创建跟踪器
     cfg = TrackerConfig(
-        match_thresh=0.20,
-        second_thresh=0.30,
+        match_thresh=0.15,
+        second_thresh=0.25,
         track_buffer_s=3.0,
         confirm_time_s=0.8,
         min_confirm_hits=2,

@@ -6,13 +6,7 @@ Pure Python implementation based on acfr/cam_lidar_calibration algorithm.
 No ROS dependency required.
 """
 
-# Legacy imports (keep for backward compatibility)
-from .feature_extractor import FeatureExtractor, FrameFeatures
-from .optimizer import Optimizer
-from .pose_selector import PoseSelector
-from .visualizer import Visualizer
-
-# New modular imports
+# Modular imports
 from .io_utils import (
     load_extrinsics,
     load_intrinsics,
@@ -68,12 +62,6 @@ from .calibration_solver import (
 )
 
 __all__ = [
-    # Legacy
-    'FeatureExtractor',
-    'FrameFeatures',
-    'Optimizer',
-    'PoseSelector',
-    'Visualizer',
     # IO
     'load_extrinsics',
     'load_intrinsics',

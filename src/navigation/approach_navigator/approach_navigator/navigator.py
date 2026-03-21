@@ -59,6 +59,8 @@ class ApproachNavigator(Node):
         self._stage_lock = threading.Lock()      # 状态锁
         self._cancel_requested = False           # 取消标志
         self._initial_depth = None              # 用户确认时的初始深度
+        self._locked_target_cx = None           # 阶段2→3 锁定目标 cam_x
+        self._locked_target_cz = None           # 阶段2→3 锁定目标 cam_z
 
         # 目标信息
         self.target_map_position: Optional[Point] = None    # 目标位置 (map 坐标系)
@@ -128,9 +130,69 @@ class ApproachNavigator(Node):
         """清除初始深度"""
         self._initial_depth = None
 
+    def back_up(self, distance_m: float, speed: float = 0.05, timeout: float = 10.0) -> bool:
+        """开环后退指定距离，用 odom 测量实际位移。
+
+        后退距离 <= 15cm，不做后方避障 — 无后方传感器，短距风险可控。
+
+        Args:
+            distance_m: 后退距离 (m)
+            speed: 后退速度 (m/s)，正值，内部取负
+            timeout: 超时 (s)
+
+        Returns:
+            bool: 到达目标距离返回 True
+        """
+        with self._odom_lock:
+            start_x = self._odom_x
+            start_y = self._odom_y
+        if start_x is None:
+            self.get_logger().error("back_up: 里程计不可用")
+            return False
+
+        self.get_logger().info(f"back_up: 后退 {distance_m:.3f}m @ {speed:.3f}m/s")
+        start_time = time.time()
+        cmd = Twist()
+        cmd.linear.x = -abs(speed)
+
+        while rclpy.ok() and not self._cancel_requested:
+            if time.time() - start_time > timeout:
+                self._stop_robot()
+                self.get_logger().warn("back_up: 超时")
+                return False
+
+            traveled = self._get_odom_traveled(start_x, start_y)
+            if traveled >= distance_m:
+                self._stop_robot()
+                self.get_logger().info(f"back_up: 完成，实际后退 {traveled:.3f}m")
+                return True
+
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+
+        self._stop_robot()
+        return False
+
     # =========================================================================
     # 主接口
     # =========================================================================
+
+    def is_reachable(self, target_position: Point) -> bool:
+        """用 Nav2 planner 检查物体位置是否可达（仅规划，不执行）"""
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = target_position.x
+        goal.pose.position.y = target_position.y
+        goal.pose.orientation.w = 1.0
+
+        path = self.nav.getPath(
+            start=PoseStamped(),
+            goal=goal,
+            planner_id='GridBased',
+            use_start=False
+        )
+        return path is not None and len(path.poses) > 0
 
     def approach_to_target(
         self,
@@ -194,6 +256,7 @@ class ApproachNavigator(Node):
                 _notify(NavStage.ALIGNING, "对准目标方向...")
                 success, msg = self._do_alignment()
                 if not success:
+                    self.depth_sensor.deactivate()
                     return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
                 time.sleep(1.0)
             else:
@@ -208,6 +271,7 @@ class ApproachNavigator(Node):
                     return ApproachResult(False, "APPROACH_FAILED", msg, stage=3)
             else:
                 self.get_logger().info("跳过阶段3")
+                self.depth_sensor.deactivate()  # 阶段2可能已激活，清理
                 final_dist = 0.0
 
             return ApproachResult(True, final_distance=final_dist)
@@ -274,7 +338,7 @@ class ApproachNavigator(Node):
 
             # 阶段1完成后等待车辆停稳
             self.get_logger().info("Nav2 到达，等待车辆停稳...")
-            time.sleep(0.5)  # 等待0.5秒
+            time.sleep(0.3)  # 等待0.3秒
 
         # ========== 阶段2: 对齐 ==========
         if 2 in skip_stages:
@@ -287,20 +351,23 @@ class ApproachNavigator(Node):
             success, msg = self._do_alignment()
 
             if self._cancel_requested:
+                self.depth_sensor.deactivate()
                 notify(NavStage.FAILED, "用户取消")
                 return ApproachResult(False, "NAV_CANCELLED", "用户取消", stage=2)
 
             if not success:
+                self.depth_sensor.deactivate()
                 notify(NavStage.FAILED, f"对齐失败: {msg}")
                 return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
 
             # 阶段2完成后等待车辆停稳
             self.get_logger().info("对齐完成，等待车辆停稳...")
-            time.sleep(1.0)  # 等待1秒让车子停稳
+            time.sleep(0.3)  # 等待0.3秒让车子停稳
 
         # ========== 阶段3: 精确接近 ==========
         if 3 in skip_stages:
             self.get_logger().info("跳过阶段3 (精确接近)")
+            self.depth_sensor.deactivate()  # 阶段2可能已激活，清理
             notify(NavStage.FINAL_APPROACH, "跳过阶段3")
             final_dist = 0.0
             success = True
@@ -379,14 +446,252 @@ class ApproachNavigator(Node):
     # =========================================================================
 
     def _do_alignment(self) -> tuple:
-        """执行 PD 控制器对齐
+        """两步对齐: 先 map 粗对齐 (把目标带入相机视野)，再深度聚类精对齐
 
-        原地旋转使机器人正面朝向目标
+        步骤1: 基于 map 坐标原地旋转，使机器人大致朝向目标
+        步骤2: 激活深度传感器，用点云聚类精确对齐到目标中心
+
+        深度传感器在对齐完成后保持激活状态，供阶段3复用。
 
         Returns:
             (bool, str): (成功标志, 错误消息)
         """
-        # 检查距离 - 太近则跳过
+        # ===== 步骤1: map 粗对齐 =====
+        self.get_logger().info("对齐步骤1: map 坐标粗对齐")
+        success, msg = self._do_alignment_by_map()
+        if not success:
+            return False, msg
+
+        # 粗对齐后停稳，等惯性消散 + IMU收敛
+        settle = self.config.align_settle_time
+        self.get_logger().info(f"粗对齐完成，停稳等待 {settle:.1f}s")
+        self._stop_robot()
+        time.sleep(settle)
+
+        # ===== 步骤2: 深度聚类精对齐 =====
+        self.get_logger().info("对齐步骤2: 深度聚类精对齐")
+        return self._do_alignment_by_depth()
+
+    def _map_to_camera(self, target_map, robot_pos, robot_yaw) -> tuple:
+        """map 坐标 → 相机光学系期望位置 (cam_x, cam_z)
+
+        camera optical: x=右, z=前
+        base_link: x=前, y=左
+        相机在 base_link 前方 robot_front_offset 处
+        逆变换: base → camera: cam_z=bx-offset, cam_x=-by
+        """
+        dx = target_map.x - robot_pos.x
+        dy = target_map.y - robot_pos.y
+        cos_y = math.cos(robot_yaw)
+        sin_y = math.sin(robot_yaw)
+        bx = dx * cos_y + dy * sin_y
+        by = -dx * sin_y + dy * cos_y
+        cam_z = bx - self.config.robot_front_offset
+        cam_x = -by
+        return cam_x, cam_z
+
+    def _select_cluster(self, clusters, robot_pos, robot_yaw,
+                        prev_cx=None, prev_cz=None):
+        """两级聚类选择: map期望 > 时序连续，无兜底
+
+        1. 距 map 期望位置最近的聚类 (容差 0.5m)
+        2. 距上帧聚类最近的 (容差 0.3m，时序连续性)
+        3. 都不匹配 → 返回 None (跳过深度对齐)
+
+        Returns:
+            (cx, cy, cz) or None
+        """
+        # map 期望位置
+        exp_cx, exp_cz = self._map_to_camera(
+            self.target_map_position, robot_pos, robot_yaw)
+        by_map = min(clusters, key=lambda c:
+                     (c[0] - exp_cx) ** 2 + (c[2] - exp_cz) ** 2)
+        map_dist = math.sqrt(
+            (by_map[0] - exp_cx) ** 2 + (by_map[2] - exp_cz) ** 2)
+        if map_dist < 0.8:
+            return by_map
+
+        # 时序连续性
+        if prev_cx is not None:
+            by_prev = min(clusters, key=lambda c:
+                         (c[0] - prev_cx) ** 2 + (c[2] - prev_cz) ** 2)
+            prev_dist = math.sqrt(
+                (by_prev[0] - prev_cx) ** 2 + (by_prev[2] - prev_cz) ** 2)
+            if prev_dist < 0.3:
+                return by_prev
+
+        # 无匹配 — 目标可能被遮挡或太小不可见
+        return None
+
+    def _match_locked_target(self, clusters, prev_cx, prev_cz, tolerance=0.15):
+        """在聚类中匹配锁定目标（纯时序连续性）
+
+        Args:
+            clusters: get_all_cluster_centroids() 返回值
+            prev_cx, prev_cz: 上帧目标位置
+            tolerance: 最大匹配距离 (米)
+        Returns:
+            (cx, cy, cz) or None
+        """
+        if not clusters or prev_cx is None:
+            return None
+        best = min(clusters, key=lambda c: (c[0]-prev_cx)**2 + (c[2]-prev_cz)**2)
+        dist = math.sqrt((best[0]-prev_cx)**2 + (best[2]-prev_cz)**2)
+        return best if dist < tolerance else None
+
+    def _do_alignment_by_depth(self) -> tuple:
+        """基于深度点云聚类的精对齐
+
+        利用 map 期望位置 + 时序连续性从聚类中锁定正确目标，
+        PD 控制使其居中于相机正前方。
+
+        Returns:
+            (bool, str): (成功标志, 错误消息)
+        """
+        robot_pos, robot_yaw = self._get_robot_pose()
+        if robot_pos is None:
+            return False, "无法获取机器人位姿"
+
+        # 激活深度传感器
+        self.depth_sensor.activate()
+
+        # 预热: 等待前N帧稳定 (RealSense 自动曝光需要几帧收敛)
+        warmup = self.config.depth_warmup_frames
+        warmup_count = 0
+        warmup_start = time.time()
+        while warmup_count < warmup and time.time() - warmup_start < 3.0:
+            if self._cancel_requested:
+                return False, "被中断"
+            if self.depth_sensor.get_all_cluster_centroids() is not None:
+                warmup_count += 1
+            time.sleep(0.1)
+
+        # 等待首次有效聚类结果 (最多5秒)
+        wait_start = time.time()
+        clusters = []
+        while time.time() - wait_start < 5.0:
+            if self._cancel_requested:
+                return False, "被中断"
+            clusters = self.depth_sensor.get_all_cluster_centroids()
+            if clusters:
+                break
+            time.sleep(0.1)
+
+        if not clusters:
+            self.get_logger().warn("深度聚类无结果，跳过精对齐")
+            return True, ""
+
+        # 选择: map期望 > 时序连续，无匹配则跳过
+        exp_cx, exp_cz = self._map_to_camera(
+            self.target_map_position, robot_pos, robot_yaw)
+        best = self._select_cluster(clusters, robot_pos, robot_yaw)
+
+        if best is None:
+            self.get_logger().warn(
+                f"无匹配聚类 (期望cam=({exp_cx:.3f},{exp_cz:.3f}), "
+                f"共{len(clusters)}个聚类)，跳过精对齐，保留map粗对齐")
+            return True, ""
+
+        cx, cy, cz = best
+        self.get_logger().info(
+            f"选定目标聚类: cam_x={cx:.3f}m cam_z={cz:.3f}m "
+            f"期望cam=({exp_cx:.3f},{exp_cz:.3f}) "
+            f"共{len(clusters)}个聚类"
+        )
+
+        # 相机横向偏移补偿 (向左为正)
+        camera_offset = self.config.camera_lateral_offset
+        if abs(camera_offset) > 0.001:
+            self.get_logger().info(f"相机横向偏移补偿: {camera_offset * 100:.1f}cm")
+
+        # PD 控制循环 — 对齐到目标聚类中心
+        loop_dt = 0.05                  # 20 Hz
+        start_time = time.time()
+        last_error = 0.0
+        last_time = start_time
+        current_omega = 0.0             # 平滑用
+        prev_cx, prev_cz = cx, cz      # 时序连续性
+
+        while rclpy.ok() and not self._cancel_requested:
+            current_time = time.time()
+
+            if current_time - start_time > self.config.align_timeout:
+                self._stop_robot()
+                return False, "精对齐超时"
+
+            robot_pos, robot_yaw = self._get_robot_pose()
+            if robot_pos is None:
+                time.sleep(loop_dt)
+                continue
+
+            clusters = self.depth_sensor.get_all_cluster_centroids()
+            if not clusters:
+                time.sleep(loop_dt)
+                continue
+
+            best = self._select_cluster(
+                clusters, robot_pos, robot_yaw, prev_cx, prev_cz)
+            if best is None:
+                time.sleep(loop_dt)
+                continue
+            cx, cy, cz = best
+            prev_cx, prev_cz = cx, cz
+
+            # 角度误差: cx>0 → 偏右 → 需右转 (omega<0)
+            # camera_offset 补偿相机与机器人中心线的横向偏移
+            error = -math.atan2(cx - camera_offset, cz)
+
+            if abs(error) < self.config.align_tolerance:
+                self._stop_robot()
+                # 保存锁定种子，供阶段3继承
+                self._locked_target_cx = cx
+                self._locked_target_cz = cz
+                self.get_logger().info(
+                    f"精对齐完成，误差: {math.degrees(error):.2f}°, "
+                    f"目标距离: {cz:.3f}m"
+                )
+                return True, ""
+
+            # PD 控制
+            actual_dt = current_time - last_time
+            if actual_dt > 0.001:
+                d_error = (error - last_error) / actual_dt
+            else:
+                d_error = 0.0
+
+            target_omega = self.config.align_kp * error + self.config.align_kd * d_error
+            target_omega = max(-self.config.align_max_omega,
+                               min(self.config.align_max_omega, target_omega))
+
+            # 角加速度限幅 — 平滑omega变化，防止突变导致晃动
+            max_delta = self.config.align_max_alpha * loop_dt
+            omega_diff = target_omega - current_omega
+            if abs(omega_diff) > max_delta:
+                current_omega += max_delta if omega_diff > 0 else -max_delta
+            else:
+                current_omega = target_omega
+
+            # 死区 — 极小omega不足以克服摩擦力，发0避免电机抖动
+            cmd = Twist()
+            if abs(current_omega) >= self.config.align_min_omega:
+                cmd.angular.z = current_omega
+            self.cmd_vel_pub.publish(cmd)
+
+            last_error = error
+            last_time = current_time
+            time.sleep(loop_dt)
+
+        self._stop_robot()
+        return False, "被中断"
+
+    def _do_alignment_by_map(self) -> tuple:
+        """回退方案: 基于地图坐标的对齐
+
+        使用 self.target_map_position 计算目标航向，PD 控制原地旋转对齐。
+
+        Returns:
+            (bool, str): (成功标志, 错误消息)
+        """
         robot_pos, robot_yaw = self._get_robot_pose()
         if robot_pos:
             dx = self.target_map_position.x - robot_pos.x
@@ -396,56 +701,58 @@ class ApproachNavigator(Node):
                 self.get_logger().info(f"距离过近 ({dist:.3f}m)，跳过对齐")
                 return True, ""
 
-        # 控制循环 — 用 time.sleep 替代 create_rate().sleep()，
-        # 后者依赖 executor generator，在 worker 线程中有并发风险。
         loop_dt = 0.05                  # 20 Hz
         start_time = time.time()
-        last_error = 0.0                # 上次角度误差
-        last_time = start_time          # 上次时间
+        last_error = 0.0
+        last_time = start_time
+        current_omega = 0.0             # 平滑用
 
         while rclpy.ok() and not self._cancel_requested:
             current_time = time.time()
 
-            # 超时检查
             if current_time - start_time > self.config.align_timeout:
                 self._stop_robot()
                 return False, "对齐超时"
 
-            # 获取当前位姿
             robot_pos, robot_yaw = self._get_robot_pose()
             if robot_pos is None:
                 time.sleep(loop_dt)
                 continue
 
-            # 计算角度误差
             dx = self.target_map_position.x - robot_pos.x
             dy = self.target_map_position.y - robot_pos.y
-            target_yaw = math.atan2(dy, dx)                     # 目标航向
-            error = normalize_angle(target_yaw - robot_yaw)     # 角度误差
+            target_yaw = math.atan2(dy, dx)
+            error = normalize_angle(target_yaw - robot_yaw)
 
-            # 检查是否已对齐
             if abs(error) < self.config.align_tolerance:
                 self._stop_robot()
-                self.get_logger().info(f"对齐完成，误差: {math.degrees(error):.2f}°")
+                self.get_logger().info(f"对齐完成 (地图回退)，误差: {math.degrees(error):.2f}°")
                 return True, ""
 
-            # PD 控制
             actual_dt = current_time - last_time
             if actual_dt > 0.001:
-                d_error = (error - last_error) / actual_dt      # 误差变化率
+                d_error = (error - last_error) / actual_dt
             else:
                 d_error = 0.0
 
-            # 计算角速度
-            omega = self.config.align_kp * error + self.config.align_kd * d_error
-            omega = max(-self.config.align_max_omega, min(self.config.align_max_omega, omega))
+            target_omega = self.config.align_kp * error + self.config.align_kd * d_error
+            target_omega = max(-self.config.align_max_omega,
+                               min(self.config.align_max_omega, target_omega))
 
-            # 发布速度
+            # 角加速度限幅
+            max_delta = self.config.align_max_alpha * loop_dt
+            omega_diff = target_omega - current_omega
+            if abs(omega_diff) > max_delta:
+                current_omega += max_delta if omega_diff > 0 else -max_delta
+            else:
+                current_omega = target_omega
+
+            # 死区
             cmd = Twist()
-            cmd.angular.z = omega
+            if abs(current_omega) >= self.config.align_min_omega:
+                cmd.angular.z = current_omega
             self.cmd_vel_pub.publish(cmd)
 
-            # 更新状态
             last_error = error
             last_time = current_time
             time.sleep(loop_dt)
@@ -468,6 +775,13 @@ class ApproachNavigator(Node):
         Returns:
             (bool, str, float): (成功标志, 错误消息, 最终距离)
         """
+        self.depth_sensor.activate()
+        try:
+            return self._do_final_approach_impl()
+        finally:
+            self.depth_sensor.deactivate()
+
+    def _do_final_approach_impl(self) -> tuple:
         loop_dt = 1.0 / self.config.control_rate   # time.sleep 替代 create_rate
         start_time = time.time()
 
@@ -480,6 +794,10 @@ class ApproachNavigator(Node):
         current_speed = 0.0  # 从0开始，逐渐加速
         max_accel = 0.15     # 最大加速率 m/s²
         max_decel = 0.3      # 最大减速率 m/s²
+
+        # 横向修正参数
+        lateral_kp = 0.3     # 横向修正 P 增益 (保守，避免蛇行)
+        camera_offset = self.config.camera_lateral_offset
 
         # 记录 odom 起始位置，用于实际行驶距离测量
         with self._odom_lock:
@@ -496,14 +814,36 @@ class ApproachNavigator(Node):
         target_distance: float = None           # 目标距离 (相对初始位置)
         total_traveled: float = 0.0             # 累计行驶距离
 
+        # P1b: 中位数滤波窗口 (取最近 5 帧的中位数，抗单帧噪声)
+        from collections import deque
+        depth_window: deque = deque(maxlen=5)
+
+        # 最近目标跟踪 (单调递减: 只有更近才更新)
+        tracked_cx = None
+        tracked_cz = None
+
         while rclpy.ok() and not self._cancel_requested:
             # 超时检查
             if time.time() - start_time > self.config.final_approach_timeout:
                 self._stop_robot()
                 return False, "接近超时", 0.0
 
-            # 获取最近障碍物深度
-            obstacle_x = self.depth_sensor.get_target_depth()
+            # (A) 安全急停：获取任意最近障碍物距离
+            nearest_any = self.depth_sensor.get_nearest_obstacle()
+            nearest_any_z = nearest_any[2] if nearest_any else None
+
+            # (B) 选择最近聚类，仅比当前更近时才更新
+            clusters = self.depth_sensor.get_all_cluster_centroids()
+            obstacle_x = None
+            lateral_cx = None
+
+            if clusters:
+                nearest = min(clusters, key=lambda c: c[2])
+                # 容差 3cm: 允许深度噪声抖动，防止间歇丢失横向修正
+                if tracked_cz is None or nearest[2] <= tracked_cz + 0.03:
+                    tracked_cx, tracked_cz = nearest[0], nearest[2]
+                    obstacle_x = tracked_cz
+                    lateral_cx = tracked_cx
 
             # 累计行驶距离: 优先用 odom 位置差，不可用时回退到指令速度积分
             if use_odom:
@@ -512,20 +852,18 @@ class ApproachNavigator(Node):
                 total_traveled += current_speed * dt
 
             # ========== 距离估算 ==========
-            # 注意: obstacle_x 已经是到机器人前沿的距离（相机在机器人最前端）
             if target_distance is None:
                 # 使用用户确认时的初始深度
                 initial_depth = self.get_initial_depth()
                 if initial_depth is not None:
-                    target_distance = initial_depth  # 使用用户确认时的深度
+                    target_distance = initial_depth
                     total_traveled = 0.0
                     front_clearance = initial_depth
                     self.get_logger().info(
                         f"[初始化] target={target_distance:.3f}m (用户确认深度)"
                     )
                 elif obstacle_x is not None:
-                    # 如果没有初始深度，用当前深度
-                    target_distance = obstacle_x  # 直接用障碍物到相机的距离
+                    target_distance = obstacle_x
                     total_traveled = 0.0
                     front_clearance = obstacle_x
                     self.get_logger().info(
@@ -539,19 +877,20 @@ class ApproachNavigator(Node):
                     time.sleep(loop_dt)
                     continue
             else:
-                # 检查是否检测到更近的障碍物
+                # P1b: 中位数滤波更新 target_distance
                 if obstacle_x is not None:
-                    # obstacle_x 已经是到机器人前沿的距离
-                    current_clearance = obstacle_x
-                    # 转换为相对初始位置的距离
-                    obstacle_from_start = current_clearance + total_traveled
+                    obstacle_from_start = obstacle_x + total_traveled
+                    depth_window.append(obstacle_from_start)
 
-                    if obstacle_from_start < target_distance:
-                        # 检测到更近的障碍物，更新目标
-                        target_distance = obstacle_from_start
-                        self.get_logger().warn(
-                            f"[更新] 检测到更近障碍物! target={target_distance:.3f}m"
-                        )
+                    if len(depth_window) >= 3:
+                        median_dist = float(sorted(depth_window)[len(depth_window) // 2])
+                        if median_dist < target_distance:
+                            old = target_distance
+                            target_distance = median_dist
+                            self.get_logger().warn(
+                                f"[更新] 更近障碍物 (中位数): "
+                                f"{old:.3f}→{target_distance:.3f}m"
+                            )
 
                 # 开环计算当前距离
                 front_clearance = target_distance - total_traveled
@@ -562,6 +901,13 @@ class ApproachNavigator(Node):
                 )
 
             # ========== 停止条件 ==========
+            # 急停：任意障碍物 <= 3cm（无论是否为目标）
+            if nearest_any_z is not None and nearest_any_z <= self.config.emergency_stop_distance:
+                self._stop_robot()
+                self.get_logger().warn(
+                    f"紧急刹车! 最近障碍物: {nearest_any_z:.3f}m (深度)")
+                return True, "", min(front_clearance, nearest_any_z)
+
             if front_clearance <= self.config.emergency_stop_distance:
                 self._stop_robot()
                 self.get_logger().warn(f"紧急刹车! 距离: {front_clearance:.3f}m")
@@ -575,18 +921,14 @@ class ApproachNavigator(Node):
             # ========== 平滑速度控制 ==========
             remaining = front_clearance - self.config.final_approach_distance
 
-            # 开环模式最大速度
             max_speed = self.config.final_approach_speed
 
-            # 目标速度：基于剩余距离的平滑曲线
             if remaining > 0.3:
                 target_speed = max_speed
             else:
-                # sqrt 曲线平滑减速
                 ratio = remaining / 0.3
                 target_speed = 0.02 + (max_speed - 0.02) * math.sqrt(ratio)
 
-            # 速度平滑：限制加速和减速率
             speed_diff = target_speed - current_speed
             if speed_diff > 0:
                 max_change = max_accel * dt
@@ -595,13 +937,19 @@ class ApproachNavigator(Node):
                 max_change = max_decel * dt
                 current_speed += max(speed_diff, -max_change)
 
-            # 确保速度在合理范围
             current_speed = max(0.0, min(max_speed, current_speed))
 
-            # 发布速度
+            # ========== P1a: 横向修正 ==========
+            angular_z = 0.0
+            if lateral_cx is not None:
+                lateral_error = -math.atan2(lateral_cx - camera_offset, obstacle_x)
+                angular_z = lateral_kp * lateral_error
+                # 限幅：前进中微调，不要大幅转向
+                angular_z = max(-0.15, min(0.15, angular_z))
+
             cmd = Twist()
             cmd.linear.x = current_speed
-            cmd.angular.z = 0.0
+            cmd.angular.z = angular_z
             self.cmd_vel_pub.publish(cmd)
 
             time.sleep(loop_dt)

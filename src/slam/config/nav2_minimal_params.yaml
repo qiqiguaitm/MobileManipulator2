@@ -1,12 +1,9 @@
 # Nav2 配置: Smac 2D + MPPI (备选: TEB)
 # 适用于二轮差速室内机器人
 #
-# 切换控制器: 当前使用 MPPI，TEB 配置在 controller_server 末尾注释保留
-#   切回 TEB: 注释 MPPI FollowPath 块，取消注释 TEB FollowPath 块
-#
 # ⚠️ WARNING: 机器人足迹配置同步！
 #   MPPI: 2 处 (local_costmap.footprint + global_costmap.footprint)
-#   TEB:  3 处 (上述 2 处 + FollowPath.footprint_model.vertices)
+#   TEB:  3 处 (local_costmap.footprint + global_costmap.footprint + FollowPath.footprint_model.vertices)
 # 当前尺寸: 0.809m x 0.62m
 # 前边缘 x=0.434 (相机光学中心0.394m + 4cm安全余量)
 # 后边缘 x=-0.375
@@ -46,12 +43,12 @@ planner_server:
         tolerance: 1.0e-10
 
 # ==================== 局部控制器: MPPI ====================
-# 采样式控制器，替代 TEB 的单弹性带优化
-# 优势: 无局部最优/无震荡/原生costmap集成/天然多路径探索
+# 采样式控制器，天然适合差速底盘非线性约束
+# 相比 TEB: 不需要显式足迹多边形(用 costmap 碰撞检测)，窄通道更稳定
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 20.0           # 20Hz，MPPI 要求 period <= model_dt (0.05s)
+    controller_frequency: 20.0           # 20Hz, 匹配 model_dt=0.05s
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
@@ -62,8 +59,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.3      # 0.5→0.3: 室内小距离移动也应算进展
+      movement_time_allowance: 15.0      # 15s 宽容窗口 (MPPI 不需要 TEB 的震荡恢复)
 
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -73,224 +70,225 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
-
-      # ==================== 采样参数 ====================
-      # 10m×10m 室内优化: 缩短视野、减少采样、更贪婪
-      time_steps: 48                     # 轨迹步数 (56→48, 视野2.4s, 室内够用)
-      model_dt: 0.05                     # 步长 50ms → 规划视野 2.4s
-      batch_size: 1000                   # 采样轨迹数 (1500→1000, 小空间不需过多探索)
-      iteration_count: 2                 # 每周期优化迭代次数
-      temperature: 0.25                  # 选择贪婪度 (0.3→0.25, 更贪婪=更稳定轨迹)
-      gamma: 0.015                       # 轨迹代价折扣因子
-      motion_model: "DiffDrive"          # 差速运动模型
-      visualize: false                   # true 可在 RViz 看候选轨迹 (调试用)
-      regenerate_noises: false           # 复用噪声序列，更稳定
+      # ---- 采样参数 ----
+      time_steps: 56                     # 48→56: horizon=2.8s, 0.3m/s看0.84m (室内转弯需要)
+      model_dt: 0.05                     # 50ms 步长, 匹配 controller_frequency
+      batch_size: 800                    # 1000→800: Jetson CPU 减20%负载, 差速2DOF够用
+      iteration_count: 2                 # 2次迭代, 质量优于默认1次
+      temperature: 0.25                  # 适度贪心, 室内不需要太多探索
+      gamma: 0.015                       # 标准折扣因子
+      motion_model: "DiffDrive"
+      visualize: false
+      regenerate_noises: false
       retry_attempt_limit: 5
 
-      # ==================== 速度约束 ====================
-      # 参照 TEB: max_vel_x=0.3, max_vel_theta=0.5, acc_lim_x=0.5
-      # MPPI 无显式加速度限制，通过降低 wz_max + 收紧噪声 std 隐式约束
-      vx_max: 0.3                        # 最大前进速度 0.3m/s (与TEB一致)
-      vx_min: -0.3                       # 最大后退速度 = 前进速度, 遇障碍快速后退脱困
-      vy_max: 0.0                        # 差速机器人无横向速度
-      wz_max: 0.6                        # 最大角速度 (TEB=0.5, +0.1给MPPI采样余量)
+      # ---- 速度约束 ----
+      vx_max: 0.3                        # 与底盘一致
+      vx_min: -0.1                       # ⚠️ -0.3→-0.1: lidar仅前180°, 后方盲区, 限制后退速度
+      vy_max: 0.0                        # 差速: 无横移
+      wz_max: 0.5                        # ⚠️ 0.6→0.5: 与 behavior_server max_rotational_vel 同步
 
-      # ==================== 采样噪声 ====================
-      # 收紧噪声 = 隐式加速度约束 (MPPI无acc_lim，靠噪声控制平滑度)
-      vx_std: 0.15                       # 线速度噪声 (0.2→0.15, 50%of vx_max, 更精细)
-      vy_std: 0.0                        # 差速无横向
-      wz_std: 0.4                        # 角速度噪声 (0.6→0.4, 67%of wz_max, 转弯更平滑)
+      # ---- 噪声标准差 ----
+      vx_std: 0.15                       # vx_max 的 50%, 合理探索范围
+      vy_std: 0.0
+      wz_std: 0.3                        # 0.4→0.3: 匹配 wz_max 降低 (60% ratio)
 
-      # ==================== 路径修剪 ====================
-      prune_distance: 1.2               # 丢弃已通过路径段 (1.7→1.2, 小房间路径短)
+      # ---- 路径跟踪 ----
+      prune_distance: 1.5               # 1.2→1.5: 转弯时不过早丢弃路径点
       transform_tolerance: 0.1
 
       TrajectoryVisualizer:
         trajectory_step: 5
         time_step: 3
 
-      # ==================== 评价函数 (Critics) ====================
+      # ---- Critics ----
       critics: [
-        "ConstraintCritic",              # 运动学硬约束
-        "ObstaclesCritic",               # 障碍物斥力 (直接几何碰撞检测)
-        "CostCritic",                    # costmap 代价 (膨胀层感知)
-        "GoalCritic",                    # 趋向目标
-        "GoalAngleCritic",              # 到达时朝向对齐
-        "PathFollowCritic",              # 跟随全局路径
-        "PathAlignCritic",               # 轨迹-路径对齐
-        "PathAngleCritic",               # 航向与路径方向一致
-        "PreferForwardCritic"            # 优先前进 (差速关键)
+        "ConstraintCritic", "ObstaclesCritic", "CostCritic",
+        "GoalCritic", "GoalAngleCritic", "PathFollowCritic",
+        "PathAlignCritic", "PathAngleCritic", "PreferForwardCritic"
       ]
 
-      # --- 运动学约束 ---
       ConstraintCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 4.0                 # 违反约束的惩罚
+        cost_weight: 4.0
 
-      # --- 障碍物避让 (替代 TEB min_obstacle_dist=0.05) ---
-      # 室内加强: 障碍物密度高，需要更大安全距离
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 2.5            # 斥力权重 (1.5→2.5, 室内远离障碍物)
-        critical_weight: 20.0            # 极近距离时的惩罚权重
-        consider_footprint: true         # 用矩形足迹碰撞检测，非圆形近似
-        collision_cost: 10000.0          # 碰撞代价 (直接淘汰该轨迹)
-        collision_margin_distance: 0.08  # 足迹安全余量 (0.05→0.08, 再次剐蹭后加大)
-        near_goal_distance: 0.3          # 接近目标放宽距离 (0.5→0.3, 室内窄区到位前也要避障)
+        repulsion_weight: 2.5
+        critical_weight: 20.0
+        consider_footprint: true         # 矩形机器人必须开
+        collision_cost: 10000.0
+        collision_margin_distance: 0.10  # ⚠️ 0.12→0.10: 减小碰撞余量，缓解接近目标时死区
+        near_goal_distance: 0.5          # ⚠️ 0.3→0.5: 更早放松障碍惩罚，消除0.3-0.5m过渡带死区
 
-      # --- Costmap 代价 (感知膨胀层) ---
       CostCritic:
         enabled: true
         cost_power: 1
         cost_weight: 3.81
-        critical_cost: 300.0             # 高代价区域阈值
-        consider_footprint: true         # 矩形足迹检查
-        collision_cost: 1000000.0        # costmap 致命代价
-        near_goal_distance: 0.8          # 接近目标降敏 (1.0→0.8, 室内晚一点才放松)
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.8
 
-      # --- 到达目标 ---
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 1.4       # 距目标 <1.4m 时激活
+        cost_weight: 8.0                 # ⚠️ 5.0→8.0: 增强目标吸引力，克服接近时的阻力
+        threshold_to_consider: 1.2       # 1.4→1.2: 室内短距离, 早点吸引到目标
 
-      # --- 目标朝向 (替代 TEB yaw_goal_tolerance) ---
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.5                 # 3.0→3.5, 室内到位朝向更精确
-        threshold_to_consider: 0.5       # 距目标 <0.5m 时调整朝向
+        cost_weight: 3.5
+        threshold_to_consider: 0.5
 
-      # --- 路径跟随 (替代 TEB global_plan 跟踪) ---
       PathFollowCritic:
         enabled: true
         cost_power: 1
         cost_weight: 5.0
-        offset_from_furthest: 5          # 路径前方偏移点数
-        threshold_to_consider: 1.4       # 接近目标时关闭 (与 GoalCritic 一致)
+        offset_from_furthest: 6          # 5→6: 56步horizon, 微调追踪参考点
+        threshold_to_consider: 1.4
 
-      # --- 路径对齐 (轨迹方向与全局路径吻合) ---
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.0                # 与其他critic均衡 (14.0过高会主导代价函数)
-        max_path_occupancy_ratio: 0.05   # 路径被占用比例阈值
-        trajectory_point_step: 4         # 每隔 4 个轨迹点评估一次
+        cost_weight: 3.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
         threshold_to_consider: 0.5
-        offset_from_furthest: 20
-        use_path_orientations: false     # 不强制路径点朝向
+        offset_from_furthest: 12         # 20→12: 56步中只跳12步, 对齐检查覆盖更完整
+        use_path_orientations: false
 
-      # --- 航向角 (减少不必要的转向) ---
       PathAngleCritic:
         enabled: true
         cost_power: 1
         cost_weight: 2.0
         offset_from_furthest: 4
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.57      # 最大允许偏航 90°
-        mode: 1                          # 0→1, 允许前进/后退双向评估，不再罚死后退轨迹
+        max_angle_to_furthest: 1.57      # 90° 最大角度偏差
+        mode: 1
 
-      # --- 前进偏好 (差速机器人核心) ---
-      # 替代 TEB weight_kinematics_forward_drive=50 (相对尺度不同)
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 1.5                 # 2.5→1.5, 差速车后退代价低，室内常需后退调姿
-        threshold_to_consider: 0.6       # 0.4→0.6, 更早允许后退
+        cost_weight: 3.0                 # ⚠️ 1.5→3.0: 因为允许vx_min=-0.1, 需更强前向偏好
+        threshold_to_consider: 0.4       # ⚠️ 0.6→0.4: 接近目标时允许微调(后退/旋转)，不强制前向
 
-# ==================== [备用] 局部规划器: TEB ====================
-# 切换方法: 注释上方 FollowPath 整块 (L72-L197)，取消注释下方 FollowPath 块
-# 注意: TEB 需额外同步 footprint_model.vertices (第3处足迹配置)
+# ==================== [备用] 局部控制器: TEB ====================
+# 切换方法: 注释上方 MPPI controller_server 块，取消注释下方块
+# 注意 TEB 需要额外同步足迹: FollowPath.footprint_model.vertices
 #
-#    FollowPath:
-#      plugin: "teb_local_planner::TebLocalPlannerROS"
+# controller_server:
+#   ros__parameters:
+#     use_sim_time: false
+#     controller_frequency: 10.0           # TEB 典型 10Hz
+#     min_x_velocity_threshold: 0.001
+#     min_y_velocity_threshold: 0.5
+#     min_theta_velocity_threshold: 0.001
+#     failure_tolerance: 0.3
+#     progress_checker_plugins: ["progress_checker"]
+#     goal_checker_plugins: ["goal_checker"]
+#     controller_plugins: ["FollowPath"]
 #
-#      # ---- 机器人约束 ----
-#      max_vel_x: 0.3
-#      max_vel_x_backwards: 0.15
-#      max_vel_y: 0.0
-#      max_vel_theta: 0.5
-#      acc_lim_x: 0.5
-#      acc_lim_y: 0.0
-#      acc_lim_theta: 1.0
-#      min_turning_radius: 0.0
-#      wheelbase: 0.0
-#      cmd_angle_instead_rotvel: false
+#     progress_checker:
+#       plugin: "nav2_controller::SimpleProgressChecker"
+#       required_movement_radius: 0.3
+#       movement_time_allowance: 15.0
 #
-#      # ---- 足迹 (0.809m x 0.62m) ----
-#      footprint_model.type: "polygon"
-#      footprint_model.vertices: "[[-0.375, -0.31], [-0.375, 0.31], [0.434, 0.31], [0.434, -0.31]]"
+#     goal_checker:
+#       plugin: "nav2_controller::SimpleGoalChecker"
+#       xy_goal_tolerance: 0.10
+#       yaw_goal_tolerance: 0.175
+#       stateful: true
 #
-#      # ---- 目标容差 ----
-#      xy_goal_tolerance: 0.10
-#      yaw_goal_tolerance: 0.175
-#      free_goal_vel: false
+#     FollowPath:
+#       plugin: "teb_local_planner::TebLocalPlannerROS"
 #
-#      # ---- 路径跟踪 ----
-#      global_plan_overwrite_orientation: false
-#      global_plan_viapoint_sep: 0.5
-#      via_points_ordered: true
-#      max_global_plan_lookahead_dist: 2.0
+#       # ---- 机器人约束 ----
+#       max_vel_x: 0.3
+#       max_vel_x_backwards: 0.0
+#       max_vel_y: 0.0
+#       max_vel_theta: 0.5
+#       acc_lim_x: 0.5
+#       acc_lim_y: 0.0
+#       acc_lim_theta: 1.0
+#       min_turning_radius: 0.0
+#       wheelbase: 0.0
+#       cmd_angle_instead_rotvel: false
 #
-#      # ---- 轨迹参数 ----
-#      teb_autosize: 1.0
-#      dt_ref: 0.3
-#      dt_hysteresis: 0.1
-#      min_samples: 3
-#      allow_init_with_backwards_motion: false
+#       # ---- 足迹 (0.809m x 0.62m) ----
+#       footprint_model.type: "polygon"
+#       footprint_model.vertices: "[[-0.375, -0.31], [-0.375, 0.31], [0.434, 0.31], [0.434, -0.31]]"
 #
-#      # ---- 障碍物 ----
-#      min_obstacle_dist: 0.05
-#      inflation_dist: 0.2
-#      include_costmap_obstacles: true
-#      costmap_obstacles_behind_robot_dist: 1.0
-#      obstacle_poses_affected: 15
-#      include_dynamic_obstacles: false
+#       # ---- 目标容差 ----
+#       xy_goal_tolerance: 0.10
+#       yaw_goal_tolerance: 0.175
+#       free_goal_vel: false
 #
-#      # ---- 优化 ----
-#      no_inner_iterations: 3
-#      no_outer_iterations: 2
-#      optimization_activate: true
-#      optimization_verbose: false
-#      penalty_epsilon: 0.1
-#      weight_max_vel_x: 2.0
-#      weight_max_vel_theta: 1.0
-#      weight_acc_lim_x: 3.0
-#      weight_acc_lim_theta: 5.0
-#      weight_kinematics_nh: 1000.0
-#      weight_kinematics_forward_drive: 50.0
-#      weight_kinematics_turning_radius: 0.0
-#      weight_optimaltime: 0.5
-#      weight_shortest_path: 0.0
-#      weight_obstacle: 15.0
-#      weight_inflation: 0.1
-#      weight_dynamic_obstacle: 10.0
-#      weight_dynamic_obstacle_inflation: 0.2
-#      weight_viapoint: 5.0
-#      weight_adapt_factor: 2.0
+#       # ---- 路径跟踪 ----
+#       global_plan_overwrite_orientation: false
+#       global_plan_viapoint_sep: 0.5
+#       via_points_ordered: true
+#       max_global_plan_lookahead_dist: 2.0
 #
-#      # ---- 震荡恢复 ----
-#      oscillation_recovery: true
-#      oscillation_v_eps: 0.05
-#      oscillation_omega_eps: 0.05
-#      oscillation_recovery_min_duration: 5.0
-#      oscillation_filter_duration: 5.0
+#       # ---- 轨迹参数 ----
+#       teb_autosize: 1.0
+#       dt_ref: 0.3
+#       dt_hysteresis: 0.1
+#       min_samples: 3
+#       allow_init_with_backwards_motion: false
 #
-#      # ---- 可行性检查 ----
-#      feasibility_check_no_poses: 4
-#      publish_feedback: false
-#      shrink_horizon_backup: true
-#      shrink_horizon_min_duration: 3.0
+#       # ---- 障碍物 ----
+#       min_obstacle_dist: 0.05
+#       inflation_dist: 0.2
+#       include_costmap_obstacles: true
+#       costmap_obstacles_behind_robot_dist: 1.0
+#       obstacle_poses_affected: 15
+#       include_dynamic_obstacles: false
 #
-#      # ---- 并行规划 ----
-#      enable_homotopy_class_planning: false
-#      enable_multithreading: true
-#      max_number_classes: 2
-#      selection_cost_hysteresis: 1.0
-#      selection_prefer_initial_plan: 1.0
+#       # ---- 优化 ----
+#       no_inner_iterations: 3
+#       no_outer_iterations: 2
+#       optimization_activate: true
+#       optimization_verbose: false
+#       penalty_epsilon: 0.1
+#       weight_max_vel_x: 2.0
+#       weight_max_vel_theta: 1.0
+#       weight_acc_lim_x: 3.0
+#       weight_acc_lim_theta: 5.0
+#       weight_kinematics_nh: 1000.0
+#       weight_kinematics_forward_drive: 50.0
+#       weight_kinematics_turning_radius: 0.0
+#       weight_optimaltime: 0.5
+#       weight_shortest_path: 0.0
+#       weight_obstacle: 15.0
+#       weight_inflation: 0.1
+#       weight_dynamic_obstacle: 10.0
+#       weight_dynamic_obstacle_inflation: 0.2
+#       weight_viapoint: 5.0
+#       weight_adapt_factor: 2.0
+#
+#       # ---- 震荡恢复 ----
+#       oscillation_recovery: true
+#       oscillation_v_eps: 0.05
+#       oscillation_omega_eps: 0.05
+#       oscillation_recovery_min_duration: 5.0
+#       oscillation_filter_duration: 5.0
+#
+#       # ---- 可行性检查 ----
+#       feasibility_check_no_poses: 4
+#       publish_feedback: false
+#       shrink_horizon_backup: true
+#       shrink_horizon_min_duration: 3.0
+#
+#       # ---- 并行规划 ----
+#       enable_homotopy_class_planning: false
+#       enable_multithreading: true
+#       max_number_classes: 2
+#       selection_cost_hysteresis: 1.0
+#       selection_prefer_initial_plan: 1.0
 
 # ==================== Local Costmap ====================
 # 严格仿照 ROS1 costmap_3d_params.yaml
@@ -301,13 +299,13 @@ local_costmap:
       global_frame: odom                  # ROS1: odom (避开 map->odom TF 延迟)
       robot_base_frame: base_link
       transform_tolerance: 0.5            # 500ms 容忍 HDL/FastLIO 时间戳差异
-      update_frequency: 8.0               # ROS1: 8.0
-      publish_frequency: 0.5              # ROS1: 0.5
+      update_frequency: 5.0               # 降频减少Jetson CPU负载 (8→5Hz)
+      publish_frequency: 2.0              # 提高发布率，便于 RViz 调试 (0.5→2.0Hz)
       rolling_window: true
-      width: 4                            # 恢复4m，3m导致recovery行为"Pose Goes Off Grid"
-      height: 4
+      width: 8                            # 8m，扩大覆盖范围避免 spin/backup "Pose Goes Off Grid"
+      height: 8
       resolution: 0.05                    # ROS1: 0.05
-      # 矩形足迹: 0.809m x 0.62m (前边缘=相机+4cm余量 0.434m)
+      # 矩形 footprint: 0.809m x 0.62m (前边缘=相机+4cm余量 0.434m)
       footprint: "[[-0.375, -0.31], [-0.375, 0.31], [0.434, 0.31], [0.434, -0.31]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       # ROS1 local costmap 不使用 static_layer (rolling window场景)
@@ -324,14 +322,14 @@ local_costmap:
           clearing: true
           marking: true
           data_type: "LaserScan"
-          raytrace_max_range: 3.0          # ROS1: raytrace_range=3.0
+          raytrace_max_range: 4.0          # 扩大清除范围,覆盖 6m rolling window 的大部分区域
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5          # ROS1: obstacle_range=2.5
+          obstacle_max_range: 3.0          # 扩大标记范围 (2.5→3.0m), 匹配 raytrace
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.35             # >= 足迹内切圆0.32m，否则碰撞检测异常
+        inflation_radius: 0.30             # >= 足迹内切圆0.32m，否则碰撞检测异常
         cost_scaling_factor: 3.0           # 代价衰减平缓，给MPPI更多可行空间
 
 # ==================== Global Costmap ====================
@@ -344,38 +342,23 @@ global_costmap:
       robot_base_frame: base_link
       transform_tolerance: 0.5            # 500ms 容忍 HDL/FastLIO 时间戳差异
       update_frequency: 3.0               # ROS1: 3.0
-      publish_frequency: 0.5              # ROS1: 0.5
+      publish_frequency: 1.0              # 提高发布率，便于 RViz 调试 (0.5→1.0Hz)
       rolling_window: false               # ROS1: rolling_window=true+global_frame=odom，Nav2用static_map=map
       track_unknown_space: false          # ROS1: 不跟踪未知区域
       # 矩形足迹: 0.809m x 0.62m (前边缘=相机+4cm余量 0.434m)
       footprint: "[[-0.375, -0.31], [-0.375, 0.31], [0.434, 0.31], [0.434, -0.31]]"
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
+        map_topic: /map
         track_unknown_space: false        # ROS1: 不跟踪未知空间
         # ROS1 trinary_costmap=true, lethal_cost_threshold=100
-      # 实时障碍物层 (让全局规划器绕行临时障碍物)
-      obstacle_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
-        enabled: true                     # ROS1: enabled=true
-        footprint_clearing_enabled: true
-        track_unknown_space: false
-        observation_sources: "scan"
-        scan:
-          topic: /scan
-          max_obstacle_height: 1.5        # ROS1: 1.5
-          min_obstacle_height: 0.0        # ROS1: 0.0 (lidar高度约0.06m)
-          clearing: true
-          marking: true
-          data_type: "LaserScan"
-          raytrace_max_range: 5.0         # ROS1: raytrace_range=5.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 3.0         # ROS1: obstacle_range=3.0
-          obstacle_min_range: 0.0
+      # NOTE: obstacle_layer 已移除 — rolling_window=false 时激光障碍物永不清除,
+      #       导致幽灵障碍物。实时避障由 local_costmap (rolling_window=true) 处理。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.45            # ROS1: 0.45
+        inflation_radius: 0.40            # ROS1: 0.45
         cost_scaling_factor: 3.0          # ROS1: 3.0
 
 # ==================== 恢复行为服务器 ====================
@@ -387,15 +370,15 @@ behavior_server:
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.5
-    # 共享运动约束 (spin/backup 共用, 与 MPPI wz_max 同步)
-    max_rotational_vel: 0.6             # 与 MPPI wz_max 一致 (0.8→0.6)
+    # 共享运动约束 (spin/backup 共用, 与 MPPI wz_max=0.5 同步)
+    max_rotational_vel: 0.5             # 与 MPPI wz_max 一致
     min_rotational_vel: 0.15
-    rotational_acc_lim: 1.2             # 角加速度 (1.6→1.2, 参照TEB acc_lim_theta=1.0)
-    simulate_ahead_time: 1.5            # 碰撞预检 (2.0→1.5, 减少off-grid风险)
-    # backup 线速度约束 (修复 "no acceleration or deceleration limits set" 警告)
+    rotational_acc_lim: 1.2             # 角加速度
+    simulate_ahead_time: 1.5            # 碰撞预检 (减少off-grid风险)
+    # backup 线速度约束
     max_linear_vel: 0.2                  # 后退最大速度
     min_linear_vel: 0.05                 # 后退最小速度
-    linear_acc_lim: 0.5                  # 线加速度 (参照TEB acc_lim_x=0.5)
+    linear_acc_lim: 0.5                  # 线加速度
     behavior_plugins: ["spin", "backup", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"
@@ -411,6 +394,8 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom/fused
+    bt_loop_duration: 100              # BT tick 间隔 100ms (10Hz足够，减少CPU)
+    default_server_timeout: 500        # action server 响应超时 500ms (Jetson CPU吃紧)
     # 使用 GoalUpdated 的 BT，避免 Humble 中未注册的 GlobalUpdatedGoal 报错
     default_nav_to_pose_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
     default_nav_through_poses_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"

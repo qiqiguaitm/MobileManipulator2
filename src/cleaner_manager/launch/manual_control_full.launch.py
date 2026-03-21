@@ -35,7 +35,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
@@ -70,15 +70,32 @@ def generate_launch_description():
     cleaner_mgr_dir   = _pkg_dir('cleaner_manager')
 
     # ==================== Arguments ====================
+    # --- Mode condition helpers ---
+    mode = LaunchConfiguration('mode')
+    is_manual = IfCondition(PythonExpression(["'", mode, "' == 'manual'"]))
+    is_auto   = IfCondition(PythonExpression(["'", mode, "' == 'auto'"]))
+
     args = [
+        DeclareLaunchArgument('mode', default_value='manual',
+                              description="'manual' (手动控制) or 'auto' (自主清扫)"),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('gui', default_value='true'),
         DeclareLaunchArgument('use_odom_fusion', default_value='true'),
         DeclareLaunchArgument('launch_chassis', default_value='true'),
         DeclareLaunchArgument('detector_type', default_value='sam3',
                               description='sam3 or dinox'),
-        DeclareLaunchArgument('extrinsics_suffix', default_value='_stereo_hand',
+        DeclareLaunchArgument('extrinsics_suffix', default_value='',
                               description='Extrinsics file suffix'),
+        DeclareLaunchArgument('depth_source', default_value='combined',
+                              description="Depth source: 'combined' | 'foundation_stereo' | 'raw'"),
+        DeclareLaunchArgument('perception_rviz', default_value='true',
+                              description="启动感知可视化节点 (占~80% CPU, 自动模式可关闭)"),
+        DeclareLaunchArgument('top_detect_rate', default_value='5.0',
+                              description="顶部相机自动检测频率 (Hz), 0=禁用 (service模式设0)"),
+        DeclareLaunchArgument('chassis_detect_rate', default_value='6.0',
+                              description="底部相机自动检测频率 (Hz), 0=禁用 (service模式设0)"),
+        DeclareLaunchArgument('fusion_publish_rate', default_value='5.0',
+                              description="融合发布频率 (Hz), 0=禁用"),
     ]
 
     # ==================== Node / launch definitions ====================
@@ -108,7 +125,7 @@ def generate_launch_description():
             # matching ROS1). Set false here because Makefile usbreset already
             # cleans USB state before launching.
             'initial_reset':  'false',
-            'camera_delay':   '6.0',  # hand at 6s, chassis at 12s (staggered)
+            'camera_delay':   '8.0',  # hand at 8s, chassis at 16s (staggered, increased for USB stability)
             # Enable IR streams for all cameras (required for FoundationStereo stereo depth).
             'top_enable_infra':     'true',
             'chassis_enable_infra': 'true',
@@ -156,13 +173,14 @@ def generate_launch_description():
             {'chassis_color_topic':  '/camera/chassis/color/image_raw'},
             {'chassis_depth_topic':  '/camera/chassis/aligned_depth_to_color/image_raw'},
             {'chassis_info_topic':   '/camera/chassis/color/camera_info'},
-            {'top_detect_rate':     5.0},
-            {'chassis_detect_rate': 6.0},
-            {'fusion_publish_rate': 5.0},
-            {'default_prompt':      'bottle.cup.box.barrel.toy.cabinet'},
+            {'top_detect_rate':     LaunchConfiguration('top_detect_rate')},
+            {'chassis_detect_rate': LaunchConfiguration('chassis_detect_rate')},
+            {'fusion_publish_rate': LaunchConfiguration('fusion_publish_rate')},
+            {'default_prompt':      "can.vegetable.bottle.box.food.Rubik's cube.tool"},
             {'detector_type':       LaunchConfiguration('detector_type')},
             {'extrinsics_dir':      perception_config_dir},
             {'extrinsics_suffix':   LaunchConfiguration('extrinsics_suffix')},
+            {'depth_source':        LaunchConfiguration('depth_source')},
             {'data_max_age':          2.0},
             {'strict_data_freshness': False},
             {'fusion_distance_threshold': 0.3},
@@ -203,10 +221,12 @@ def generate_launch_description():
     )
 
     # Perception RViz visualization (detection images + 3D markers)
+    # 占 ~80% CPU (一个核), 自动模式下可通过 perception_rviz:=false 关闭
     perception_rviz_node = Node(
         package='perception',
         executable='multi_camera_rviz_node',
         name='multi_camera_rviz',
+        condition=IfCondition(LaunchConfiguration('perception_rviz')),
         parameters=[{
             'enable_top':       True,
             'enable_chassis':   True,
@@ -216,7 +236,8 @@ def generate_launch_description():
             'image_scale':      0.5,
             'depth_max':        5.0,
             'extrinsics_dir':   perception_config_dir,
-            'extrinsics_suffix': '_stereo_hand',
+            'extrinsics_suffix': LaunchConfiguration('extrinsics_suffix'),
+            'enable_fused_viz': False,
         }],
         output='log',
     )
@@ -227,7 +248,9 @@ def generate_launch_description():
         executable='manual_control_node.py',
         name='manual_control_node',
         parameters=[manual_config],
+        prefix='nice -n 5 ',
         output='screen',
+        condition=is_manual,
     )
 
     cleaner_manager_node = Node(
@@ -235,7 +258,9 @@ def generate_launch_description():
         executable='cleaner_manager_node.py',
         name='cleaner_manager_node',
         parameters=[manual_config],
-        output='log',
+        prefix='nice -n 5 ',
+        output='screen',
+        condition=is_auto,
     )
 
     object_selector_node = Node(
@@ -243,6 +268,7 @@ def generate_launch_description():
         executable='object_selector_node.py',
         name='object_selector_node',
         output='log',
+        condition=is_manual,
     )
 
     # RViz — use ExecuteProcess directly; Node+IfCondition silently skips
@@ -252,6 +278,7 @@ def generate_launch_description():
     rviz_proc = ExecuteProcess(
         cmd=['rviz2', '-d', rviz_config, '--ros-args', '--log-level', 'WARN'],
         additional_env={'DISPLAY': display},
+        prefix='nice -n 15 ',
         output='screen',
     )
 
@@ -273,8 +300,8 @@ def generate_launch_description():
         timeout=30)
 
     manual_gate = _ready_gate(
-        '手动控制',
-        'ros2 node list 2>/dev/null | grep -q manual_control_node',
+        '控制节点',
+        'ros2 node list 2>/dev/null | grep -qE "manual_control_node|cleaner_manager_node"',
         timeout=15)
 
     # ==================== Build (event-driven sequential startup) ====================
@@ -323,7 +350,7 @@ def generate_launch_description():
         target_action=perception_gate,
         on_exit=[
             LogInfo(msg=''),
-            LogInfo(msg='[阶段 3] 手动控制 + 自主模式 + GUI...'),
+            LogInfo(msg='[阶段 3] 控制节点...'),
             manual_node,
             cleaner_manager_node,
             object_selector_node,
@@ -348,7 +375,7 @@ def generate_launch_description():
             LogInfo(msg='  [x] 相机 (Top + Hand + Chassis)'),
             LogInfo(msg='  [x] 机械臂 (Piper)'),
             LogInfo(msg='  [x] 感知 (multi_camera_perception + rviz可视化)'),
-            LogInfo(msg='  [x] 手动控制 (ManualControlNode + CleanerManagerNode)'),
+            LogInfo(msg='  [x] 控制节点'),
             LogInfo(msg='  [x] RViz'),
             LogInfo(msg=''),
             LogInfo(msg='操作提示:'),

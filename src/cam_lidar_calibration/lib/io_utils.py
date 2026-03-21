@@ -9,19 +9,28 @@ import yaml
 from scipy.spatial.transform import Rotation
 
 
-def load_extrinsics(yaml_path):
-    """加载外参文件"""
+def load_extrinsics(yaml_path, as_point_transform=False):
+    """加载外参文件 (TF约定格式)
+
+    Args:
+        yaml_path: YAML文件路径
+        as_point_transform: True 时返回点变换形式 (P_cam = R @ P_lidar + t)，
+                           False 时返回原始 TF 约定 (R_tf, t_tf)
+    """
     with open(yaml_path, 'r') as f:
         data = yaml.safe_load(f)
 
     t = data['transform']['translation']
     r = data['transform']['rotation']
 
-    translation = np.array([t['x'], t['y'], t['z']])
+    t_tf = np.array([t['x'], t['y'], t['z']])
     quat = [r['x'], r['y'], r['z'], r['w']]  # xyzw
-    rotation = Rotation.from_quat(quat).as_matrix()
+    R_tf = Rotation.from_quat(quat).as_matrix()
 
-    return rotation, translation
+    if as_point_transform:
+        return R_tf.T, -R_tf.T @ t_tf
+
+    return R_tf, t_tf
 
 
 def load_intrinsics(yaml_path):
@@ -70,13 +79,17 @@ def load_pcd(pcd_path):
 
 
 def save_extrinsics(yaml_path, R, t, frame_id='rs16_lidar', child_frame_id='camera_optical_frame',
-                    n_frames=0, method='interactive_multi_frame'):
-    """保存外参到YAML文件 (TF约定格式)"""
+                    n_frames=0, method='interactive_multi_frame', calibration_date=None):
+    """保存外参到YAML文件 (TF约定格式)
+
+    Args:
+        calibration_date: 标定日期字符串，默认取当天日期
+    """
     quat = Rotation.from_matrix(R).as_quat()  # xyzw
 
     result = {
         'header': {
-            'calibration_date': str(np.datetime64('today')),
+            'calibration_date': calibration_date or str(np.datetime64('today')),
             'method': method,
             'n_frames': n_frames
         },

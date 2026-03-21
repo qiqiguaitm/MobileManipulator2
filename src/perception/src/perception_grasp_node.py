@@ -157,7 +157,7 @@ class PerceptionGraspNode(Node):
         realtime_cfg = self.config.get('trigger', {}).get('realtime_mode', {})
         self._realtime_enabled = realtime_cfg.get('enabled', False)
         self._realtime_rate = realtime_cfg.get('rate', 1.0)  # 默认1Hz以降低计算负载
-        self._realtime_prompt = realtime_cfg.get('default_prompt', 'pen.box.phone.bottle.toy')
+        self._realtime_prompt = realtime_cfg.get('default_prompt', "can.vegetable.bottle.box.food.Rubik's cube.tool")
         self._realtime_enable_cdm = self.config.get('services', {}).get('cdm', {}).get('enabled', True)
 
         # === 结果发布器 ===
@@ -386,6 +386,7 @@ class PerceptionGraspNode(Node):
         else:
             response.error_message = result.get('error_message', 'Detection failed')
         response.detection_time_ms = result.get('detection_time_ms', 0.0)
+        response.all_objects = result.get('all_objects', [])
         return response
 
     def detect(self, prompt, enable_cdm=True, wait_for_lock=True, verbose=True):
@@ -597,7 +598,8 @@ class PerceptionGraspNode(Node):
                     'score': chosen.grasp_score,
                     'center_uv': list(chosen.grasp_center),
                     'depth_value': chosen.depth,
-                    'detection_time_ms': detection_time_ms
+                    'detection_time_ms': detection_time_ms,
+                    'all_objects': grasp_objects,  # 批量结果
                 }
                 if verbose:
                     self.log.info(f"DETECT: Success: category={chosen.category}, "
@@ -607,7 +609,8 @@ class PerceptionGraspNode(Node):
                 result = {
                     'success': False,
                     'error_message': 'No valid grasp found',
-                    'detection_time_ms': detection_time_ms
+                    'detection_time_ms': detection_time_ms,
+                    'all_objects': [],
                 }
                 if verbose:
                     self.log.warn(f"DETECT: Failed: No valid grasp, time={detection_time_ms:.0f}ms")

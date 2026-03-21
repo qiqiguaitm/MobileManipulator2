@@ -255,7 +255,9 @@ class PiperAPI:
                      roll: float = None, pitch: float = None, yaw: float = None,
                      speed: int = 30, wait: bool = True,
                      use_gripper_center: bool = True,
-                     linear: bool = False) -> bool:
+                     linear: bool = False,
+                     timeout: float = 5.0,
+                     tolerance: int = 5000) -> bool:
         """
         Set end effector position
 
@@ -325,14 +327,13 @@ class PiperAPI:
             mode_name = "MoveL" if linear else "MoveJ"
             # print(f"[PiperAPI] {mode_name} to target, speed={safe_speed}%")
 
-            # Send command (official pattern)
-            self.piper.MotionCtrl_1(0x00, 0x00, 0x00)  # Prepare
+            # Send command (official pattern: MotionCtrl_2 + EndPoseCtrl)
             self.piper.MotionCtrl_2(0x01, move_mode, safe_speed, 0x00)  # Cartesian mode
             self.piper.EndPoseCtrl(*target)
 
             if wait:
-                return self._wait_position_reached(target, timeout=5.0, speed=safe_speed,
-                                                   move_mode=move_mode)
+                return self._wait_position_reached(target, timeout=timeout, speed=safe_speed,
+                                                   move_mode=move_mode, tolerance=tolerance)
             else:
                 time.sleep(0.1)
                 return True
@@ -344,58 +345,97 @@ class PiperAPI:
     def _wait_position_reached(self, target, timeout: float = 5.0,
                                 tolerance: int = 5000, speed: int = 30,
                                 move_mode: int = 0x00) -> bool:
-        """Wait for position to be reached
+        """Wait for arm to reach target using dual-track detection.
 
-        Good Taste: Check for errors early, don't wait for timeout
+        Uses GetArmStatus().motion_status (CAN 0x2A1 Byte4):
+            0x00 = reached target position
+            0x01 = not yet reached
+
+        Detection strategy (dual-track, parallel):
+            1. motion_status transition: track 0x01→0x00, require 2 consecutive
+               0x00 reads to filter stale CAN data from previous command
+            2. Position check: independent of motion_status, runs after grace
+               period — catches firmware bugs where motion_status stays 0x01
+            Either path returning True is sufficient.
+
+        Safety:
+            - Error detection: arm_status 0x02/0x03/0x04, joint limit bits
+            - Resend once at 1s if firmware never started moving
 
         Args:
             target: Target position in SDK units
             timeout: Maximum wait time in seconds
-            tolerance: Position tolerance in SDK units (0.001mm)
+            tolerance: Position tolerance in SDK units (fallback check)
             speed: Motion speed 1-100%
             move_mode: Motion mode (0x00=MoveJ, 0x02=MoveL)
         """
-        start_time = time.time()
-        resend_interval = 0.2
-        last_resend = 0
-        last_current = None
+        start = time.time()
+        resent = False
+        seen_moving = False  # True once we observe motion_status == 0x01
+        reached_count = 0  # consecutive 0x00 reads after seen_moving
+        REACHED_CONFIRM = 2  # require N consecutive 0x00 to confirm arrival
+        ERROR_GRACE = 0.3  # ignore transient TARGET_LIMIT right after command
+        RESEND_DEADLINE = 1.0  # firmware mode switch takes ~100ms; 1s is safe margin
 
-        while time.time() - start_time < timeout:
-            # Good Taste: Check error state early (don't wait for timeout)
-            has_error, error_type = self._get_error_type()
-            if has_error:
-                if error_type == "TARGET_LIMIT":
-                    print(f"[PiperAPI] ✗ Target position exceeds limit (detected in {time.time()-start_time:.2f}s)")
-                    return False
-                elif "JOINT_LIMIT" in error_type:
-                    print(f"[PiperAPI] ✗ Joint limit triggered: {error_type}")
-                    return False
-                # Other errors - continue waiting (might be transient)
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                break
 
-            current = self._get_current_pose()
+            status = self.piper.GetArmStatus()
+            arm_st = status.arm_status.arm_status
+            motion_st = status.arm_status.motion_status
 
-            pos_ok = all(abs(current[i] - target[i]) < tolerance for i in range(3))
+            # Error detection — fail fast
+            if arm_st == 0x04 and elapsed >= ERROR_GRACE:  # TARGET_POS_EXCEEDS_LIMIT
+                print(f"[PiperAPI] ✗ Target limit (t={elapsed:.2f}s)")
+                return False
+            if arm_st in (0x02, 0x03):  # NO_SOLUTION, SINGULARITY
+                print(f"[PiperAPI] ✗ Arm error: 0x{int(arm_st):02X} (t={elapsed:.2f}s)")
+                return False
+            if status.arm_status.err_code & 0x3F00:  # Joint limit bits
+                joints = [f"J{i+1}" for i in range(6)
+                          if status.arm_status.err_code & (1 << (8 + i))]
+                print(f"[PiperAPI] ✗ Joint limit: {','.join(joints)}")
+                return False
 
-            # Check orientation (simplified)
-            angle_ok = all(self._angle_diff(current[i], target[i]) < 3000 for i in range(3, 6))
+            if motion_st == 0x01:
+                seen_moving = True
+                reached_count = 0  # reset: arm still moving
 
-            if pos_ok and angle_ok:
-                time.sleep(0.2)  # Stabilization
-                return True
+            # Reached target: require N consecutive 0x00 reads after seen_moving
+            # to filter out stale CAN bus data from previous command completion
+            if motion_st == 0x00 and seen_moving:
+                reached_count += 1
+                if reached_count >= REACHED_CONFIRM:
+                    return True
 
-            # Resend command periodically (preserve move_mode)
-            elapsed = time.time() - start_time
-            if elapsed - last_resend > resend_interval:
+            # Position check: independent of motion_status
+            # Firmware may keep motion_status=0x01 even after arm reaches target,
+            # so always check position once arm started moving or after grace period.
+            if elapsed > ERROR_GRACE:
+                current = self._get_current_pose()
+                if all(abs(current[i] - target[i]) < tolerance for i in range(3)):
+                    return True
+
+            # Command lost / mode-switch drop: resend once after deadline
+            if elapsed > RESEND_DEADLINE and not resent and not seen_moving:
+                print(f"[PiperAPI] ⚠ No motion after {RESEND_DEADLINE}s, resending command")
                 self.piper.MotionCtrl_2(0x01, move_mode, speed, 0x00)
                 self.piper.EndPoseCtrl(*target)
-                last_resend = elapsed
+                resent = True
 
-            last_current = current
             time.sleep(0.05)
 
-        # Timeout - check if arm moved at all
-        diff = [abs(current[i] - target[i]) / 1000 for i in range(3)]
-        print(f"[PiperAPI] ⚠ Position timeout ({timeout}s), diff: [{diff[0]:.1f}, {diff[1]:.1f}, {diff[2]:.1f}]mm")
+        # Timeout — log position for diagnosis
+        try:
+            current = self._get_current_pose()
+            diff = [abs(current[i] - target[i]) / self.FACTOR for i in range(3)]
+            print(f"[PiperAPI] ✗ Timeout ({timeout}s), motion_status=0x{int(motion_st):02X}, "
+                  f"seen_moving={seen_moving}, diff=[{diff[0]:.1f},{diff[1]:.1f},{diff[2]:.1f}]mm")
+        except Exception:
+            print(f"[PiperAPI] ✗ Timeout ({timeout}s), motion_status=0x{int(motion_st):02X}, "
+                  f"seen_moving={seen_moving}")
         return False
 
     def move_z_segmented(self, target_z: float, max_step: float = 60,
@@ -427,19 +467,35 @@ class PiperAPI:
 
         _, current_pos = self.get_position(return_gripper_center=use_gripper_center)
         current_z = current_pos[2]
-        # Lock XY to current position (prevent drift)
+        # Lock XY and orientation from initial state.
+        # Orientation MUST be locked: roll near ±180° causes sign-flip between segments
+        # (179.9° → -179.9°), and firmware interprets the flip as a 360° J4 rotation.
         locked_x = current_pos[0]
         locked_y = current_pos[1]
+        locked_roll  = current_pos[3]
+        locked_pitch = current_pos[4]
+        locked_yaw   = current_pos[5]
         delta_z = target_z - current_z
+
+        # Per-segment timeout: shorter than global 10s because each segment is small.
+        # Arm completes a 60mm step in ~3s at 20% speed. Post-timeout (3s) confirms if main
+        # loop missed due to CAN resend cache stall. Total ~5s reliable per segment.
+        # Tolerance 8mm (flange): handles pitch-induced coordinate conversion offset
+        # where GC error ~5mm maps to flange error ~5.5mm, just over 5mm strict threshold.
+        seg_timeout = 5.0
+        seg_tolerance = 8000  # 8mm in SDK units (0.001mm)
 
         # If distance is small, direct move
         if abs(delta_z) <= max_step:
             if lock_xy:
-                return self.set_position(x=locked_x, y=locked_y, z=target_z, speed=speed,
-                                         use_gripper_center=use_gripper_center, linear=False)
+                return self.set_position(x=locked_x, y=locked_y, z=target_z,
+                                         roll=locked_roll, pitch=locked_pitch, yaw=locked_yaw,
+                                         speed=speed, use_gripper_center=use_gripper_center,
+                                         linear=False, timeout=seg_timeout, tolerance=seg_tolerance)
             else:
                 return self.set_position(z=target_z, speed=speed,
-                                         use_gripper_center=use_gripper_center, linear=False)
+                                         use_gripper_center=use_gripper_center, linear=False,
+                                         timeout=seg_timeout, tolerance=seg_tolerance)
 
         # Calculate segments
         num_segments = int(abs(delta_z) / max_step) + 1
@@ -455,13 +511,16 @@ class PiperAPI:
             else:
                 segment_z = current_z + step_size * (i + 1)
 
-            # Use MoveJ for each segment, with XY locked to prevent drift
+            # Use MoveJ for each segment, with XY and orientation locked to prevent drift
             if lock_xy:
-                success = self.set_position(x=locked_x, y=locked_y, z=segment_z, speed=speed,
-                                            use_gripper_center=use_gripper_center, linear=False)
+                success = self.set_position(x=locked_x, y=locked_y, z=segment_z,
+                                            roll=locked_roll, pitch=locked_pitch, yaw=locked_yaw,
+                                            speed=speed, use_gripper_center=use_gripper_center,
+                                            linear=False, timeout=seg_timeout, tolerance=seg_tolerance)
             else:
                 success = self.set_position(z=segment_z, speed=speed,
-                                            use_gripper_center=use_gripper_center, linear=False)
+                                            use_gripper_center=use_gripper_center, linear=False,
+                                            timeout=seg_timeout, tolerance=seg_tolerance)
 
             if not success:
                 print(f"[PiperAPI] ✗ Segment {i+1}/{num_segments} failed at Z={segment_z:.1f}mm")
@@ -690,15 +749,15 @@ class PiperAPI:
     def clean_error(self, go_zero: bool = True, force: bool = False,
                     allow_disable: bool = False) -> bool:
         """
-        Clear error state - SAFE by default (won't cause arm to fall)
+        Two-tier error handler:
+          Tier 1: JointConfig(7, clear_err=0xAE) — safe, arm holds position
+          Tier 2: Manual intervention (ResetPiper cuts current, too dangerous)
 
-        Good Taste: Different errors need different recovery strategies
+        TARGET_LIMIT and COLLISION are safe to auto-clear (Tier 1):
+        the arm holds position, only the planner rejected the target.
 
-        Args:
-            go_zero: Go to zero position after clearing (if successful)
-            force: Force clear attempt even if no error detected
-            allow_disable: Allow disable/enable cycle (DANGEROUS - arm will FALL!)
-                          Default False for safety
+        EMERGENCY_STOP, NO_SOLUTION, SINGULARITY, JOINT_COMM_ERR,
+        BRAKE_NOT_RELEASED require manual intervention (Tier 2).
 
         Returns:
             True if error cleared, False if manual intervention needed
@@ -706,93 +765,39 @@ class PiperAPI:
         if not self.is_connected:
             return False
 
-        print("[PiperAPI] Clearing error...")
-
-        # Step 0: Check error type - Good Taste: know what you're dealing with
         has_error, error_type = self._get_error_type()
         if not has_error and not force:
-            print("[PiperAPI] No error to clear")
             return True
 
-        print(f"[PiperAPI] Error type: {error_type}")
-
-        # Step 1: Soft reset (SAFE - no fall risk)
-        self.piper.MotionCtrl_1(0x02, 0, 0)  # Resume/Reset
-        time.sleep(0.5)
-
-        # Step 1.5: For TARGET_LIMIT, also reset motion mode
-        # This is the key fix - target limit needs mode reset
-        if error_type == "TARGET_LIMIT":
-            print("[PiperAPI] Target position limit - resetting motion mode...")
-            self.piper.MotionCtrl_2(0, 0, 0, 0x00)  # Reset to position-velocity mode
-            time.sleep(0.3)
-
-        # Check if successful
-        has_error_now, _ = self._get_error_type()
-        if not has_error_now:
-            print("[PiperAPI] ✓ Soft reset successful")
-            if go_zero:
-                self._go_zero()
-            return True
-
-        # Step 2: Soft reset failed
         error_info = self._get_error_info()
-        print(f"[PiperAPI] ⚠ Soft reset failed: {error_info}")
+        print(f"[PiperAPI] ❌ Error detected: {error_type} ({error_info})")
 
-        # Step 2.5: Physical joint limit needs manual intervention
-        if "JOINT_LIMIT" in error_type:
-            print("[PiperAPI] ❌ Physical joint limit detected!")
-            print("[PiperAPI] ⚠ Manual intervention required:")
-            print("[PiperAPI]   1. Manually move arm away from limit")
-            print("[PiperAPI]   2. Call clean_error() again")
-            print("[PiperAPI] ⚠ DO NOT use allow_disable=True - arm will FALL!")
-            return False
+        # Tier 1: safe auto-clear for planner rejections
+        TIER1_ERRORS = ("TARGET_LIMIT", "OTHER:0x04", "COLLISION")
+        if error_type in TIER1_ERRORS or error_type.startswith("ERR_CODE:"):
+            print(f"[PiperAPI] Tier1: clearing error via JointConfig...")
+            self.piper.JointConfig(7, 0x00, 0x00, 500, 0xAE)  # clear_err=0xAE
+            time.sleep(0.3)  # firmware needs time to process
 
-        if not allow_disable:
-            print("[PiperAPI] ❌ Cannot auto-clear without disable")
-            print("[PiperAPI] ❌ Call clean_error(allow_disable=True) to force")
-            print("[PiperAPI] ⚠ WARNING: This may cause arm to fall if not in safe position!")
-            return False
-
-        # Step 3: User explicitly allowed disable (DANGEROUS)
-        print("[PiperAPI] ⚠ WARNING: Attempting disable/enable cycle...")
-        print("[PiperAPI] ⚠ This is DANGEROUS - only use if arm is in safe position!")
-
-        # Check if arm can move before trying _safe_disable
-        # If in error state, _safe_disable will fail to reach natural hang
-        has_error_before_disable, _ = self._get_error_type()
-        if has_error_before_disable:
-            print("[PiperAPI] ❌ Cannot use _safe_disable in error state!")
-            print("[PiperAPI] ⚠ Performing direct disable (arm may fall!)")
-            # Direct disable without moving
-            self.piper.DisableArm(7)
-            time.sleep(1.0)
-        else:
-            # Normal safe disable
-            self._safe_disable()
-            time.sleep(0.5)
-
-        # Re-enable
-        for _ in range(10):
-            self.piper.EnableArm(7)
-            self.piper.GripperCtrl(0, 1000, 0x01, 0)
-            time.sleep(0.5)
-
-            if all(self._get_enable_status_official()):
-                print("[PiperAPI] ✓ Re-enabled after disable")
+            has_error_after, error_type_after = self._get_error_type()
+            if not has_error_after:
+                print(f"[PiperAPI] ✓ Error cleared")
                 return True
+            else:
+                print(f"[PiperAPI] ⚠ Error persists after Tier1: {error_type_after}")
 
-        print("[PiperAPI] ❌ Failed to re-enable")
+        # Tier 2: manual intervention required
+        print("[PiperAPI] ⚠ Arm will HOLD current position (no auto-recovery)")
+        print("[PiperAPI] ⚠ Please manually drag arm to safe position, then re-enable")
         return False
 
     def clean_gripper_error(self):
-        """Clear gripper error"""
+        """Clear gripper error using 'Enable and clear error' (gripper_code=0x03)"""
         if not self.is_connected:
             return
 
-        self.piper.GripperCtrl(0, 1000, 0x02, 0)  # Reset
+        self.piper.GripperCtrl(0, 1000, 0x03, 0)  # Enable and clear error
         time.sleep(0.1)
-        self.piper.GripperCtrl(0, 1000, 0x01, 0)  # Enable
         print("[PiperAPI] ✓ Gripper error cleared")
 
     def _is_in_error(self) -> bool:
@@ -856,12 +861,14 @@ class PiperAPI:
         """Go to zero position (public method)"""
         self._go_zero()
 
-    def _go_zero(self):
-        """
-        Go to zero position - following official pattern
+    def _go_zero(self) -> bool:
+        """Go to zero position with active position verification.
+
+        Returns:
+            True if zero reached, False on timeout/error
         """
         if not self.is_connected:
-            return
+            return False
 
         print("[PiperAPI] Moving to zero position...")
 
@@ -873,9 +880,13 @@ class PiperAPI:
         self.piper.GripperCtrl(0, 1000, 0x01, 0)
         self._last_gripper_position = 0
 
-        # Wait for movement
-        time.sleep(3.0)
-        print("[PiperAPI] ✓ Zero position reached")
+        # Active wait with joint angle verification
+        ok = self._wait_joint_reached([0, 0, 0, 0, 0, 0], timeout=5.0, tolerance_deg=2.5)
+        if ok:
+            print("[PiperAPI] ✓ Zero position reached")
+        else:
+            print("[PiperAPI] ⚠ Zero position not confirmed (see above)")
+        return ok
 
     def go_ready(self, ready_pos: dict = None, open_gripper: bool = True,
                  speed: int = 30) -> bool:
@@ -907,8 +918,7 @@ class PiperAPI:
                 print("[PiperAPI]   Opening gripper...")
                 self.set_gripper_position(self.gripper_max_mm, speed=500, wait=True)
 
-            # Move to ready position (gripper_center coordinates)
-            result = self.set_position(
+            target_kw = dict(
                 x=pos.get('x', self.DEFAULT_READY_POS['x']),
                 y=pos.get('y', self.DEFAULT_READY_POS['y']),
                 z=pos.get('z', self.DEFAULT_READY_POS['z']),
@@ -917,8 +927,29 @@ class PiperAPI:
                 yaw=pos.get('yaw', self.DEFAULT_READY_POS['yaw']),
                 wait=True,
                 speed=speed,
-                use_gripper_center=True
+                use_gripper_center=True,
             )
+            result = self.set_position(**target_kw)
+
+            if not result:
+                # SDK end-pose cache may be stale after CAN write storm.
+                # Brief pause (no CAN writes) lets SDK process pending feedback.
+                time.sleep(0.5)
+                _, gc = self.get_position(return_gripper_center=True)
+                tx, ty, tz = pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)
+                dist = math.sqrt((gc[0]-tx)**2 + (gc[1]-ty)**2 + (gc[2]-tz)**2)
+                if dist < 30.0:
+                    print(f"[PiperAPI] ⚠ go_ready: SDK refreshed — arm IS at target "
+                          f"(dist={dist:.1f}mm), treating as success")
+                    result = True
+                else:
+                    has_err, err_type = self._get_error_type()
+                    if has_err:
+                        print(f"[PiperAPI] ⚠ go_ready: hardware error ({err_type}), skip retry")
+                    else:
+                        print(f"[PiperAPI] ⚠ go_ready: no HW error, dist={dist:.1f}mm — retrying once")
+                        time.sleep(0.5)
+                        result = self.set_position(**target_kw)
 
             if result:
                 print("[PiperAPI] ✓ Ready position reached")
@@ -1010,9 +1041,20 @@ class PiperAPI:
                 self.piper.JointCtrl(*target)
                 time.sleep(1.0)
 
-            # Position before disable
+            # Check if arm actually reached near natural hang before disabling
             joints_pre = self.get_joint_degrees()
+            diff_pre = [abs(joints_pre[i] - self.NATURAL_HANG_DEG[i]) for i in range(6)]
+            max_diff_pre = max(diff_pre)
             print(f"[PiperAPI] Before disable: [{', '.join(f'{j:6.1f}' for j in joints_pre)}]°")
+            print(f"[PiperAPI] Distance to hang: {max_diff_pre:.1f}°")
+
+            # Safety gate: refuse to disable if arm is far from natural hang
+            SAFE_DISABLE_THRESHOLD = 15.0  # degrees
+            if max_diff_pre > SAFE_DISABLE_THRESHOLD:
+                print(f"[PiperAPI] ❌ Arm NOT at natural hang ({max_diff_pre:.1f}° > {SAFE_DISABLE_THRESHOLD}°)")
+                print("[PiperAPI] ❌ Skipping DisableArm to prevent fall! Arm stays enabled.")
+                print("[PiperAPI] ------ DAMPED STOP (ABORTED) ------")
+                return
 
             # Disable
             print("[PiperAPI] DisableArm(7)...")
@@ -1220,8 +1262,13 @@ class PiperAPI:
 
     def _wait_joint_reached(self, target_sdk: List[int], timeout: float = 3.0,
                             tolerance_deg: float = 2.0) -> bool:
-        """
-        Wait for joint angles to reach target.
+        """Wait for joint angles to reach target using dual-track detection.
+
+        Detection strategy (mirrors _wait_position_reached):
+            1. motion_status 0x01→0x00 transition: trust immediately
+            2. Joint angle check: independent of motion_status, runs after
+               grace period — catches firmware bugs where motion_status
+               stays 0x01
 
         Args:
             target_sdk: Target joint angles in SDK units (0.001deg)
@@ -1229,40 +1276,76 @@ class PiperAPI:
             tolerance_deg: Position tolerance in degrees
 
         Returns:
-            True if target reached, False if timeout
+            True if target reached, False if timeout/error
         """
         tolerance_sdk = int(tolerance_deg * self.FACTOR)
-        start_time = time.time()
-        resend_interval = 0.3
-        last_resend = 0
+        start = time.time()
+        seen_moving = False
+        resent = False
+        ERROR_GRACE = 0.3
+        RESEND_DEADLINE = 1.0
 
-        while time.time() - start_time < timeout:
-            # Get current joint angles
-            msg = self.piper.GetArmJointMsgs()
-            current = [
-                msg.joint_state.joint_1,
-                msg.joint_state.joint_2,
-                msg.joint_state.joint_3,
-                msg.joint_state.joint_4,
-                msg.joint_state.joint_5,
-                msg.joint_state.joint_6,
-            ]
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                break
 
-            # Check if all joints within tolerance
-            all_ok = all(abs(current[i] - target_sdk[i]) < tolerance_sdk for i in range(6))
+            status = self.piper.GetArmStatus()
+            arm_st = status.arm_status.arm_status
+            motion_st = status.arm_status.motion_status
 
-            if all_ok:
-                time.sleep(0.1)  # Brief stabilization
+            # Error detection — fail fast
+            if arm_st == 0x04 and elapsed >= ERROR_GRACE:
+                print(f"[PiperAPI] ✗ Joint target limit (t={elapsed:.2f}s)")
+                return False
+            if arm_st in (0x02, 0x03):
+                print(f"[PiperAPI] ✗ Arm error: 0x{int(arm_st):02X} (t={elapsed:.2f}s)")
+                return False
+            if status.arm_status.err_code & 0x3F00:
+                joints = [f"J{i+1}" for i in range(6)
+                          if status.arm_status.err_code & (1 << (8 + i))]
+                print(f"[PiperAPI] ✗ Joint limit: {','.join(joints)}")
+                return False
+
+            if motion_st == 0x01:
+                seen_moving = True
+
+            # Reached: motion_status 0x01→0x00 transition
+            if motion_st == 0x00 and seen_moving:
                 return True
 
-            # Resend command periodically
-            elapsed = time.time() - start_time
-            if elapsed - last_resend > resend_interval:
+            # Joint angle check: independent of motion_status
+            if elapsed > ERROR_GRACE:
+                msg = self.piper.GetArmJointMsgs()
+                current = [
+                    msg.joint_state.joint_1, msg.joint_state.joint_2,
+                    msg.joint_state.joint_3, msg.joint_state.joint_4,
+                    msg.joint_state.joint_5, msg.joint_state.joint_6,
+                ]
+                if all(abs(current[i] - target_sdk[i]) < tolerance_sdk for i in range(6)):
+                    return True
+
+            # Command lost: resend once after deadline
+            if elapsed > RESEND_DEADLINE and not resent and not seen_moving:
+                print(f"[PiperAPI] ⚠ No joint motion after {RESEND_DEADLINE}s, resending")
                 self.piper.JointCtrl(*target_sdk)
-                last_resend = elapsed
+                resent = True
 
             time.sleep(0.05)
 
+        # Timeout — log joint diff for diagnosis
+        try:
+            msg = self.piper.GetArmJointMsgs()
+            current = [
+                msg.joint_state.joint_1, msg.joint_state.joint_2,
+                msg.joint_state.joint_3, msg.joint_state.joint_4,
+                msg.joint_state.joint_5, msg.joint_state.joint_6,
+            ]
+            diff = [abs(current[i] - target_sdk[i]) / self.FACTOR for i in range(6)]
+            print(f"[PiperAPI] ✗ Joint timeout ({timeout}s), seen_moving={seen_moving}, "
+                  f"diff={[f'{d:.1f}°' for d in diff]}")
+        except Exception:
+            print(f"[PiperAPI] ✗ Joint timeout ({timeout}s), seen_moving={seen_moving}")
         return False
 
     def move_z_with_ik(self,

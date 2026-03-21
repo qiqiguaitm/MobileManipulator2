@@ -21,6 +21,8 @@ export DINOX_URL="http://192.168.112.14:10086"
 export SAM3_URL="http://192.168.112.14:8081"
 export CDM_URL="http://192.168.112.14:8082"
 export TRACKER_URL="http://192.168.112.14:11086"
+export COMBINED_GPU0_URL="http://192.168.112.14:8090"
+export COMBINED_GPU1_URL="http://192.168.112.14:8091"
 
 # ============================================================================
 # 环境设置函数

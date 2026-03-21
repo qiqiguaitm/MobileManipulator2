@@ -18,6 +18,7 @@ string error_message
 string category
 float32[] grasp_position       # [x, y, z] mm
 float32 execution_time_ms
+int32 queue_remaining          # 队列剩余物体数（>0 可跳过下轮 Observe）
 ---
 # === Feedback ===
 uint8 state

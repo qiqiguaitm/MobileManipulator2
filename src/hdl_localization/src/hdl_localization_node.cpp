@@ -151,7 +151,7 @@ private:
     this->declare_parameter<double>("cool_time_duration", 2.0);
     this->declare_parameter<bool>("enable_robot_odometry_prediction", false);
     this->declare_parameter<double>("status_max_correspondence_dist", 0.2);
-    this->declare_parameter<double>("localization_inlier_threshold", 0.95);
+    this->declare_parameter<double>("localization_inlier_threshold", 0.90);
 
     // 参数化初始位姿
     this->declare_parameter<bool>("specify_init_pose", false);

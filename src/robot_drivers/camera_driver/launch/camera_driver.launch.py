@@ -222,7 +222,7 @@ def generate_launch_description():
                 'camera_name': camera_name,
                 'camera_namespace': 'camera',
                 'serial_no': cfg.get(serial_key, ''),
-                'initial_reset': 'true',  # hand/chassis hardcode true (matching ROS1)
+                'initial_reset': cfg.get('initial_reset', 'false'),  # default false; Makefile USB reset handles pre-launch cleanup
                 'enable_depth': cfg.get('enable_depth', 'true'),
                 'enable_color': cfg.get('enable_color', 'true'),
                 'enable_infra1': enable_infra,
@@ -240,11 +240,18 @@ def generate_launch_description():
 
         delay = float(cfg.get('camera_delay', '5.0'))
 
-        # Stagger cameras: hand at 1×delay, chassis at 2×delay.
+        # Top camera initial_reset (forced when top_enable_infra=true) causes
+        # USB bus-wide reset on Bus 2. Other cameras must wait for it to settle.
+        top_resets = (cfg.get('top_enable', 'false').lower() == 'true' and
+                      (cfg.get('top_enable_infra', 'false').lower() == 'true' or
+                       cfg.get('initial_reset', 'false').lower() == 'true'))
+        reset_settle = 8.0 if top_resets else 0.0
+
+        # Stagger cameras: hand at settle+1×delay, chassis at settle+2×delay.
         # Same-time startup causes USB bus contention (all on Bus 002).
         if cfg.get('hand_enable', 'false').lower() == 'true':
             actions.append(TimerAction(
-                period=delay,
+                period=reset_settle + delay,
                 actions=[IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(rs_launch),
                     launch_arguments=_resolved_camera_args('hand', 'hand_serial_no').items()
@@ -253,7 +260,7 @@ def generate_launch_description():
 
         if cfg.get('chassis_enable', 'false').lower() == 'true':
             actions.append(TimerAction(
-                period=delay * 2,
+                period=reset_settle + delay * 2,
                 actions=[IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(rs_launch),
                     launch_arguments=_resolved_camera_args('chassis', 'chassis_serial_no').items()

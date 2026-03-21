@@ -366,7 +366,9 @@ def select_board_roi_3d(points_3d, image, corners_2d, frame_idx, cam_distance=No
     else:
         z_lower_bound = -0.35
 
-    yz_mask = (points_3d[:, 1] >= y1) & (points_3d[:, 1] <= y2) & \
+    # X 预过滤：与显示用的 display_points 保持一致，排除背面/远处噪声
+    yz_mask = (points_3d[:, 0] >= min_dist) & (points_3d[:, 0] <= max_dist) & \
+              (points_3d[:, 1] >= y1) & (points_3d[:, 1] <= y2) & \
               (points_3d[:, 2] >= z1) & (points_3d[:, 2] <= z2)
     yz_candidates = points_3d[yz_mask]
 
@@ -387,13 +389,14 @@ def select_board_roi_3d(points_3d, image, corners_2d, frame_idx, cam_distance=No
     roi_points_3d = points_3d[roi_mask]
 
     print(f"  提取到 {len(roi_points_3d)} 个点")
-    print(f"    X: [{roi_points_3d[:, 0].min():.2f}, {roi_points_3d[:, 0].max():.2f}]")
-    print(f"    Y: [{roi_points_3d[:, 1].min():.2f}, {roi_points_3d[:, 1].max():.2f}]")
-    print(f"    Z: [{roi_points_3d[:, 2].min():.2f}, {roi_points_3d[:, 2].max():.2f}]")
 
     if len(roi_points_3d) < 10:
         print(f"  [警告] 点数太少，返回None")
         return None
+
+    print(f"    X: [{roi_points_3d[:, 0].min():.2f}, {roi_points_3d[:, 0].max():.2f}]")
+    print(f"    Y: [{roi_points_3d[:, 1].min():.2f}, {roi_points_3d[:, 1].max():.2f}]")
+    print(f"    Z: [{roi_points_3d[:, 2].min():.2f}, {roi_points_3d[:, 2].max():.2f}]")
 
     return roi_points_3d
 
@@ -1246,23 +1249,12 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, 'extrinsics_%s_%s.yaml' % (calib_label, timestamp))
 
-    result = {
-        'header': {
-            'calibration_date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'method': 'interactive_multi_frame_v2',
-            'n_frames': len(features_final)
-        },
-        'frame_id': 'rs16_lidar',
-        'child_frame_id': output_child_frame,
-        'transform': {
-            'translation': {'x': float(opt_t_tf[0]), 'y': float(opt_t_tf[1]), 'z': float(opt_t_tf[2])},
-            'rotation': {'x': float(opt_quat_tf[0]), 'y': float(opt_quat_tf[1]),
-                        'z': float(opt_quat_tf[2]), 'w': float(opt_quat_tf[3])}
-        }
-    }
-
-    with open(output_file, 'w') as f:
-        yaml.dump(result, f, default_flow_style=False)
+    save_extrinsics(
+        output_file, opt_R_tf, opt_t_tf,
+        frame_id='rs16_lidar', child_frame_id=output_child_frame,
+        n_frames=len(features_final), method='interactive_multi_frame_v2',
+        calibration_date=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    )
 
     print(f"\n[保存] TF 外参已保存到: {output_file}")
 

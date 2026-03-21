@@ -2,6 +2,9 @@
 string category
 float64 pos_x
 float64 pos_y
+float64 pos_z               # base_link z (height above ground)
+float64 distance             # distance from robot (m)
+float64 physical_size        # estimated max physical dimension (m)
 float64 score
 uint8 status            # 0=ACTIVE 1=PICKED 2=FAILED
 uint32 observations

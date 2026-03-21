@@ -438,6 +438,9 @@ void CleanerPanel::cleanerManagerStatusCb(
         info.category = t.category;
         info.pos_x = t.pos_x;
         info.pos_y = t.pos_y;
+        info.pos_z = t.pos_z;
+        info.distance = t.distance;
+        info.physical_size = t.physical_size;
         info.score = t.score;
         info.status = t.status;
         info.observations = t.observations;
@@ -688,21 +691,16 @@ void CleanerPanel::updateTargetListUI()
         // Only show viable ACTIVE targets; stale/low-obs and PICKED/FAILED are noise
         if (t.status != 0 || !t.viable) continue;
 
-        QString status_str = t.viable ? "OK" : "stale";
-        // viable: default palette color; stale: dim gray
-        QColor fg = t.viable
-            ? list_targets_->palette().color(QPalette::Text)
-            : QColor("#999999");
-
-        QString text = QString("%1 (%2,%3) s=%4 obs=%5 %6")
+        // Format: category (x,y) z=0.05 d=1.2m ~6cm
+        int size_cm = static_cast<int>(t.physical_size * 100.0 + 0.5);
+        QString text = QString("%1 (%2,%3) z=%4 d=%5m ~%6cm")
             .arg(QString::fromStdString(t.category), -8)
-            .arg(t.pos_x, 5, 'f', 1)
-            .arg(t.pos_y, 5, 'f', 1)
-            .arg(t.score, 0, 'f', 2)
-            .arg(t.observations)
-            .arg(status_str);
+            .arg(t.pos_x, 0, 'f', 1)
+            .arg(t.pos_y, 0, 'f', 1)
+            .arg(t.pos_z, 0, 'f', 2)
+            .arg(t.distance, 0, 'f', 1)
+            .arg(size_cm);
         auto* item = new QListWidgetItem(text);
-        item->setForeground(fg);
         list_targets_->addItem(item);
     }
 }

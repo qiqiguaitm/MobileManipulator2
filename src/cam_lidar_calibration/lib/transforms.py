@@ -130,7 +130,8 @@ def transform_points_camera_to_lidar(points, R, t):
 # Camera Link <-> Optical Frame Transformations
 # ============================================================================
 
-# 静态TF: camera_optical_frame -> camera_link (点变换形式)
+# 静态点变换: camera_optical_frame -> camera_link
+# 命名 _PT = Point Transform，即 p_link = R(q) @ p_optical + t
 # 来源: RealSense 驱动发布的 tf (camera/top_link -> camera/top_color_optical_frame)
 #
 # ROS TF 约定: tf_echo A B 输出的四元数 q 用于点变换 p_A = R(q) @ p_B + t
@@ -138,7 +139,7 @@ def transform_points_camera_to_lidar(points, R, t):
 # 就是 optical -> link 的点变换，可直接使用
 #
 # 验证: optical [0,0,1] (前) -> link [1,0,0] (前) ✓
-CAMERA_OPTICAL_TO_LINK_TF = {
+CAMERA_OPTICAL_TO_LINK_PT = {
     'top': {
         # tf_echo camera/top_link camera/top_color_optical_frame (ROS 实际值)
         'translation': np.array([-0.000283, -0.059184, -0.000029]),
@@ -164,10 +165,10 @@ def get_camera_optical_to_link_transform(camera_type='top'):
         R: 旋转矩阵 (3x3)，用于点变换
         t: 平移向量 (3,)
     """
-    if camera_type not in CAMERA_OPTICAL_TO_LINK_TF:
+    if camera_type not in CAMERA_OPTICAL_TO_LINK_PT:
         raise ValueError(f"Unknown camera type: {camera_type}. Must be 'top' or 'chassis'")
 
-    tf_data = CAMERA_OPTICAL_TO_LINK_TF[camera_type]
+    tf_data = CAMERA_OPTICAL_TO_LINK_PT[camera_type]
     t = tf_data['translation']
     quat = tf_data['rotation_quat']  # xyzw format
     R = Rotation.from_quat(quat).as_matrix()

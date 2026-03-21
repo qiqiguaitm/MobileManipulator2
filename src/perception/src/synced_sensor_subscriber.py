@@ -12,6 +12,7 @@ ROS1 → ROS2 关键变化:
 - rospy.wait_for_message → 自定义实现
 """
 
+import os
 import threading
 import time
 from typing import Optional
@@ -31,6 +32,7 @@ from perception.utils import (
     stamp_to_sec,
     SENSOR_QOS,
     DEFAULT_QOS,
+    LATCHED_QOS,
 )
 
 
@@ -70,6 +72,7 @@ class SyncedSensorSubscriber:
         ir_left_topic: str = '',
         ir_right_topic: str = '',
         ir_info_topic: str = '',
+        ir_intrinsics_file: str = '',
     ):
         """
         初始化同步传感器订阅器
@@ -97,6 +100,7 @@ class SyncedSensorSubscriber:
         self.ir_left_topic = ir_left_topic
         self.ir_right_topic = ir_right_topic
         self.ir_info_topic = ir_info_topic
+        self.ir_intrinsics_file = ir_intrinsics_file
 
         self._bridge = CvBridge()
         self._latest_data: Optional[dict] = None
@@ -209,8 +213,17 @@ class SyncedSensorSubscriber:
 
         # 3. Optional IR sync (independent from color/depth sync)
         if self.ir_left_topic and self.ir_right_topic:
-            # Get IR2 camera_info for baseline (P matrix has Tx = -fx * baseline)
-            if self.ir_info_topic:
+            # IR 内参: 优先使用静态文件（包含完整的 ir_to_color_extrinsics），
+            # 避免运行时从 ROS topic 查询外参超时的问题
+            if self.ir_intrinsics_file and os.path.isfile(self.ir_intrinsics_file):
+                import yaml
+                with open(self.ir_intrinsics_file, 'r') as f:
+                    self._ir_intrinsics = yaml.safe_load(f)
+                self._logger.info(
+                    f'[SyncedSensor] IR内参从静态文件加载: {os.path.basename(self.ir_intrinsics_file)}, '
+                    f'baseline={self._ir_intrinsics.get("baseline", "?")}'
+                )
+            elif self.ir_info_topic:
                 ir_info_msg = wait_for_message(
                     self._node, CameraInfo, self.ir_info_topic,
                     timeout=timeout, qos_profile=DEFAULT_QOS,
@@ -220,6 +233,7 @@ class SyncedSensorSubscriber:
                     self._logger.info(
                         f'[SyncedSensor] IR内参获取成功: baseline={self._ir_intrinsics.get("baseline", 0):.4f}m'
                     )
+                    self._fetch_ir_to_color_extrinsics(timeout=3.0)
                 else:
                     self._logger.warn('[SyncedSensor] IR camera_info获取超时，baseline未知')
 
@@ -241,6 +255,64 @@ class SyncedSensorSubscriber:
 
         self._connected = True
         return True
+
+    def _fetch_ir_to_color_extrinsics(self, timeout: float = 3.0):
+        """从 RealSense 驱动获取 IR→Color 外参，注入 ir_intrinsics 字典。
+
+        RealSense ROS2 驱动发布 /camera/{name}/extrinsics/depth_to_color (latched)，
+        包含 IR 左→Color 的旋转矩阵和平移向量。FS server 用此做深度对齐。
+        D435 如果缺失外参，FS 深度重投影会有 ~7px 垂直偏移 + 14.8mm 水平位移。
+
+        重试策略: 最多3次，超时递增 (3s, 5s, 10s)。
+        """
+        if self._ir_intrinsics is None:
+            return
+        # Derive camera namespace: /camera/top/infra1/image_rect_raw → /camera/top
+        parts = self.ir_left_topic.rsplit('/', 2)
+        if len(parts) < 3:
+            return
+        ext_topic = f'{parts[0]}/extrinsics/depth_to_color'
+        timeouts = [timeout, 5.0, 10.0]
+        try:
+            from realsense2_camera_msgs.msg import Extrinsics as RsExtrinsics
+        except ImportError:
+            self._logger.warn('[SyncedSensor] realsense2_camera_msgs不可用，跳过IR→Color外参')
+            return
+
+        for attempt, t_sec in enumerate(timeouts, 1):
+            try:
+                ext_msg = wait_for_message(
+                    self._node, RsExtrinsics, ext_topic,
+                    timeout=t_sec, qos_profile=LATCHED_QOS,
+                )
+                if ext_msg is not None:
+                    self._ir_intrinsics['ir_to_color_extrinsics'] = {
+                        'rotation': [round(float(r), 6) for r in ext_msg.rotation],
+                        'translation': [round(float(t), 6) for t in ext_msg.translation],
+                    }
+                    t = ext_msg.translation
+                    R = ext_msg.rotation
+                    self._logger.info(
+                        f'[SyncedSensor] IR→Color外参获取成功 (attempt {attempt}): '
+                        f't=[{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}], R[5]={R[5]:.6f}'
+                    )
+                    return  # success
+                else:
+                    self._logger.warn(
+                        f'[SyncedSensor] IR→Color外参超时 ({ext_topic}, '
+                        f'attempt {attempt}/{len(timeouts)}, timeout={t_sec}s)'
+                    )
+            except Exception as e:
+                self._logger.warn(
+                    f'[SyncedSensor] IR→Color外参获取失败 (attempt {attempt}): {e}'
+                )
+
+        # All retries exhausted
+        self._logger.error(
+            f'[SyncedSensor] IR→Color外参获取全部失败! '
+            f'D435深度对齐将降级(R=I,t=0), chassis相机定位精度会受影响。'
+            f'Topic: {ext_topic}'
+        )
 
     def _parse_ir_camera_info(self, msg: CameraInfo):
         """从IR camera_info构建FS服务所需的内参格式（与capture_d435.py一致）。

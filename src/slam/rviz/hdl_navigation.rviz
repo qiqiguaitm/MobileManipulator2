@@ -495,7 +495,7 @@ Visualization Manager:
           Class: rviz_default_plugins/Map
           Color Scheme: costmap
           Draw Behind: true
-          Enabled: false
+          Enabled: true
           Name: Global Costmap
           Topic:
             Depth: 1
@@ -505,12 +505,12 @@ Visualization Manager:
             Reliability Policy: Reliable
             Value: /global_costmap/costmap
           Use Timestamp: false
-          Value: false
+          Value: true
         - Alpha: 0.699999988079071
           Class: rviz_default_plugins/Map
           Color Scheme: costmap
           Draw Behind: false
-          Enabled: false
+          Enabled: true
           Name: Local Costmap
           Topic:
             Depth: 1
@@ -520,7 +520,7 @@ Visualization Manager:
             Reliability Policy: Reliable
             Value: /local_costmap/costmap
           Use Timestamp: false
-          Value: false
+          Value: true
       Enabled: true
       Name: Costmap
     - Alpha: 1

@@ -1328,7 +1328,7 @@ class CombinedPerceptionClient:
         self._intr_hash = None
         self._intr_bytes = None
         # (connect_timeout, read_timeout) — cap WiFi spikes, normal P90<160ms
-        self._timeout = (2.0, 0.25)
+        self._timeout = (2.0, 0.35)
 
     def check_health(self):
         try:
@@ -1471,6 +1471,10 @@ class CombinedPerceptionClient:
             }
 
         except Exception as e:
+            # Clear cached hash so next request resends full intrinsics
+            # (server restart invalidates its hash cache → stale hash causes 400)
+            self._intr_hash = None
+            self._intr_bytes = None
             t_err = time.time()
             if _timing is not None:
                 _timing['combined_encode'] = (t_enc - t0) * 1000

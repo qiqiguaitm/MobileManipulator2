@@ -34,26 +34,28 @@ class TargetRecord:
     last_seen: float = field(default_factory=time.time)
     fail_reason: str = ""
     observation_count: int = 1   # Fix 3: incremented each matched frame
+    physical_size: float = 0.0   # estimated max physical dimension (m)
 
 
 def _point_distance(a: Point, b: Point) -> float:
+    """3D 距离 (用于导航排序等)"""
     return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
+
+
+def _point_distance_2d(a: Point, b: Point) -> float:
+    """2D 水平距离 (用于目标合并，忽略 z 高度噪声)"""
+    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
 
 
 class TargetPool:
     """Thread-safe pool of tracked objects projected into map frame."""
 
     def __init__(self, logger,
-
-                 min_distance: float = 0.3,
-                 max_distance: float = 3.0,
                  max_attempts: int = 3,
                  target_ttl: float = 60.0,
                  match_threshold: float = 0.20,
                  min_observations: int = 2):
         self._logger = logger
-        self._min_distance = min_distance
-        self._max_distance = max_distance
         self._max_attempts = max_attempts
         self._target_ttl = target_ttl           # Fix 1: 0 = disabled
         self._match_threshold = match_threshold  # Fix 2: was hardcoded 0.08
@@ -67,6 +69,11 @@ class TargetPool:
         self._total_added = 0
         self._total_picked = 0
         self._total_failed = 0
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return not self._update_enabled
 
     def pause(self):
         with self._lock:
@@ -95,33 +102,43 @@ class TargetPool:
         except (ValueError, IndexError):
             return hash(object_id) & 0x7FFFFFFF
 
+    @staticmethod
+    def _estimate_physical_size(obj) -> float:
+        """Estimate max physical dimension from bbox + depth (D435 fx≈920)."""
+        FX = 920.0
+        bbox = obj.bbox
+        depth = obj.depth
+        if depth <= 0.1 or bbox is None or len(bbox) < 4:
+            return 0.0
+        phys_w = (bbox[2] - bbox[0]) * depth / FX
+        phys_h = (bbox[3] - bbox[1]) * depth / FX
+        return max(phys_w, phys_h)
+
     def _update_locked(self, msg) -> None:
         """Must be called with lock held."""
         now = time.time()
         for obj in msg.objects:
-            if obj.distance < self._min_distance or obj.distance > self._max_distance:
-                self._logger.debug(
-                    f"Pool skip {obj.object_id}: dist={obj.distance:.2f}m "
-                    f"(range [{self._min_distance}, {self._max_distance}])",
-                    throttle_duration_sec=5.0)
-                continue
-
             pos_map = obj.position  # already in map frame
+            phys_size = self._estimate_physical_size(obj)
 
-            # Match against existing targets
+            # Match against existing targets (only by distance, ignore category)
             matched = False
             for t in self._targets:
-                if t.category != obj.category:
-                    continue
-                if _point_distance(t.position_map, pos_map) < self._match_threshold:
-                    # Update existing — running average for position stability
-                    t.position_map.x = 0.7 * t.position_map.x + 0.3 * pos_map.x
-                    t.position_map.y = 0.7 * t.position_map.y + 0.3 * pos_map.y
-                    t.position_map.z = 0.7 * t.position_map.z + 0.3 * pos_map.z
+                if _point_distance_2d(t.position_map, pos_map) < self._match_threshold:
+                    # 近距离观测更准 (深度误差 ∝ z²)，动态调整融合权重
+                    # 0.3m → alpha=0.7, 2.0m → alpha=0.5, 4m+ → alpha=0.2
+                    alpha = max(0.2, min(0.7, 1.0 - obj.distance / 4.0))
+                    t.position_map.x = (1 - alpha) * t.position_map.x + alpha * pos_map.x
+                    t.position_map.y = (1 - alpha) * t.position_map.y + alpha * pos_map.y
+                    t.position_map.z = (1 - alpha) * t.position_map.z + alpha * pos_map.z
+                    if obj.score > t.track_score:
+                        t.category = obj.category  # 高分类别覆盖
                     t.track_score = max(t.track_score, obj.score)
                     t.position_confidence = max(t.position_confidence, obj.confidence)
                     t.last_seen = now
                     t.observation_count += 1  # Fix 3
+                    if phys_size > 0:
+                        t.physical_size = (1 - alpha) * t.physical_size + alpha * phys_size
                     matched = True
                     break
 
@@ -134,6 +151,7 @@ class TargetPool:
                     position_confidence=obj.confidence,
                     last_seen=now,
                     observation_count=1,
+                    physical_size=phys_size,
                 ))
                 self._total_added += 1
 
@@ -141,7 +159,7 @@ class TargetPool:
         self._merge_nearby_locked()
 
     def _merge_nearby_locked(self) -> None:
-        """Merge ACTIVE same-category targets within match_threshold. Must hold lock."""
+        """Merge ACTIVE nearby targets within match_threshold (ignore category). Must hold lock."""
         merged = True
         while merged:
             merged = False
@@ -153,9 +171,7 @@ class TargetPool:
                     tj = self._targets[j]
                     if tj.status != TargetStatus.ACTIVE:
                         continue
-                    if ti.category != tj.category:
-                        continue
-                    if _point_distance(ti.position_map, tj.position_map) < self._match_threshold:
+                    if _point_distance_2d(ti.position_map, tj.position_map) < self._match_threshold:
                         # Merge j into i, weighted by observation count
                         total = ti.observation_count + tj.observation_count
                         w_i = ti.observation_count / total
@@ -163,6 +179,9 @@ class TargetPool:
                         ti.position_map.x = w_i * ti.position_map.x + w_j * tj.position_map.x
                         ti.position_map.y = w_i * ti.position_map.y + w_j * tj.position_map.y
                         ti.position_map.z = w_i * ti.position_map.z + w_j * tj.position_map.z
+                        # 保留观测数更多的类别
+                        if tj.observation_count > ti.observation_count:
+                            ti.category = tj.category
                         ti.track_score = max(ti.track_score, tj.track_score)
                         ti.observation_count += tj.observation_count
                         ti.last_seen = max(ti.last_seen, tj.last_seen)
@@ -196,7 +215,7 @@ class TargetPool:
             ]
             if not candidates:
                 return None
-            candidates.sort(key=lambda t: _point_distance(t.position_map, robot_pos_map))
+            candidates.sort(key=lambda t: _point_distance_2d(t.position_map, robot_pos_map))
             return candidates[0]
 
     def get_workspace_targets(
@@ -219,7 +238,7 @@ class TargetPool:
                     continue
                 if in_working_area_fn(t.position_map):
                     results.append(t)
-            results.sort(key=lambda t: _point_distance(t.position_map, robot_pos_map))
+            results.sort(key=lambda t: _point_distance_2d(t.position_map, robot_pos_map))
             return results
 
     def get_all_active(self, robot_pos_map: Point) -> List[TargetRecord]:
@@ -234,7 +253,7 @@ class TargetPool:
                 and t.observation_count >= self._min_observations
                 and (self._target_ttl <= 0 or (now - t.last_seen) < self._target_ttl)
             ]
-            results.sort(key=lambda t: _point_distance(t.position_map, robot_pos_map))
+            results.sort(key=lambda t: _point_distance_2d(t.position_map, robot_pos_map))
             return results
 
     def mark_picked(self, pos: Point) -> None:
@@ -243,6 +262,27 @@ class TargetPool:
             if t:
                 t.status = TargetStatus.PICKED
                 self._total_picked += 1
+
+    def mark_picked_nearest(self, pos: Point, max_dist: float = 0.25) -> tuple:
+        """Mark nearest ACTIVE target as PICKED if within max_dist (2D horizontal).
+
+        Returns (marked: bool, dist: float, category: str).
+        """
+        with self._lock:
+            best = None
+            best_dist = float('inf')
+            for t in self._targets:
+                if t.status != TargetStatus.ACTIVE:
+                    continue
+                d = _point_distance_2d(t.position_map, pos)
+                if d < best_dist:
+                    best_dist = d
+                    best = t
+            if best is None or best_dist > max_dist:
+                return False, best_dist, ""
+            best.status = TargetStatus.PICKED
+            self._total_picked += 1
+            return True, best_dist, best.category
 
     def mark_failed(self, pos: Point, reason: str = "") -> None:
         with self._lock:
@@ -261,7 +301,7 @@ class TargetPool:
         for t in self._targets:
             if t.status != TargetStatus.ACTIVE:
                 continue
-            d = _point_distance(t.position_map, pos)
+            d = _point_distance_2d(t.position_map, pos)
             if d < best_dist:
                 best_dist = d
                 best = t

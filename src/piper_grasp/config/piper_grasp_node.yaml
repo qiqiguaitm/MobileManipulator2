@@ -51,22 +51,42 @@ piper_ros:
     zero:
       joints: [0, 0, 0, 0, 0, 0]
 
-  # === Working Area Limits (all in mm) ===
+  # === Working Area Limits (all in mm, arm_base_link frame) ===
+  # arm_base_link: X+前 Y+左 Z+上, 原点在 base_link 前方 118mm 上方 100mm
+  #
+  # 几何约束 (arm_base_link frame):
+  #   底盘相机 D435:  X≈262mm (实测380mm-118mm), Z≈-90mm
+  #   机器人前沿:      X=316mm (footprint前边)
+  #   机器人侧边:      Y=±310mm
+  #   地面:            Z≈-250mm
+  #   臂展 (FK P99):   400~535mm (随高度变化)
   working_area:
-    offset_xmin: -50              # mm (was -0.05m)
-    offset_xmax: 150              # mm (was 0.15m)
-    offset_ymin: -150             # mm (was -0.15m)
-    offset_ymax: 150              # mm (was 0.15m)
-    offset_zmin: -400             # mm (was -0.4m)
-    offset_zmax: -150             # mm (was -0.15m)
-    yaw_min: 90                  # degrees  #170
-    yaw_max: 270                  # degrees, in [0, 360], default angle is 180   #190
+    # Absolute bounding box in arm_base_link (mm)
+    # target_box 优先于 reach_envelope; 配置 target_box 后 reach_envelope 不生效
+    target_box:
+      xmin: 300        # 底盘相机X≈262mm + 38mm安全距离, 避免臂下探撞相机
+      xmax: 450        # 前方最远 450mm, 臂展 ~535mm; 500mm边缘lift会触发TARGET_LIMIT
+      ymin: -250       # 左侧 250mm (机器人半宽 310mm 内)
+      ymax: 250        # 右侧 250mm
+      zmin: -300       # 低于地面(-250mm) 50mm 容差
+      zmax: 150        # 最高 150mm (arm_base 上方 250mm = 地面上 350mm)
+    # offset / yaw / reach_envelope — 全部禁用, 仅用 target_box
+    offset_xmin: -9999
+    offset_xmax: 9999
+    offset_ymin: -9999
+    offset_ymax: 9999
+    offset_zmin: -9999
+    offset_zmax: 9999
+    yaw_min: 0
+    yaw_max: 360
+    max_reach: 9999
+    reach_envelope: []
 
   # === Grasp ===
   grasp:
     enabled: true
     perception_service: "/perception_grasp_node/detect"
-    default_prompt: 'bottle.cup.box.can.toy.pen.bag'  # fallback when observe_prompt is empty
+    default_prompt: "can.vegetable.bottle.box.food.Rubik's cube"  # fallback when observe_prompt is empty
     default_speed: 30            # %
     approach_speed: 20           # %
     min_z: -245                  # mm (min Z during grasp), -245 in real

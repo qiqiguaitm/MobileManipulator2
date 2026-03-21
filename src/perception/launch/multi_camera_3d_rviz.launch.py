@@ -127,10 +127,10 @@ def generate_launch_description():
         description='Enable CDM depth optimization (set false to use raw RealSense depth)'
     )
 
-    # FoundationStereo 被动双目深度（所有相机）
+    # 深度源: combined(SAM3+FS单次HTTP) → foundation_stereo → raw 自动回退
     depth_source_arg = DeclareLaunchArgument(
-        'depth_source', default_value='foundation_stereo',
-        description="All cameras depth source: 'raw' (RealSense) or 'foundation_stereo'"
+        'depth_source', default_value='combined',
+        description="Depth source: 'combined' | 'foundation_stereo' | 'raw' (auto-fallback)"
     )
     foundation_stereo_url_arg = DeclareLaunchArgument(
         'foundation_stereo_url', default_value='http://192.168.112.14:8084',
@@ -180,7 +180,7 @@ def generate_launch_description():
             {'detector_type': LaunchConfiguration('detector_type')},
             {'top_detect_rate': LaunchConfiguration('top_detect_rate')},
             {'chassis_detect_rate': LaunchConfiguration('chassis_detect_rate')},
-            {'default_prompt': 'coke can.scissors.rubiks cube.toy vegetable.toy food.bottle.box.black block'},
+            {'default_prompt': "can.vegetable.bottle.box.food.Rubik's cube.tool"},
             # 匈牙利匹配融合参数
             {'fusion_distance_threshold': 0.2},  # 20cm 距离硬门控
             {'fusion_max_cost': 0.7},

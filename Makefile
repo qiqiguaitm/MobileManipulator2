@@ -15,14 +15,16 @@ ROS_SETUP := export ROS_DOMAIN_ID=$(ROS_DOMAIN_ID) && \
 	source $(WS_DIR)/install/setup.bash
 
 .PHONY: help \
+        renice \
         navigation navi nav navi-fusion nav-fusion navi-approach \
         percept-nav \
         cleaner-manager-node \
-        full-manual rviz \
+        full full-auto full-manual rviz \
         build build-all build-drivers build-slam build-nav build-perception build-cleaner-manager \
         can-bringup can-bringup-auto can-reset can-status \
         cam-clean cam-top cam-hand cam-chassis cam-dual cam-status \
         percept-check percept-3d percept-multi percept-3d-rviz percept-multi-rviz percept-full percept-full-sam3 percept-full-sam3-nocdm percept-full-sam3-no-rviz percept-full-sam3-stereo-hand percept-full-sam3-stereo-hand-nocdm percept-stop \
+        cpu-perf cpu-status \
         status stop clean kill-ros health
 
 help:
@@ -61,6 +63,7 @@ help:
 	@echo ""
 	@echo "全系统命令 (Cleaner Manager):"
 	@echo "  make full-manual            - 手动控制全流程 (导航+相机+感知+机械臂+GUI面板)"
+	@echo "  make full / make full-auto  - 自主清扫全流程 (导航+相机+感知+机械臂+自动循环)"
 	@echo "  make cleaner-manager-node   - 仅启动管理节点 (需其他模块已运行)"
 	@echo "  make rviz                   - 单独启动 RViz (手动控制配置)"
 	@echo "  make build-cleaner-manager  - 构建 cleaner_manager 包"
@@ -86,6 +89,8 @@ help:
 	@echo "  make stop           - 停止所有节点"
 	@echo "  make clean          - 清理构建文件"
 	@echo "  make health         - 硬件健康检测"
+	@echo "  make cpu-perf       - CPU 性能模式 (MAXN + 2.2GHz 锁频)"
+	@echo "  make cpu-status     - 查看 CPU 频率/功耗状态"
 	@echo "=============================================="
 
 # ============================================
@@ -168,41 +173,57 @@ rviz:
 	@$(ROS_SETUP) && rviz2 -d \
 		$$(ros2 pkg prefix cleaner_manager)/share/cleaner_manager/config/cleaner_manager.rviz
 
-# 全手动模式: 感知 + 导航 + 抓取全流程 (手动控制面板)
-full-manual:
-	@echo "[FULL-MANUAL] 清理残留相机进程..."
+# 相机清理+USB重置 (full-manual / full-auto 共享)
+_cam-prepare:
+	@echo "  清理残留相机进程..."
 	-@pkill -15 -f "[r]ealsense2_camera_node" 2>/dev/null; sleep 2; \
 	pkill -9 -f "[r]ealsense2_camera_node" 2>/dev/null; sleep 1
-	@echo "[FULL-MANUAL] 重置所有 RealSense USB 设备..."
+	@echo "  重置所有 RealSense USB 设备..."
 	-@lsusb | grep '8086:0b' | while read line; do \
 		bus=$$(echo "$$line" | awk '{print $$2}'); \
 		dev=$$(echo "$$line" | awk '{print $$4}' | tr -d ':'); \
 		usbreset "$$bus/$$dev" 2>/dev/null && echo "  [OK] Reset: $$bus/$$dev"; \
 	done; \
 	sleep 2
-	@echo "[FULL-MANUAL] 解绑 D455 的 uvcvideo 驱动..."
+	@echo "  解绑所有 RealSense 的 uvcvideo 驱动..."
 	-@for iface in /sys/bus/usb/devices/*/idProduct; do \
 		product=$$(cat "$$iface" 2>/dev/null); \
-		if [ "$$product" = "0b5c" ]; then \
+		if [ "$$product" = "0b5c" ] || [ "$$product" = "0b07" ]; then \
 			devdir=$$(dirname "$$iface"); \
 			for sub in $$devdir/*/driver; do \
 				if [ -L "$$sub" ] && [ "$$(basename $$(readlink $$sub))" = "uvcvideo" ]; then \
 					subdev=$$(basename $$(dirname "$$sub")); \
-					echo "$$subdev" > /sys/bus/usb/drivers/uvcvideo/unbind 2>/dev/null && \
+					echo "didi" | sudo -S sh -c "echo $$subdev > /sys/bus/usb/drivers/uvcvideo/unbind" 2>/dev/null && \
 						echo "  [OK] Unbind uvcvideo: $$subdev"; \
 				fi; \
 			done; \
 		fi; \
 	done; \
 	sleep 1
-	@echo "[FULL-MANUAL] 启动手动控制全流程 (导航+相机+感知+机械臂+手动控制面板)..."
+
+# 全手动模式: 感知 + 导航 + 抓取全流程 (手动控制面板)
+full-manual: _cam-prepare
+	@echo "[FULL-MANUAL] 启动手动控制全流程..."
 	@DISPLAY=$${DISPLAY:-:1} xhost +local: 2>/dev/null || true
 	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control_full.launch.py \
+		mode:=manual \
 		rviz:=true gui:=true \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
+		detector_type:=sam3
+
+# 全自主模式: 感知 + 导航 + 自主清扫循环
+full full-auto: _cam-prepare
+	@echo "[FULL-AUTO] 启动自主清扫全流程..."
+	@DISPLAY=$${DISPLAY:-:1} xhost +local: 2>/dev/null || true
+	@$(ROS_SETUP) && ros2 launch cleaner_manager manual_control_full.launch.py \
+		mode:=auto \
+		rviz:=true gui:=false \
+		use_odom_fusion:=true \
+		launch_chassis:=true \
 		detector_type:=sam3 \
-		extrinsics_suffix:=_stereo_hand
+		perception_rviz:=false \
+		top_detect_rate:=0.0 chassis_detect_rate:=0.0 fusion_publish_rate:=0.0
 
 # ============================================
 # 构建命令
@@ -341,6 +362,35 @@ kill-ros:
 	@ros2 daemon stop 2>/dev/null || true
 	@$(MAKE) stop
 	@echo "[OK] 完成"
+
+# ============================================
+# CPU/功耗管理
+# ============================================
+
+# CPU 性能模式: MAXN + jetson_clocks 锁定 2.2GHz
+renice:
+	@bash $(WS_DIR)/scripts/ros_renice.sh
+
+cpu-perf:
+	@echo "[CPU] 设置 MAXN 模式 + 锁定 2.2GHz..."
+	@echo "didi" | sudo -S nvpmodel -m 0 2>&1 | grep -v "password"
+	@echo "didi" | sudo -S jetson_clocks 2>&1 | grep -v "password"
+	@echo "[OK] CPU 已锁定: MAXN + performance governor + 2.2GHz"
+	@cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+	@echo "当前频率: $$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq) kHz"
+
+# 查看 CPU/功耗状态
+cpu-status:
+	@echo "=============================================="
+	@echo "  CPU / 功耗状态"
+	@echo "=============================================="
+	@echo "NV Power Mode: $$(echo "didi" | sudo -S nvpmodel -q 2>&1 | grep -v password | head -1)"
+	@echo "Governor:      $$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+	@echo "CPU 频率:      $$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq) kHz"
+	@echo "CPU 最大频率:  $$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) kHz"
+	@echo "CPU 最小频率:  $$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq) kHz"
+	@echo "CPU 温度:      $$(cat /sys/devices/virtual/thermal/thermal_zone*/temp 2>/dev/null | head -1 | awk '{printf "%.1f°C\n", $$1/1000}')"
+	@echo "=============================================="
 
 # ============================================
 # 硬件健康检测

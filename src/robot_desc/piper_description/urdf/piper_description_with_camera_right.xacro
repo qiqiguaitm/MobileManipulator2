@@ -145,7 +145,7 @@
         <parent link="${namespace}/link2" />
         <child link="${namespace}/link3" />
         <axis xyz="0 0 1" />
-        <limit lower="-2.697" upper="0" effort="100" velocity="3" />
+        <limit lower="-2.967" upper="0" effort="100" velocity="3" />
     </joint>
 
     <link name="${namespace}/link4">
@@ -183,7 +183,7 @@
         <parent link="${namespace}/link3" />
         <child link="${namespace}/link4" />
         <axis xyz="0 0 1" />
-        <limit lower="-1.832" upper="1.832" effort="100" velocity="3" />
+        <limit lower="-1.745" upper="1.745" effort="100" velocity="3" />
     </joint>
 
     <link name="${namespace}/link5">
@@ -259,7 +259,7 @@
         <parent link="${namespace}/link5" />
         <child link="${namespace}/link6" />
         <axis xyz="0 0 1" />
-        <limit lower="-3.14" upper="3.14" effort="100" velocity="3" />
+        <limit lower="-2.0944" upper="2.0944" effort="100" velocity="3" />
     </joint>
 
     <link name="${namespace}/link7">
@@ -297,7 +297,7 @@
         <parent link="${namespace}/link6" />
         <child link="${namespace}/link7" />
         <axis xyz="0 0 -1" />
-        <limit lower="0" upper="0.05" effort="10" velocity="1" />
+        <limit lower="0" upper="0.035" effort="10" velocity="1" />
     </joint>
 
     <link name="${namespace}/link8">
@@ -335,7 +335,7 @@
         <parent link="${namespace}/link6" />
         <child link="${namespace}/link8" />
         <axis xyz="0 0 1" />
-        <limit lower="-0.05" upper="0" effort="10" velocity="1" />
+        <limit lower="-0.035" upper="0" effort="10" velocity="1" />
     </joint>
 
 </xacro:macro>

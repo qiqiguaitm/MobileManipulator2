@@ -12,6 +12,8 @@ TF Republisher（严格仿照 ROS1 _MobileManipulator）
 import math
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped, Transform
 from tf2_msgs.msg import TFMessage
@@ -67,9 +69,15 @@ class TFRepublisher(Node):
         self._logged_once = False
         self._waiting_logged = False
 
-        self.create_subscription(TFMessage, '/tf', self.tf_callback, 50)
+        # callback group 隔离：timer 不被高流量 /tf subscription 阻塞
+        self._sub_group = ReentrantCallbackGroup()
+        self._timer_group = MutuallyExclusiveCallbackGroup()
+
+        self.create_subscription(TFMessage, '/tf', self.tf_callback, 5,
+                                 callback_group=self._sub_group)
         self.tf_broadcaster = TransformBroadcaster(self)
-        self.create_timer(1.0 / self.rate_hz, self.timer_callback)
+        self.create_timer(1.0 / self.rate_hz, self.timer_callback,
+                          callback_group=self._timer_group)
 
         smooth_info = f', smooth_alpha={self.smooth_alpha}' if self.smooth_alpha > 0 else ' (no smoothing)'
         self.get_logger().info(
@@ -182,8 +190,10 @@ def main(args=None):
     signal.signal(signal.SIGTERM, _sigterm)
     rclpy.init(args=args)
     node = TFRepublisher()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

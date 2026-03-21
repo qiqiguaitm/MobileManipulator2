@@ -1,21 +1,21 @@
 # Extrinsics: chassis_camera_optical_frame -> base_link
-# Computed: inv(T_rslidar_to_chassis) @ T_rslidar_to_base_link
-# Source: direct chassis-lidar calibration (interactive_calibrate_v2, 6 frames)
-# Generated: 2026-03-02
+# Computed: inv(base_to_rslidar @ rslidar_to_chassis_optical)
+# Source: chassis LiDAR calibration 2026-03-19 + URDF base_to_rslidar
+# Generated: 2026-03-19
 
 header:
-  calibration_date: '2026-03-02'
-  source: 'Computed: inv(T_rslidar_to_chassis) @ T_rslidar_to_base_link'
+  calibration_date: '2026-03-19'
+  source: 'Computed: inv(base_to_rslidar @ rslidar_to_chassis_optical)'
   frame_id: chassis_camera_optical_frame
   child_frame_id: base_link
 
 transform:
   translation:
-    x: 0.024287229181202
-    y: -0.029837275896892
-    z: -0.371847534605418
+    x: 0.0330339934
+    y: -0.0533757310
+    z: -0.3809870688
   rotation:
-    x: 0.481751874015268
-    y: -0.475913817920651
-    z: 0.523889809956828
-    w: 0.516682336468324
+    x: 0.4680753090
+    y: -0.4737209074
+    z: 0.5276658636
+    w: 0.5273165496

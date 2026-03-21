@@ -1,20 +1,20 @@
 # Extrinsics: rslidar -> chassis_camera_optical_frame
-# Source: direct chassis-lidar calibration (interactive_calibrate_v2, 6 frames)
-# Generated: 2026-03-02
+# Source: direct chassis-lidar calibration (interactive_calibrate_v2)
+# Deployed: 2026-03-19 12:04:15
 
+child_frame_id: chassis_camera_optical_frame
+frame_id: rslidar
 header:
-  calibration_date: '2026-03-02'
-  source: direct_chassis_lidar_calibration
-  frame_id: rslidar
-  child_frame_id: chassis_camera_optical_frame
-
+  calibration_date: '2026-03-19 11:55:50'
+  method: interactive_multi_frame_v2
+  n_frames: 6
 transform:
-  translation:
-    x: 0.1005468633961456
-    y: 0.02323394748806266
-    z: -0.0942426561537487
   rotation:
-    x: 0.48175187401526753
-    y: -0.47591381792065074
-    z: 0.5238898099568278
-    w: -0.5166823364683237
+    w: -0.5273165495775017
+    x: 0.46807530897488003
+    y: -0.47372090737288086
+    z: 0.5276658635799392
+  translation:
+    x: 0.11222011619350233
+    y: 0.030549645628022818
+    z: -0.10480022568192959

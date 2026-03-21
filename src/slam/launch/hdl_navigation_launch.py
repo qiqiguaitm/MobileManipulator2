@@ -168,6 +168,7 @@ def generate_launch_description():
         package='slam',
         executable='delayed_cloud_relay.py',
         name='delayed_cloud_relay',
+        prefix='nice -n -10 ',
         parameters=[{
             'input': '/rslidar_points',
             'output': '/rslidar_points_delayed',
@@ -245,6 +246,7 @@ def generate_launch_description():
         package='slam',
         executable='tf_republisher.py',
         name='tf_republisher',
+        prefix='nice -n -10 ',
         parameters=[{
             'source_frame': 'map',
             'child_frame': 'odom',
@@ -303,9 +305,11 @@ def generate_launch_description():
     # min_height: ROS1 用 -0.08 + costmap PointCloud2 的 min_obstacle_height 二次过滤
     #   ROS2 走 LaserScan (2D,无高度)，costmap 无法二次过滤 → 必须在此过滤地面
     #   lidar 距地面 ~6cm，rslidar 系下地面 ≈ z=-0.06m, 设 0.0 过滤地面回波
-    # max_height: 1.36m (检测人、桌椅等)
+    # max_height: 0.5m — 只保留低矮波束,过滤穿墙/越墙假障碍
+    #   0.5m 覆盖桌腿(~0.45m)、椅腿、推车、箱子、人腿等实际障碍
+    #   过滤门上方缝隙和高角度多径反射产生的远距假点
     # transform_tolerance: 0.1s (系统时间统一后，无需大容错)
-    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': -0.08, 'max_height': 1.36,
+    _laserscan_params = {'target_frame': 'rslidar', 'transform_tolerance': 0.1, 'min_height': 0.0, 'max_height': 1.0,
                         'angle_min': -1.5708, 'angle_max': 1.5708, 'angle_increment': 0.00872, 'scan_time': 0.1,
                         'range_min': 0.2, 'range_max': 10.0, 'use_inf': True}
     pointcloud_to_laserscan_aligned = Node(

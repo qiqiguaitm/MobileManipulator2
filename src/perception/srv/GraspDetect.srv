@@ -24,3 +24,6 @@ float64 depth                    # 中心点深度值 米
 
 # 统计
 float64 detection_time_ms        # 检测耗时 ms
+
+# 批量结果（按 grasp_score 降序，>min_grasp_score）
+GraspObject[] all_objects        # 所有检测物体

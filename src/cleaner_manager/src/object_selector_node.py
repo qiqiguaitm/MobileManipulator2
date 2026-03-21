@@ -4,17 +4,15 @@ object_selector_node.py — Interactive 3D object selector for RViz.
 
 Subscribes to fused/objects_3d (always), renders clickable InteractiveMarkers.
 Clicking a marker sends CMD_SELECT_OBJECT to manual_control_node.
-No state gating — markers are always visible whenever objects are detected.
+
+Perception guarantees objects are in 'map' frame (source gate).
+No TF lookup needed — coordinates are used directly.
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-
-import tf2_ros
-from geometry_msgs.msg import PointStamped
-from tf2_geometry_msgs import do_transform_point
 
 from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
 from interactive_markers import InteractiveMarkerServer
@@ -46,9 +44,6 @@ class ObjectSelectorNode(Node):
             ManualCommand, '/manual_control_node/command',
             callback_group=self._cb_group)
 
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
-
         self.create_subscription(
             Object3DArray,
             '/multi_camera_perception/fused/objects_3d',
@@ -57,7 +52,6 @@ class ObjectSelectorNode(Node):
 
         # Cached objects for timer-driven marker rebuild
         self._cached_objects = []
-        self._cached_transform = None
         self._cached_dirty = False
         self._prev_marker_ids = set()
 
@@ -70,24 +64,13 @@ class ObjectSelectorNode(Node):
 
     def _objects_cb(self, msg: Object3DArray):
         """Cache latest fused detections; timer will rebuild markers."""
-        src_frame = msg.frame_id if msg.frame_id else 'base_link'
-
         if len(msg.objects) == 0:
             if self._cached_objects:
                 self._cached_objects = []
-                self._cached_transform = None
                 self._cached_dirty = True
             return
 
-        try:
-            transform = self._tf_buffer.lookup_transform(
-                'map', src_frame, rclpy.time.Time())
-        except Exception as e:
-            self._log.warn(f'TF {src_frame}->map failed: {e}', throttle_duration_sec=3.0)
-            return
-
         self._cached_objects = msg.objects
-        self._cached_transform = transform
         self._cached_dirty = True
 
     def _update_timer_cb(self):
@@ -105,28 +88,19 @@ class ObjectSelectorNode(Node):
             self._cached_dirty = False
             return
 
-        if self._cached_transform is not None:
-            self._build_markers(
-                self._cached_objects, 'base_link', self._cached_transform)
+        self._build_markers(self._cached_objects)
         self._cached_dirty = False
 
-    def _build_markers(self, objects, src_frame, transform):
+    def _build_markers(self, objects):
         new_ids = {obj.object_id for obj in objects}
 
         # Remove markers for objects no longer present
         for old_id in self._prev_marker_ids - new_ids:
             self._server.erase(old_id)
 
-        # Insert/update markers for current objects
+        # Insert/update markers for current objects (already in map frame)
         for idx, obj in enumerate(objects):
-            ps = PointStamped()
-            ps.header.frame_id = src_frame
-            ps.point = obj.position
-            try:
-                pos_map = do_transform_point(ps, transform).point
-            except Exception:
-                continue
-
+            pos = obj.position
             name = obj.object_id
             r, g, b = _COLORS[idx % len(_COLORS)]
 
@@ -134,9 +108,9 @@ class ObjectSelectorNode(Node):
             im.header.frame_id = 'map'
             im.name = name
             im.description = ''
-            im.pose.position.x = pos_map.x
-            im.pose.position.y = pos_map.y
-            im.pose.position.z = pos_map.z + 0.08
+            im.pose.position.x = pos.x
+            im.pose.position.y = pos.y
+            im.pose.position.z = pos.z
             im.scale = 0.2
 
             ctrl = InteractiveMarkerControl()
@@ -168,14 +142,14 @@ class ObjectSelectorNode(Node):
             im.controls.append(ctrl)
             self._server.insert(
                 im,
-                feedback_callback=self._make_click_cb(obj, pos_map))
+                feedback_callback=self._make_click_cb(obj, pos))
 
         self._server.applyChanges()
         self._prev_marker_ids = new_ids
         self._log.debug(
             f'markers applied: {len(new_ids)} objects in map frame')
 
-    def _make_click_cb(self, obj, pos_map):
+    def _make_click_cb(self, obj, pos):
         def cb(feedback):
             if feedback.event_type != feedback.BUTTON_CLICK:
                 return
@@ -185,9 +159,9 @@ class ObjectSelectorNode(Node):
             req.object_id = obj.object_id
             req.category = obj.category
             req.distance = obj.distance
-            req.target_position.x = pos_map.x
-            req.target_position.y = pos_map.y
-            req.target_position.z = pos_map.z
+            req.target_position.x = pos.x
+            req.target_position.y = pos.y
+            req.target_position.z = pos.z
             req.position_frame = 'map'
             self._cmd_cli.call_async(req)
         return cb

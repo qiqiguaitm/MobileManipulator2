@@ -75,7 +75,7 @@ class ManualControlNode(Node):
         self.declare_parameter('pick_timeout', 60.0)
         self.declare_parameter('place_timeout', 30.0)
         self.declare_parameter('nav_timeout', 120.0)
-        self.declare_parameter('status_rate', 10.0)
+        self.declare_parameter('status_rate', 2.0)
 
         # === TF ===
         self._tf_buffer = tf2_ros.Buffer()
@@ -131,14 +131,12 @@ class ManualControlNode(Node):
         self._error_message = ""
 
         # === Async operation tracking ===
-        self._detect_future = None
         self._cancel_requested = False
         self._worker_thread = None
         self._active_goal_handle = None
         self._navigator = None
 
         # === Timers ===
-        self.create_timer(0.02, self._poll_cb, callback_group=self._cb_group)
         rate = self.get_parameter('status_rate').value
         self.create_timer(
             1.0 / rate, self._publish_status, callback_group=self._cb_group)
@@ -280,18 +278,16 @@ class ManualControlNode(Node):
             req.prompt = self._prompt
         req.enable_lidar = False
         req.camera_id = "all"
-        self._detect_future = self._detect_cli.call_async(req)
+        future = self._detect_cli.call_async(req)
+        future.add_done_callback(self._on_detect_done)
 
-    def _poll_cb(self):
-        """50Hz poll for async detection result."""
-        if self._detect_future is not None and self._detect_future.done():
-            future = self._detect_future
-            self._detect_future = None
-            try:
-                result = future.result()
-                self._handle_detect_result(result)
-            except Exception as e:
-                self._set_state(STATE_IDLE, f"检测异常: {e}")
+    def _on_detect_done(self, future):
+        """Event-driven callback when detection completes."""
+        try:
+            result = future.result()
+            self._handle_detect_result(result)
+        except Exception as e:
+            self._set_state(STATE_IDLE, f"检测异常: {e}")
 
     def _handle_detect_result(self, result):
         if not result.success:
@@ -488,9 +484,6 @@ class ManualControlNode(Node):
             except Exception:
                 pass
 
-        if self._detect_future is not None:
-            self._detect_future = None
-
         # Only reset arm when it might have moved from ready position
         if state in (STATE_OBSERVING, STATE_PICKING, STATE_PLACING):
             self._safe_go_ready()
@@ -616,7 +609,7 @@ def main(args=None):
     navigator = ApproachNavigator()
     node.set_navigator(navigator)
 
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     executor.add_node(navigator)
 

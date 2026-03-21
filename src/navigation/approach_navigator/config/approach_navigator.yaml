@@ -6,25 +6,30 @@ approach_navigator:
     # ============================================================
     # 阶段1: Nav2 导航到接近点
     # ============================================================
-    # 接近距离必须 > local_costmap inflation_radius (0.35m)
-    approach_distance: 0.45           # 接近点到目标的距离 (米)
+    # 接近距离必须 > global_costmap inflation_radius (0.45m)
+    approach_distance: 0.40           # 接近点到目标的距离 (米)，需 > global inflation 0.45m
     nav_timeout: 60.0                 # 导航超时时间 (秒)
 
     # ============================================================
     # 阶段2: 对齐 (PD 控制器)
     # ============================================================
     align_tolerance: 0.087            # 对齐容差 5度 (弧度)
-    align_kp: 1.0                     # P 增益
-    align_kd: 0.1                     # D 增益
-    align_max_omega: 0.5              # 最大角速度 (弧度/秒)
+    align_kp: 0.6                     # P 增益 (降低减少超调)
+    align_kd: 0.3                     # D 增益 (增大阻尼抑制振荡)
+    align_max_omega: 0.4              # 最大角速度 (弧度/秒)
+    align_max_alpha: 1.0              # 最大角加速度 (弧度/秒²)，平滑omega变化
+    align_min_omega: 0.02             # 死区角速度 (弧度/秒)，低于此值发0
     align_timeout: 10.0               # 对齐超时时间 (秒)
     min_align_distance: 0.10          # 距离小于此值跳过对齐 (米)
+    align_settle_time: 0.8            # 粗对齐后停稳等待 (秒)，让IMU/里程计收敛
+    depth_warmup_frames: 5            # 深度传感器预热帧数，丢弃前N帧不稳定数据
+    camera_lateral_offset: -0.013     # 机器人中心在相机光学系的x偏移 (米，x=右，-0.013=中心在相机左侧1.3cm)
 
     # ============================================================
     # 阶段3: 精确接近
     # ============================================================
     final_approach_speed: 0.10        # 最大前进速度 (米/秒)
-    final_approach_distance: 0.08     # 目标距离：前边缘到目标 + 3cm安全余量 (米)
+    final_approach_distance: 0.04     # 目标距离：前边缘到目标 + 3cm安全余量 (米)
     emergency_stop_distance: 0.03     # 紧急刹车距离 (米)
     speed_decel_rate: 0.5             # 最大减速率 (米/秒²)
     final_approach_timeout: 15.0      # 精确接近超时 (秒)
@@ -45,12 +50,35 @@ approach_navigator:
 
     # 相机坐标系: y 向下为正, 相机离地约 15cm → 地面在 y ≈ +0.15m
     # ROI 上限必须 > depth_ground_max_height, 才能让地面点进入 RANSAC 去除
-    depth_ground_max_height: 0.15      # 地面高度: +15cm (相机离地15cm, y向下为正)
+    depth_ground_max_height: 0.158      # 地面高度: +15cm (相机离地15cm, y向下为正)
     depth_obstacle_min_height: -0.50   # ROI 上方截止: -50cm (排除50cm以上高处, y向上为负)
-    depth_obstacle_max_height: 0.22    # ROI 下方截止: +22cm (包含地面+7cm余量, 供RANSAC使用)
+    depth_obstacle_max_height: 0.24    # ROI 下方截止: +22cm (包含地面+7cm余量, 供RANSAC使用)
 
     # 检测范围: 前方 |y| < 此值的范围
-    depth_detect_width: 0.4           # 检测宽度 (米)，左右各此值
+    depth_detect_width: 0.8           # 检测宽度 (米)，左右各此值
+
+    # ============================================================
+    # 去噪参数 (半径异常值去除)
+    # ============================================================
+    outlier_radius: 0.05              # 搜索半径 (米)
+    outlier_min_neighbors: 3          # 最少邻居数，不足则判为噪点
+
+    # ============================================================
+    # RANSAC 地面拟合参数
+    # ============================================================
+    ransac_distance_threshold: 0.02   # 点到平面距离阈值 (米)
+    ransac_max_iterations: 80         # 最大迭代次数
+    ransac_min_inlier_ratio: 0.3      # 最小内点比例，低于则拟合失败
+    ground_candidate_margin: 0.05     # 地面候选点 y 容差 (米)，y >= ground_max - margin
+    ground_inlier_min_dist: -0.01     # 地面内点有符号距离下限 (米，平面上方1cm)
+    ground_inlier_max_dist: 0.03      # 地面内点有符号距离上限 (米，平面下方3cm)
+
+    # ============================================================
+    # 聚类参数
+    # ============================================================
+    cluster_tolerance: 0.05           # DBSCAN eps / KDTree 邻域半径 (米)
+    cluster_min_size: 50              # 最小聚类点数
+    cluster_max_size: 10000           # 最大聚类点数
 
     # ============================================================
     # 机器人几何参数
@@ -62,7 +90,7 @@ approach_navigator:
     # ============================================================
     # 控制参数
     # ============================================================
-    control_rate: 50.0                # 控制循环频率 (Hz)
+    control_rate: 30.0                # 控制循环频率 (Hz)
 
     # ============================================================
     # TF 坐标系

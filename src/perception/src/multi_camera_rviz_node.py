@@ -44,6 +44,7 @@ from geometry_msgs.msg import Point
 
 from perception.msg import Object3DArray
 from perception.coordinate_transformer import CoordinateTransformer
+from cleaner_manager.msg import CleanerManagerStatus
 
 # 传感器 QoS
 SENSOR_QOS = QoSProfile(
@@ -110,6 +111,14 @@ class MultiCameraRVizNode(Node):
         (255, 128, 0), (128, 255, 0), (128, 0, 255), (0, 255, 128), (255, 0, 128),
     ]
 
+    # 目标池状态颜色 (RGBA)
+    POOL_STATUS_COLORS = {
+        0: (0.0, 0.9, 0.2, 0.7),   # ACTIVE — 绿色
+        1: (0.2, 0.5, 1.0, 0.7),   # PICKED — 蓝色
+        2: (1.0, 0.1, 0.1, 0.7),   # FAILED — 红色
+    }
+    POOL_STATUS_NAMES = {0: 'ACTIVE', 1: 'PICKED', 2: 'FAILED'}
+
     # 类别到颜色的映射缓存
     _category_color_cache: Dict[str, Tuple] = {}
 
@@ -139,6 +148,7 @@ class MultiCameraRVizNode(Node):
         self._fused_lock = threading.Lock()
         self._previous_fused_ids = set()  # 追踪之前的fused marker IDs，避免DELETEALL导致闪烁
         self._previous_camera_ids = {}  # 追踪每个相机的marker IDs {camera_name: set()}
+        self._previous_pool_ids = set()  # 目标池 marker IDs
 
         # 加载外参
         self._load_extrinsics()
@@ -164,12 +174,25 @@ class MultiCameraRVizNode(Node):
         )
 
         # === 订阅融合结果（使用独立回调组，避免被定时器阻塞）===
-        fused_topic = f'/{self._perception_node_name}/fused/objects_3d'
-        self._fused_sub = self.create_subscription(
-            Object3DArray, fused_topic, self._fused_objects_callback, DETECTION_QOS,
+        if self._enable_fused_viz:
+            fused_topic = f'/{self._perception_node_name}/fused/objects_3d'
+            self._fused_sub = self.create_subscription(
+                Object3DArray, fused_topic, self._fused_objects_callback, DETECTION_QOS,
+                callback_group=self._fused_callback_group
+            )
+            self.get_logger().info(f"Subscribe fused results: {fused_topic} (depth=10, dedicated callback group)")
+        else:
+            self._fused_sub = None
+            self.get_logger().info("Fused visualization disabled")
+
+        # === 订阅目标池状态（auto 模式下 cleaner_manager_node 发布）===
+        pool_status_topic = '/cleaner_manager_node/status'
+        self._pool_status_sub = self.create_subscription(
+            CleanerManagerStatus, pool_status_topic,
+            self._pool_status_callback, 10,
             callback_group=self._fused_callback_group
         )
-        self.get_logger().info(f"Subscribe fused results: {fused_topic} (depth=10, dedicated callback group)")
+        self.get_logger().info(f"Subscribe pool status: {pool_status_topic}")
 
         # === 定时发布（使用独立回调组）===
         if self._publish_rate > 0:
@@ -235,6 +258,9 @@ class MultiCameraRVizNode(Node):
         self.declare_parameter('perception_node_name', 'multi_camera_perception')
         self._perception_node_name = self.get_parameter('perception_node_name').value
 
+        self.declare_parameter('enable_fused_viz', True)
+        self._enable_fused_viz = self.get_parameter('enable_fused_viz').value
+
     def _load_extrinsics(self):
         """加载所有相机的外参"""
         for camera_name, state in self._cameras.items():
@@ -277,6 +303,11 @@ class MultiCameraRVizNode(Node):
         # 融合结果 markers
         self.pub_fused_markers = self.create_publisher(
             MarkerArray, '~/fused/object_markers', 1
+        )
+
+        # 目标池 markers
+        self.pub_pool_markers = self.create_publisher(
+            MarkerArray, '~/pool/target_markers', 1
         )
 
     def _setup_camera_subscribers(self, camera_name: str):
@@ -444,23 +475,25 @@ class MultiCameraRVizNode(Node):
             self._previous_camera_ids[camera_name] = set()
 
         current_ids = set()
+        cam_frame = (objects_msg.header.frame_id if objects_msg and objects_msg.header.frame_id
+                     else self._target_frame)
         objects_list = objects_msg.objects if objects_msg is not None else []
         for i, obj in enumerate(objects_list):
             color = self._get_category_color(obj.category, camera_name)
             global_id = self._get_global_marker_id(camera_name, i)
             current_ids.add(global_id)
 
-            bbox_marker = self._create_bbox_marker(obj, global_id, color, stamp, camera_name)
+            bbox_marker = self._create_bbox_marker(obj, global_id, color, stamp, camera_name, cam_frame)
             markers.markers.append(bbox_marker)
 
-            label_marker = self._create_distance_label(obj, global_id, stamp, camera_name)
+            label_marker = self._create_distance_label(obj, global_id, stamp, camera_name, cam_frame)
             markers.markers.append(label_marker)
 
         # 增量删除旧 markers
         stale_ids = self._previous_camera_ids[camera_name] - current_ids
         for stale_id in stale_ids:
             del_bbox = Marker()
-            del_bbox.header.frame_id = self._target_frame
+            del_bbox.header.frame_id = cam_frame
             del_bbox.header.stamp = stamp
             del_bbox.ns = f"{camera_name}_object_bbox"
             del_bbox.id = stale_id
@@ -468,7 +501,7 @@ class MultiCameraRVizNode(Node):
             markers.markers.append(del_bbox)
 
             del_label = Marker()
-            del_label.header.frame_id = self._target_frame
+            del_label.header.frame_id = cam_frame
             del_label.header.stamp = stamp
             del_label.ns = f"{camera_name}_distance_labels"
             del_label.id = stale_id
@@ -570,120 +603,10 @@ class MultiCameraRVizNode(Node):
         cloud_msg = self._create_colored_pointcloud(points_base, colors, stamp, self._target_frame)
         self.pubs[camera_name]['rgb_pointcloud'].publish(cloud_msg)
 
-    def _publish_object_visualization(self, camera_name: str,
-                                      objects_msg: Optional[Object3DArray],
-                                      depth: np.ndarray, stamp):
-        """发布物体可视化（增量更新，避免闪烁）"""
-        state = self._cameras[camera_name]
-        markers = MarkerArray()
-
-        # 初始化该相机的marker ID追踪集合
-        if camera_name not in self._previous_camera_ids:
-            self._previous_camera_ids[camera_name] = set()
-
-        # 收集本次的marker IDs
-        current_ids = set()
-
-        # 收集所有物体点云
-        all_object_points = []
-        all_object_colors = []
-
-        fx, fy = state.intrinsics['fx'], state.intrinsics['fy']
-        cx, cy = state.intrinsics['cx'], state.intrinsics['cy']
-
-        # 处理物体（即使没有物体也要继续，以便清理旧markers）
-        objects_list = objects_msg.objects if objects_msg is not None else []
-        for i, obj in enumerate(objects_list):
-            color = self._get_category_color(obj.category, camera_name)
-            global_id = self._get_global_marker_id(camera_name, i)
-            current_ids.add(global_id)
-
-            # 边界框 marker
-            bbox_marker = self._create_bbox_marker(obj, global_id, color, stamp, camera_name)
-            markers.markers.append(bbox_marker)
-
-            # 距离标签 marker
-            label_marker = self._create_distance_label(obj, global_id, stamp, camera_name)
-            markers.markers.append(label_marker)
-
-            # 生成物体 mask 点云（基于 bbox）
-            bbox = obj.bbox
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            h, w = depth.shape
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-
-            skip = 2
-            ys_box, xs_box = np.mgrid[y1:y2:skip, x1:x2:skip]
-            ys_flat, xs_flat = ys_box.flatten(), xs_box.flatten()
-
-            if len(ys_flat) == 0:
-                continue
-
-            ds_flat = depth[ys_flat, xs_flat]
-            valid = (ds_flat > 0.1) & (ds_flat < self._depth_max)
-
-            if not np.any(valid):
-                continue
-
-            depth_median = np.median(ds_flat[valid])
-            depth_mask = np.abs(ds_flat - depth_median) < 0.5
-            final_mask = valid & depth_mask
-
-            ys_v, xs_v, ds_v = ys_flat[final_mask], xs_flat[final_mask], ds_flat[final_mask]
-
-            if len(ds_v) < 10:
-                continue
-
-            # 反投影
-            X = (xs_v - cx) * ds_v / fx
-            Y = (ys_v - cy) * ds_v / fy
-            Z = ds_v
-            pts = np.column_stack([X, Y, Z])
-
-            # 过滤
-            if len(pts) > 1000:
-                pts = self._cluster_object_points(pts)
-
-            if len(pts) > 0:
-                all_object_points.append(pts)
-                clr = np.array([[int(color[2]*255), int(color[1]*255), int(color[0]*255)]])
-                all_object_colors.append(np.tile(clr, (len(pts), 1)))
-
-        # 删除不再需要的旧markers（增量删除，避免DELETEALL导致闪烁）
-        stale_ids = self._previous_camera_ids[camera_name] - current_ids
-        for stale_id in stale_ids:
-            # 删除边界框
-            del_bbox = Marker()
-            del_bbox.header.frame_id = self._target_frame
-            del_bbox.header.stamp = stamp
-            del_bbox.ns = f"{camera_name}_object_bbox"
-            del_bbox.id = stale_id
-            del_bbox.action = Marker.DELETE
-            markers.markers.append(del_bbox)
-
-            # 删除标签
-            del_label = Marker()
-            del_label.header.frame_id = self._target_frame
-            del_label.header.stamp = stamp
-            del_label.ns = f"{camera_name}_distance_labels"
-            del_label.id = stale_id
-            del_label.action = Marker.DELETE
-            markers.markers.append(del_label)
-
-        # 更新追踪集合
-        self._previous_camera_ids[camera_name] = current_ids
-
-        # 发布 markers
-        self.pubs[camera_name]['object_markers'].publish(markers)
-
-        # 发布合并的 markers（方便统一查看）
-        self.pub_combined_markers.publish(markers)
-
-    def _create_bbox_marker(self, obj, idx: int, color: Tuple, stamp, camera_name: str) -> Marker:
+    def _create_bbox_marker(self, obj, idx: int, color: Tuple, stamp, camera_name: str, frame_id: str = '') -> Marker:
         """创建边界框 Marker"""
         marker = Marker()
-        marker.header.frame_id = self._target_frame
+        marker.header.frame_id = frame_id or self._target_frame
         marker.header.stamp = stamp
         marker.ns = f"{camera_name}_object_bbox"  # 独立 namespace
         marker.id = idx
@@ -711,10 +634,10 @@ class MultiCameraRVizNode(Node):
 
         return marker
 
-    def _create_distance_label(self, obj, idx: int, stamp, camera_name: str) -> Marker:
+    def _create_distance_label(self, obj, idx: int, stamp, camera_name: str, frame_id: str = '') -> Marker:
         """创建距离标签 Marker"""
         marker = Marker()
-        marker.header.frame_id = self._target_frame
+        marker.header.frame_id = frame_id or self._target_frame
         marker.header.stamp = stamp
         marker.ns = f"{camera_name}_distance_labels"  # 独立 namespace
         marker.id = idx
@@ -726,8 +649,8 @@ class MultiCameraRVizNode(Node):
         marker.pose.position.z = obj.position.z + 0.18  # 增加高度以容纳更多文字
         marker.pose.orientation.w = 1.0
 
-        # 构建文字内容
-        lines = [obj.object_id]
+        # 构建文字内容 (空格→下划线，避免RViz等宽字体显示极宽空格)
+        lines = [obj.object_id.replace(" ", "_") if obj.object_id else ""]
 
         # 第二行: base_link 距离
         prefix = "T" if camera_name == 'top' else "C"
@@ -1032,6 +955,9 @@ class MultiCameraRVizNode(Node):
             valid_count = 0
 
             # 处理物体（即使没有物体也要继续，以便清理旧markers）
+            # 使用消息自带的 frame_id（可能是 map 或 base_link）
+            fused_frame = objects_msg.header.frame_id if objects_msg else self._target_frame
+
             if objects_msg is not None and len(objects_msg.objects) > 0:
                 for i, obj in enumerate(objects_msg.objects):
                     try:
@@ -1040,11 +966,11 @@ class MultiCameraRVizNode(Node):
                         current_ids.add(marker_id)
 
                         # 边界框 marker
-                        bbox_marker = self._create_fused_bbox_marker(obj, marker_id, fused_color, stamp)
+                        bbox_marker = self._create_fused_bbox_marker(obj, marker_id, fused_color, stamp, fused_frame)
                         markers.markers.append(bbox_marker)
 
                         # 距离标签 marker
-                        label_marker = self._create_fused_distance_label(obj, marker_id, stamp)
+                        label_marker = self._create_fused_distance_label(obj, marker_id, stamp, fused_frame)
                         markers.markers.append(label_marker)
                         valid_count += 1
                     except Exception as e:
@@ -1055,7 +981,7 @@ class MultiCameraRVizNode(Node):
             for stale_id in stale_ids:
                 # 删除边界框
                 del_bbox = Marker()
-                del_bbox.header.frame_id = self._target_frame
+                del_bbox.header.frame_id = fused_frame
                 del_bbox.header.stamp = stamp
                 del_bbox.ns = "fused_object_bbox"
                 del_bbox.id = stale_id
@@ -1064,7 +990,7 @@ class MultiCameraRVizNode(Node):
 
                 # 删除标签
                 del_label = Marker()
-                del_label.header.frame_id = self._target_frame
+                del_label.header.frame_id = fused_frame
                 del_label.header.stamp = stamp
                 del_label.ns = "fused_distance_labels"
                 del_label.id = stale_id
@@ -1085,10 +1011,10 @@ class MultiCameraRVizNode(Node):
             import traceback
             traceback.print_exc()
 
-    def _create_fused_bbox_marker(self, obj, idx: int, color: Tuple, stamp) -> Marker:
+    def _create_fused_bbox_marker(self, obj, idx: int, color: Tuple, stamp, frame_id: str = '') -> Marker:
         """创建融合结果的边界框 Marker"""
         marker = Marker()
-        marker.header.frame_id = self._target_frame
+        marker.header.frame_id = frame_id or self._target_frame
         marker.header.stamp = stamp
         marker.ns = "fused_object_bbox"
         marker.id = idx
@@ -1099,60 +1025,46 @@ class MultiCameraRVizNode(Node):
         marker.pose.position.y = obj.position.y
         marker.pose.position.z = obj.position.z
         marker.pose.orientation.w = 1.0
-
-        # 融合结果使用稍大的尺寸以区分
-        marker.scale.x = 0.18
-        marker.scale.y = 0.18
-        marker.scale.z = 0.18
+        marker.scale.x = 0.15
+        marker.scale.y = 0.15
+        marker.scale.z = 0.15
 
         marker.color.r = color[0]
         marker.color.g = color[1]
         marker.color.b = color[2]
         marker.color.a = color[3]
 
-        marker.text = f"[FUSED] {obj.object_id}"
+        marker.text = ""  # 不用 CUBE 自带文字（RViz 会将其渲染到很高位置），由单独的 TEXT_VIEW_FACING marker 显示
         marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
 
-    def _create_fused_distance_label(self, obj, idx: int, stamp) -> Marker:
+    def _create_fused_distance_label(self, obj, idx: int, stamp, frame_id: str = '') -> Marker:
         """创建融合结果的距离标签 Marker"""
         marker = Marker()
-        marker.header.frame_id = self._target_frame
+        marker.header.frame_id = frame_id or self._target_frame
         marker.header.stamp = stamp
         marker.ns = "fused_distance_labels"
         marker.id = idx
         marker.type = Marker.TEXT_VIEW_FACING
         marker.action = Marker.ADD
 
+        # cube 中心在 z，半边长 0.075，顶面 ≈ z+0.075
         marker.pose.position.x = obj.position.x
         marker.pose.position.y = obj.position.y
-        marker.pose.position.z = obj.position.z + 0.20  # 稍高一些避免与单相机标签重叠
+        marker.pose.position.z = obj.position.z + 0.08
         marker.pose.orientation.w = 1.0
 
-        # 构建文字内容（格式与单相机保持一致，冒号后不加空格）
-        lines = [obj.object_id]
-
-        # 距离信息
-        if obj.distance > 0:
-            lines.append(f"dist:{obj.distance:.2f}m")
-        else:
-            dist = (obj.position.x**2 + obj.position.y**2 + obj.position.z**2) ** 0.5
-            lines.append(f"dist:{dist:.2f}m" if dist > 0.01 else "dist:N/A")
-
-        # 来源相机
+        # 2 行：ID|类别 / 距离|来源 (空格→下划线，避免RViz等宽字体显示极宽空格)
+        cat_disp = obj.category.replace(" ", "_") if obj.category else ""
+        oid_disp = obj.object_id.replace(" ", "_") if obj.object_id else ""
+        line1 = f"{oid_disp}|{cat_disp}" if cat_disp else oid_disp
+        line2 = f"{obj.distance:.2f}m" if obj.distance > 0 else ""
         if obj.source_camera:
-            lines.append(f"src:{obj.source_camera}")
+            line2 = f"{line2}|{obj.source_camera}" if line2 else obj.source_camera
+        marker.text = f"{line1}\n{line2}" if line2 else line1
 
-        # 置信度
-        if obj.confidence > 0:
-            lines.append(f"conf:{obj.confidence:.2f}")
-
-        marker.text = "\n".join(lines)
-
-        base_scale = 0.022  # 与单相机一致
-        distance = max(obj.distance, 0.5) if obj.distance > 0 else 1.0
-        marker.scale.z = base_scale * distance
+        marker.scale.z = 0.05
 
         # 使用金色文字
         marker.color.r = 1.0
@@ -1163,6 +1075,77 @@ class MultiCameraRVizNode(Node):
         marker.lifetime.sec = 3  # 固定3秒lifetime，避免检测间隔不稳定导致闪烁
 
         return marker
+
+
+    # ==================== 目标池可视化 ====================
+
+    def _pool_status_callback(self, msg: CleanerManagerStatus):
+        """目标池状态回调 → 发布 Sphere + 文字标签 markers"""
+        markers = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        frame_id = 'map'
+        current_ids = set()
+
+        for i, t in enumerate(msg.pool_targets):
+            marker_id = i
+            current_ids.add(marker_id)
+
+            base_color = self.POOL_STATUS_COLORS.get(t.status, (0.5, 0.5, 0.5, 0.7))
+            alpha = max(0.5, base_color[3] - 0.03 * (i % 8))
+
+            # Sphere marker
+            sphere = Marker()
+            sphere.header.frame_id = frame_id
+            sphere.header.stamp = stamp
+            sphere.ns = "pool_target_sphere"
+            sphere.id = marker_id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = t.pos_x
+            sphere.pose.position.y = t.pos_y
+            sphere.pose.position.z = t.pos_z
+            sphere.pose.orientation.w = 1.0
+            sz = max(t.physical_size, 0.08) if t.physical_size > 0 else 0.10
+            sphere.scale.x = sz
+            sphere.scale.y = sz
+            sphere.scale.z = sz
+            sphere.color = ColorRGBA(r=base_color[0], g=base_color[1], b=base_color[2], a=alpha)
+            sphere.lifetime.sec = 3
+            markers.markers.append(sphere)
+
+            # 文字标签
+            label = Marker()
+            label.header.frame_id = frame_id
+            label.header.stamp = stamp
+            label.ns = "pool_target_labels"
+            label.id = marker_id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = t.pos_x
+            label.pose.position.y = t.pos_y
+            label.pose.position.z = t.pos_z + sz / 2 + 0.05
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.06
+
+            status_name = self.POOL_STATUS_NAMES.get(t.status, '?')
+            label.text = f"{t.category}|{status_name}\nobs:{t.observations} att:{t.attempts}\n{t.distance:.1f}m"
+            label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
+            label.lifetime.sec = 3
+            markers.markers.append(label)
+
+        # 增量删除旧 markers
+        for stale_id in (self._previous_pool_ids - current_ids):
+            for ns in ("pool_target_sphere", "pool_target_labels"):
+                d = Marker()
+                d.header.frame_id = frame_id
+                d.header.stamp = stamp
+                d.ns = ns
+                d.id = stale_id
+                d.action = Marker.DELETE
+                markers.markers.append(d)
+
+        self._previous_pool_ids = current_ids
+        self.pub_pool_markers.publish(markers)
 
 
 def main(args=None):

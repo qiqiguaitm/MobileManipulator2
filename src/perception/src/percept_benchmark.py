@@ -27,7 +27,8 @@ import numpy as np
 
 # 支持直接 python3 执行（无需 ROS2 环境）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from percept import DinoXDetectorOnline, SAM3Online, GraspAnythingOnline, DepthOptimizerOnline
+from percept import (DinoXDetectorOnline, SAM3Online, GraspAnythingOnline, DepthOptimizerOnline,
+                     CombinedPerceptionClient, DualPerceptionClient)
 
 
 class SimpleConfig:
@@ -1077,6 +1078,158 @@ def benchmark_parallel_pipeline(sam3_service, fs_service,
     print(f"{'='*80}")
 
 
+def benchmark_combined_dual(url_gpu0, url_gpu1,
+                            top_frames, top_intrinsics,
+                            chassis_frames, chassis_intrinsics,
+                            text_prompt='pen,box,phone,bottle,toy',
+                            num_runs=10, warmup_runs=3):
+    """Combined server 双 GPU 并行 benchmark.
+
+    每次迭代: top → GPU0, chassis → GPU1, 并行执行 SAM3+FS。
+    衡量端到端 wall time, 判断是否达到 5Hz (≤200ms)。
+    """
+    n_top = len(top_frames)
+    n_chassis = len(chassis_frames)
+
+    cfg0 = SimpleConfig(url=url_gpu0, confidence=0.30, return_mask=False)
+    cfg1 = SimpleConfig(url=url_gpu1, confidence=0.30, return_mask=False)
+    dual = DualPerceptionClient(cfg0, cfg1)
+
+    # health check
+    health = dual.check_health()
+    for i, h in enumerate(health):
+        status = h.get('status', 'unknown')
+        print(f"  [GPU{i}] health: {status}")
+        if status != 'ok':
+            print(f"  [GPU{i}] WARNING: server not ready — {h}")
+
+    times = []
+    detail_times = []
+
+    print(f"\n{'='*70}")
+    print(f"[Combined Dual] GPU0={url_gpu0}  GPU1={url_gpu1}")
+    print(f"  {num_runs} runs, {warmup_runs} warmup, prompt={text_prompt}")
+    print(f"  Top: {n_top} frames, Chassis: {n_chassis} frames")
+    print(f"{'='*70}")
+
+    for i in range(warmup_runs + num_runs):
+        is_warmup = i < warmup_runs
+        d_top = top_frames[i % n_top]
+        d_chassis = chassis_frames[i % n_chassis]
+        timing = {}
+
+        t0 = time.perf_counter()
+        r0, r1 = dual.forward(
+            d_top['rgb'], d_top['ir_left'], d_top['ir_right'], top_intrinsics,
+            d_chassis['rgb'], d_chassis['ir_left'], d_chassis['ir_right'], chassis_intrinsics,
+            text_prompt=text_prompt, _timing=timing)
+        wall = time.perf_counter() - t0
+        wall_ms = wall * 1000
+
+        # summary per GPU
+        gpu0_http = timing.get('gpu0_combined_http', 0)
+        gpu1_http = timing.get('gpu1_combined_http', 0)
+        gpu0_enc = timing.get('gpu0_combined_encode', 0)
+        gpu1_enc = timing.get('gpu1_combined_encode', 0)
+        gpu0_dec = timing.get('gpu0_combined_decode', 0)
+        gpu1_dec = timing.get('gpu1_combined_decode', 0)
+
+        ok0 = r0.get('success', False)
+        ok1 = r1.get('success', False)
+        n_det0 = len(r0.get('detections', {}).get('objects', [])) if ok0 else -1
+        n_det1 = len(r1.get('detections', {}).get('objects', [])) if ok1 else -1
+        has_d0 = r0.get('depth') is not None if ok0 else False
+        has_d1 = r1.get('depth') is not None if ok1 else False
+
+        tag = 'WARM' if is_warmup else 'PERF'
+        num = i + 1 if is_warmup else i - warmup_runs + 1
+
+        # 网络分析字段
+        g0_up = timing.get('gpu0_upload_kb', 0)
+        g0_dn = timing.get('gpu0_download_kb', 0)
+        g0_srv = timing.get('gpu0_server_total', 0)
+        g1_up = timing.get('gpu1_upload_kb', 0)
+        g1_dn = timing.get('gpu1_download_kb', 0)
+        g1_srv = timing.get('gpu1_server_total', 0)
+        g0_net = gpu0_http - g0_srv
+        g1_net = gpu1_http - g1_srv
+
+        print(f"  {tag} #{num:03d}: wall={wall_ms:.0f}ms | "
+              f"GPU0[enc:{gpu0_enc:.0f} http:{gpu0_http:.0f}(srv:{g0_srv:.0f}+net:{g0_net:.0f}) "
+              f"dec:{gpu0_dec:.0f} ↑{g0_up:.0f}KB↓{g0_dn:.0f}KB] "
+              f"GPU1[enc:{gpu1_enc:.0f} http:{gpu1_http:.0f}(srv:{g1_srv:.0f}+net:{g1_net:.0f}) "
+              f"dec:{gpu1_dec:.0f} ↑{g1_up:.0f}KB↓{g1_dn:.0f}KB]")
+
+        if not is_warmup:
+            times.append(wall)
+            detail_times.append(timing)
+
+    if not times:
+        print("  No valid runs.")
+        return
+
+    # --- statistics ---
+    sorted_times = sorted(times)
+    n = len(sorted_times)
+    avg_ms = statistics.mean(times) * 1000
+    p50_ms = sorted_times[n // 2] * 1000
+    p95_ms = sorted_times[min(int((n - 1) * 0.95), n - 1)] * 1000
+    min_ms = sorted_times[0] * 1000
+    max_ms = sorted_times[-1] * 1000
+
+    print(f"\n{'='*70}")
+    print(f"[Combined Dual] 统计 ({n} runs)")
+    print(f"{'='*70}")
+    print(f"  {'Metric':<8} {'avg':>7} {'P50':>7} {'P95':>7} {'min':>7} {'max':>7}")
+    print(f"  {'─'*43}")
+    print(f"  {'Wall':<8} {avg_ms:7.1f} {p50_ms:7.1f} {p95_ms:7.1f} {min_ms:7.1f} {max_ms:7.1f}")
+
+    # Per-stage averages
+    stage_keys = ['gpu0_combined_encode', 'gpu0_combined_http', 'gpu0_combined_decode',
+                  'gpu1_combined_encode', 'gpu1_combined_http', 'gpu1_combined_decode']
+    print(f"\n  分项耗时 (avg, ms):")
+    for key in stage_keys:
+        vals = [t.get(key, 0) for t in detail_times]
+        avg_v = statistics.mean(vals)
+        label = key.replace('combined_', '')
+        print(f"    {label:<22}: {avg_v:6.1f}")
+
+    # 网络分析
+    net_keys = [
+        ('gpu0_upload_kb',    'gpu0 upload (KB)'),
+        ('gpu0_download_kb',  'gpu0 download (KB)'),
+        ('gpu0_server_total', 'gpu0 server_total (ms)'),
+        ('gpu1_upload_kb',    'gpu1 upload (KB)'),
+        ('gpu1_download_kb',  'gpu1 download (KB)'),
+        ('gpu1_server_total', 'gpu1 server_total (ms)'),
+    ]
+    print(f"\n  网络分析 (avg):")
+    for key, label in net_keys:
+        vals = [t.get(key, 0) for t in detail_times]
+        avg_v = statistics.mean(vals) if vals else 0
+        print(f"    {label:<26}: {avg_v:6.1f}")
+    # 推算网络开销
+    for gpu_label in ['gpu0', 'gpu1']:
+        http_vals = [t.get(f'{gpu_label}_combined_http', 0) for t in detail_times]
+        srv_vals = [t.get(f'{gpu_label}_server_total', 0) for t in detail_times]
+        net_vals = [h - s for h, s in zip(http_vals, srv_vals)]
+        avg_net = statistics.mean(net_vals) if net_vals else 0
+        up_vals = [t.get(f'{gpu_label}_upload_kb', 0) for t in detail_times]
+        dn_vals = [t.get(f'{gpu_label}_download_kb', 0) for t in detail_times]
+        avg_up = statistics.mean(up_vals) if up_vals else 0
+        avg_dn = statistics.mean(dn_vals) if dn_vals else 0
+        print(f"    {gpu_label} net overhead     : {avg_net:6.1f} ms "
+              f"(↑{avg_up:.0f}+↓{avg_dn:.0f} = {avg_up+avg_dn:.0f} KB)")
+
+    hz = 1000.0 / p50_ms if p50_ms > 0 else 0
+    target_ms = 200.0
+    ok = p50_ms <= target_ms
+    print(f"\n  频率 (P50): {hz:.2f} Hz")
+    print(f"  5Hz 可达性: {'✅ 达标' if ok else '❌ 未达标'} "
+          f"(P50={p50_ms:.1f}ms, 目标≤{target_ms:.0f}ms)")
+    print(f"{'='*70}")
+
+
 def compute_centroid_from_mask(depth_m, mask, bbox, intrinsics,
                                erode_kernel=5, iqr_factor=1.5,
                                depth_min=0.3, depth_max=10.0, min_pts=10):
@@ -1385,6 +1538,12 @@ def main():
                        help='SAM3 text prompt for parallel mode')
     parser.add_argument('--max-stereo-frames', type=int, default=20,
                        help='Stereo 测试最大帧数 (default: 20, 0=不限)')
+    parser.add_argument('--combined-url-gpu0', type=str,
+                       default='http://192.168.112.14:8090',
+                       help='Combined server URL for GPU0')
+    parser.add_argument('--combined-url-gpu1', type=str,
+                       default='http://192.168.112.14:8091',
+                       help='Combined server URL for GPU1')
     args = parser.parse_args()
 
     # 如果没有指定任何模式，默认运行 benchmark
@@ -1601,12 +1760,15 @@ def main():
                 print(f"  [Stereo] 帧数限制: {len(stereo_args_list)} → {args.max_stereo_frames}")
                 stereo_args_list = stereo_args_list[:args.max_stereo_frames]
 
+            # 固定 stereo 总测试次数 = 50 (num_runs × frames ≈ 50)
+            stereo_total_target = 50
+            stereo_num_runs = max(1, stereo_total_target // len(stereo_args_list))
             result = benchmark_with_timing(
                 func=fs_service.forward_stereo,
                 args_list=stereo_args_list,
                 kwargs={},
                 name='Stereo(FS)',
-                num_runs=num_runs,
+                num_runs=stereo_num_runs,
                 warmup_runs=warmup_runs
             )
             all_results.append(result)
@@ -1685,6 +1847,33 @@ def main():
             traceback.print_exc()
     elif not stereo_available or len(camera_datasets) < 2:
         print(f"\n[SAM3+Stereo 双路] 跳过 - 需要至少2组相机数据 (当前 {len(camera_datasets)} 组)")
+
+    # ========== 8. Combined Server 双 GPU 并行测试 ==========
+    if args.combined_url_gpu0 and args.combined_url_gpu1:
+        if stereo_available and len(camera_datasets) >= 2:
+            try:
+                cam_a_name, cam_a_frames, cam_a_intrinsics = camera_datasets[0]
+                cam_b_name, cam_b_frames, cam_b_intrinsics = camera_datasets[1]
+
+                benchmark_combined_dual(
+                    url_gpu0=args.combined_url_gpu0,
+                    url_gpu1=args.combined_url_gpu1,
+                    top_frames=cam_a_frames,
+                    top_intrinsics=cam_a_intrinsics,
+                    chassis_frames=cam_b_frames,
+                    chassis_intrinsics=cam_b_intrinsics,
+                    text_prompt=text_prompt_sam3,
+                    num_runs=num_runs,
+                    warmup_runs=warmup_runs,
+                )
+            except Exception as e:
+                print(f"\n[Combined Dual] 测试失败: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"\n[Combined Dual] 跳过 - 需要至少2组相机数据 (当前 {len(camera_datasets)} 组)")
+    elif args.combined_url_gpu0 or args.combined_url_gpu1:
+        print(f"\n[Combined Dual] 跳过 - 需要同时指定 --combined-url-gpu0 和 --combined-url-gpu1")
 
     # ========== 汇总对比 ==========
     if all_results:
