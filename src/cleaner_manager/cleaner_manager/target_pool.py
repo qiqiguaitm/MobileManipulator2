@@ -104,7 +104,11 @@ class TargetPool:
 
     @staticmethod
     def _estimate_physical_size(obj) -> float:
-        """Estimate max physical dimension from bbox + depth (D435 fx≈920)."""
+        """Return physical size from perception (real intrinsics), fallback to bbox+depth estimate."""
+        ps = getattr(obj, 'physical_size', 0.0) or 0.0
+        if ps > 0:
+            return ps
+        # fallback: hardcoded fx (D435 @ 1280x720)
         FX = 920.0
         bbox = obj.bbox
         depth = obj.depth

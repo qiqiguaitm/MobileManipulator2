@@ -20,13 +20,14 @@ class TargetFilter:
     occupied / inscribed cells in the global costmap.
     """
 
-    # RealSense D435 @ 1280x720 typical focal length
+    # Fallback focal length (RealSense D435 @ 1280x720)
+    # 优先使用 obj.physical_size（感知节点用真实内参预算）
     _FX = 920.0
     _FY = 920.0
 
     def __init__(self,
-                 z_min: float = -0.20,   # base_link frame; floor at -0.15m (chassis 15cm)
-                 z_max: float = 0.35,    # 35cm above base_link = 50cm above floor
+                 z_min: float = -0.20,   # map frame; ground ≈ -0.12m, 此值允许地面以下 8cm
+                 z_max: float = 0.35,    # map frame; 地面以上 ~47cm, 低于桌面高度
                  dist_min: float = 0.15,
                  dist_max: float = 6.0,
                  size_min: float = 0.02,
@@ -100,11 +101,11 @@ class TargetFilter:
         z    = obj.position.z
         dist = obj.distance
 
-        # 1. Height (base_link z-axis)
+        # 1. Height (map frame z)
         if not (self.z_min <= z <= self.z_max):
             if self._log:
                 self._log.debug(
-                    f'[FILTER✗] {cat} z={z:.2f}m 超出高度范围'
+                    f'[FILTER✗] {cat} z={z:.2f}m 超出map高度范围'
                     f'[{self.z_min},{self.z_max}]')
             return False
 
@@ -116,25 +117,43 @@ class TargetFilter:
                     f'超出范围[{self.dist_min},{self.dist_max}]m')
             return False
 
-        # 3. Physical size (bbox + depth back-projection)
+        # 3. Physical size — 优先用感知节点预算值，fallback 硬编码 fx
+        phys_max = getattr(obj, 'physical_size', 0.0) or 0.0
         bbox  = obj.bbox
         depth = obj.depth
-        if depth > 0.1 and bbox is not None and len(bbox) >= 4:
+        if phys_max > 0:
+            # 感知节点已用真实内参计算 physical_size (max dimension)
+            # 估算 min dimension: bbox 短边/长边 × phys_max
+            if bbox is not None and len(bbox) >= 4:
+                bw = bbox[2] - bbox[0]
+                bh = bbox[3] - bbox[1]
+                if max(bw, bh) > 0:
+                    phys_min = min(bw, bh) / max(bw, bh) * phys_max
+                else:
+                    phys_min = phys_max
+            else:
+                phys_min = phys_max
+        elif depth > 0.1 and bbox is not None and len(bbox) >= 4:
+            # fallback: 硬编码焦距
             phys_w = (bbox[2] - bbox[0]) * depth / self._FX
             phys_h = (bbox[3] - bbox[1]) * depth / self._FY
             phys_max = max(phys_w, phys_h)
             phys_min = min(phys_w, phys_h)
+        else:
+            phys_max = phys_min = 0.0
+
+        if phys_max > 0:
             if phys_max > self.size_max:
                 if self._log:
                     self._log.debug(
                         f'[FILTER✗] {cat} 过大 '
-                        f'{phys_w:.2f}x{phys_h:.2f}m > {self.size_max}m')
+                        f'phys_max={phys_max:.3f}m > {self.size_max}m')
                 return False
             if phys_min < self.size_min:
                 if self._log:
                     self._log.debug(
                         f'[FILTER✗] {cat} 过小 '
-                        f'{phys_w:.2f}x{phys_h:.2f}m < {self.size_min}m')
+                        f'phys_min={phys_min:.3f}m < {self.size_min}m')
                 return False
 
         # 4. Costmap navigability (map frame)

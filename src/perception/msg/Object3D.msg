@@ -16,6 +16,9 @@ float64 confidence                 # 测量置信度
 geometry_msgs/Point position_optical  # optical frame 下的位置 (x右, y下, z前/深度)
 float64 depth                         # 中心点深度 (m), 即 position_optical.z
 
+# 物理尺寸估算 (由感知节点用真实相机内参计算)
+float64 physical_size              # 估计最大物理尺寸 (m), bbox反投影
+
 # LiDAR 测量 (可选, distance_lidar=0 表示无效或禁用)
 float64 distance_lidar             # LiDAR 测距 (m)
 geometry_msgs/Point position_lidar # LiDAR 质心

@@ -167,8 +167,10 @@ class MultiCameraPerceptionNode(Node):
         )
 
         # ========== Map 坐标系支持 ==========
+        # TF listener 在独立节点+线程中运行，避免被主 executor 的相机/Timer 回调阻塞
+        self._tf_node = rclpy.create_node('_perception_tf_listener')
         self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self._tf_node, spin_thread=True)
         self._localization_ready = False
         self.create_subscription(Bool, '/localization_status', self._localization_status_cb, 5)
 
@@ -212,18 +214,31 @@ class MultiCameraPerceptionNode(Node):
             return None
         try:
             ts = None
+            tf_mode = 'latest'
             if image_stamp is not None:
                 try:
                     query_time = rclpy.time.Time.from_msg(image_stamp)
                     ts = self._tf_buffer.lookup_transform(
                         'map', 'base_link', query_time,
                         timeout=Duration(seconds=0.0))
+                    tf_mode = 'interpolated'
                 except Exception:
                     pass  # ExtrapolationException: image 比最新TF更新
             if ts is None:
                 ts = self._tf_buffer.lookup_transform(
                     'map', 'base_link', rclpy.time.Time(),
                     timeout=Duration(seconds=0.05))
+                tf_mode = 'latest' if image_stamp is not None else 'no_stamp'
+            # TF 时间同步监控
+            tf_t = ts.header.stamp.sec + ts.header.stamp.nanosec * 1e-9
+            now = time.time()
+            tf_age = now - tf_t
+            if image_stamp is not None:
+                img_t = image_stamp.sec + image_stamp.nanosec * 1e-9
+                delta = abs(tf_t - img_t) * 1000
+                self.get_logger().warn(
+                    f'[TF] mode={tf_mode} img_age={now-img_t:.3f}s '
+                    f'tf_age={tf_age:.3f}s delta={delta:.1f}ms')
             t = ts.transform.translation
             q = ts.transform.rotation
             # quaternion → rotation matrix (无 scipy 依赖)
@@ -1036,6 +1051,16 @@ class MultiCameraPerceptionNode(Node):
             )
             obj.depth = float(optical_centroid[2])
             obj.source_camera = camera_name
+            # 物理尺寸: bbox 反投影，用真实相机内参
+            intr = task.intrinsics or {}
+            _fx = intr.get('fx', 920.0)
+            _fy = intr.get('fy', 920.0)
+            _bbox = det['bbox']
+            _dep = float(optical_centroid[2])
+            if _dep > 0.1 and len(_bbox) >= 4:
+                _pw = (_bbox[2] - _bbox[0]) * _dep / _fx
+                _ph = (_bbox[3] - _bbox[1]) * _dep / _fy
+                obj.physical_size = float(max(_pw, _ph))
             result.objects.append(obj)
 
         result.objects = self._filter_footprint(result.objects)
@@ -1336,9 +1361,11 @@ class MultiCameraPerceptionNode(Node):
                     # 返回指定相机结果
                     response.result = results.get(request.camera_id)
                 else:
-                    # 返回第一个相机结果
-                    primary_camera = cameras[0]
-                    response.result = results[primary_camera]
+                    # 返回第一个有结果的相机
+                    for cam in cameras:
+                        if cam in results:
+                            response.result = results[cam]
+                            break
 
                 # 发布所有结果（不做融合）
                 for camera_name, result in results.items():
@@ -1406,8 +1433,16 @@ class MultiCameraPerceptionNode(Node):
         # ── combined 模式: 复用 _run_combined_detection (与 Timer+Queue 路径统一) ──
         combined_client = self._combined_clients.get(camera_name)
         if combined_client is not None:
-            data = sensor.get_latest_data()
-            if data is None or data.get('age', 0) > 3.0:
+            # 服务调用路径：短暂等待数据到达（与 get_synced_data 对齐）
+            data = None
+            for _ in range(20):  # 最多等 2s
+                data = sensor.get_latest_data()
+                if data is not None and data.get('age', 0) <= 3.0:
+                    break
+                data = None
+                time.sleep(0.1)
+            if data is None:
+                self.get_logger().warn(f'[{camera_name}] combined 服务调用: 无可用数据')
                 return None
             try:
                 optical_to_base = transformer.get_transform('optical_to_base')
@@ -1548,6 +1583,15 @@ class MultiCameraPerceptionNode(Node):
             )
             obj.depth = float(optical_centroid[2])  # z 值即为深度
             obj.source_camera = camera_name
+            # 物理尺寸: bbox 反投影，用真实相机内参
+            _fx = sensor.intrinsics.get('fx', 920.0) if sensor.intrinsics else 920.0
+            _fy = sensor.intrinsics.get('fy', 920.0) if sensor.intrinsics else 920.0
+            _bbox = det['bbox']
+            _dep = float(optical_centroid[2])
+            if _dep > 0.1 and len(_bbox) >= 4:
+                _pw = (_bbox[2] - _bbox[0]) * _dep / _fx
+                _ph = (_bbox[3] - _bbox[1]) * _dep / _fy
+                obj.physical_size = float(max(_pw, _ph))
 
             result.objects.append(obj)
 
@@ -1596,6 +1640,7 @@ class MultiCameraPerceptionNode(Node):
                 obj_copy.position_optical = obj.position_optical
                 obj_copy.depth = obj.depth
                 obj_copy.source_camera = obj.source_camera
+                obj_copy.physical_size = obj.physical_size
                 merged.objects.append(obj_copy)
                 total_count += 1
 
@@ -1774,6 +1819,7 @@ class MultiCameraPerceptionNode(Node):
             obj.position_optical = original_obj.position_optical
             obj.depth = original_obj.depth
             obj.source_camera = track.get('source', original_obj.source_camera)
+            obj.physical_size = original_obj.physical_size
             result.objects.append(obj)
 
         return result
@@ -1901,6 +1947,7 @@ class MultiCameraPerceptionNode(Node):
             # distance 取两相机的均值（base_link 下到机器人的真实距离，不受 map 变换影响）
             fused_obj.distance = (obj_chassis.distance + obj_top.distance) / 2.0
             fused_obj.depth = fused_obj.distance
+            fused_obj.physical_size = max(obj_chassis.physical_size, obj_top.physical_size)
 
             # 融合置信度
             fused_obj.confidence = match.fused_confidence if match.fused_confidence > 0 else \
@@ -2040,6 +2087,10 @@ class MultiCameraPerceptionNode(Node):
 
         # 关闭共享线程池
         self._detection_executor.shutdown(wait=False)
+
+        # 清理 TF 独立节点
+        if hasattr(self, '_tf_node'):
+            self._tf_node.destroy_node()
 
         self.get_logger().info('Timer + Worker 已停止')
         super().destroy_node()
