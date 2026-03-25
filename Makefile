@@ -201,7 +201,7 @@ _cam-prepare:
 	done; \
 	sleep 1
 
-# 全手动模式: 感知 + 导航 + 抓取全流程 (手动控制面板)
+# 全手动模式: Timer=0，纯service按需检测 + GUI面板
 full-manual: _cam-prepare
 	@echo "[FULL-MANUAL] 启动手动控制全流程..."
 	@DISPLAY=$${DISPLAY:-:1} xhost +local: 2>/dev/null || true
@@ -210,9 +210,10 @@ full-manual: _cam-prepare
 		rviz:=true gui:=true \
 		use_odom_fusion:=true \
 		launch_chassis:=true \
-		detector_type:=sam3
+		detector_type:=sam3 \
+		top_detect_rate:=0.0 chassis_detect_rate:=0.0 fusion_publish_rate:=0.0
 
-# 全自主模式: 感知 + 导航 + 自主清扫循环
+# 全自主模式: Timer全速连续检测 + ByteTracker3D + topic订阅
 full full-auto: _cam-prepare
 	@echo "[FULL-AUTO] 启动自主清扫全流程..."
 	@DISPLAY=$${DISPLAY:-:1} xhost +local: 2>/dev/null || true
@@ -222,8 +223,7 @@ full full-auto: _cam-prepare
 		use_odom_fusion:=true \
 		launch_chassis:=true \
 		detector_type:=sam3 \
-		perception_rviz:=false \
-		top_detect_rate:=0.0 chassis_detect_rate:=0.0 fusion_publish_rate:=0.0
+		perception_rviz:=false
 
 # ============================================
 # 构建命令

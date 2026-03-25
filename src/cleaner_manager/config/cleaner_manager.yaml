@@ -9,12 +9,11 @@ manual_control_node:
     observe_timeout: 10.0
     pick_timeout: 60.0
     place_timeout: 30.0
-    nav_timeout: 120.0
+    nav_timeout: 45.0
     status_rate: 10.0
 
 cleaner_manager_node:
   ros__parameters:
-    detection_mode: "service"    # "topic" (订阅+ByteTracker) or "service" (按需检测)
     tracked_objects_topic: "/multi_camera_perception/fused/objects_3d"
     max_attempts: 3
     max_picks_per_nav: 10
@@ -26,14 +25,14 @@ cleaner_manager_node:
     observe_timeout: 10.0      # s
     pick_timeout: 60.0         # s
     place_timeout: 30.0        # s
-    nav_timeout: 120.0         # s
+    nav_timeout: 45.0          # s (成功导航一般3-6s, 留够BT recovery)
     max_consecutive_failures: 3
     error_cooldown: 5.0        # s
     max_error_retries: 3
     status_rate: 1.0           # Hz
     target_ttl: 0.0            # s, target expiry; 0=disabled
     match_threshold: 0.10      # m, 2D horizontal merge threshold
-    min_observations: 2        # min frames before target enters candidate pool
+    min_observations: 4        # min frames before target enters candidate pool
     wait_for_first_target_timeout: 15.0  # s, startup wait for perception
     scan_duration: 3.0         # s, 收臂后观察窗口时长
     pick_clear_max_dist: 0.25  # m, 抓取后清除目标池的最大匹配距离 (2D)
@@ -45,7 +44,7 @@ cleaner_manager_node:
     reapproach_ymax_mm: 250.0          # mm, |base y| > 此值侧向无法修正 (= working_area ymax)
     min_scan_time: 2.0         # s, minimum SCANNING dwell time
     # --- TargetFilter: 感知入池统一准入门槛 (可通过 CleanerPanel 运行时更新) ---
-    grasp_z_min: -0.15          # m, base_link frame; floor=-0.15m (chassis 15cm high)
+    grasp_z_min: -0.25          # m, map frame; 地面物体z可低至-0.20
     grasp_z_max:  0.25          # m, 35cm above base_link = 50cm above floor
     grasp_distance_min: 0.15    # m, 最近有效距离 (D435 最小深度约 0.1m)
     grasp_distance_max: 4.8     # m, 最远感知跟踪距离

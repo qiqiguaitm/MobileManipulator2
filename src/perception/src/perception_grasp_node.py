@@ -85,6 +85,8 @@ class PerceptionGraspNode(Node):
         # 声明动态参数（可能不在 YAML 中）
         if not self.has_parameter('debug_filter'):
             self.declare_parameter('debug_filter', False)
+        if not self.has_parameter('save_debug_image'):
+            self.declare_parameter('save_debug_image', False)
         if not self.has_parameter('log_level'):
             self.declare_parameter('log_level', 'INFO')
 
@@ -552,6 +554,13 @@ class PerceptionGraspNode(Node):
 
             t4 = time.time()
             timing['build_objects'] = (t4 - t3) * 1000
+
+            # === Debug: 保存检测可视化图 ===
+            if self.get_parameter('save_debug_image').value:
+                try:
+                    self._save_debug_image(rgb, targets, grasp_objects, chosen_idx)
+                except Exception as e:
+                    self.log.warn(f"DEBUG_IMG: Save failed: {e}")
 
             # === 构建返回结果 ===
             detection_time_ms = (time.time() - t0) * 1000
@@ -1050,6 +1059,71 @@ class PerceptionGraspNode(Node):
             self.log.info(f"BUILD: Filters applied: {' | '.join(build_logs)}")
 
         return grasp_objects, chosen_idx
+
+    def _save_debug_image(self, rgb, targets, grasp_objects, chosen_idx):
+        """保存带 bounding box + grasp 信息的检测可视化图到 /tmp/"""
+        vis = rgb.copy()
+        h, w = vis.shape[:2]
+
+        COLORS = [
+            (0, 255, 0),    # green
+            (255, 165, 0),  # orange
+            (255, 0, 0),    # red
+            (0, 255, 255),  # yellow
+            (255, 0, 255),  # magenta
+            (0, 165, 255),  # orange-ish
+        ]
+
+        # Draw DinoX targets (all raw detections, including filtered ones)
+        for i, target in enumerate(targets):
+            bbox = target.get('bbox', [])
+            if len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+            cat = target.get('category', '?')
+            score = target.get('score', 0)
+            color = COLORS[i % len(COLORS)]
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            label = f"T{i} {cat} {score:.2f}"
+            cv2.putText(vis, label, (x1, max(y1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        # Draw grasp objects (after filtering, with 3D info)
+        for i, obj in enumerate(grasp_objects):
+            if obj.grasp_score <= 0 and obj.depth <= 0:
+                continue
+            cx, cy = int(obj.grasp_center[0]), int(obj.grasp_center[1])
+            is_chosen = (i == chosen_idx)
+            marker_color = (0, 255, 255) if is_chosen else (255, 255, 255)
+
+            # Grasp center cross
+            sz = 8
+            cv2.line(vis, (cx - sz, cy), (cx + sz, cy), marker_color, 2)
+            cv2.line(vis, (cx, cy - sz), (cx, cy + sz), marker_color, 2)
+
+            # Grasp angle line
+            angle_rad = obj.grasp_angle
+            dx = int(30 * math.cos(angle_rad))
+            dy = int(30 * math.sin(angle_rad))
+            cv2.line(vis, (cx - dx, cy - dy), (cx + dx, cy + dy), marker_color, 2)
+
+            # Info label: category, depth, score, 3D position
+            p = obj.position
+            depth_mm = int(obj.depth * 1000)
+            pos_str = f"{p.x*1000:.0f},{p.y*1000:.0f},{p.z*1000:.0f}"
+            info = f"{'>>>' if is_chosen else ''}{obj.category} d={depth_mm} s={obj.grasp_score:.2f} [{pos_str}]mm"
+            cv2.putText(vis, info, (cx + 12, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, marker_color, 1, cv2.LINE_AA)
+
+        # Timestamp + summary
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        summary = f"targets={len(targets)} objects={len(grasp_objects)} chosen={chosen_idx}"
+        cv2.putText(vis, summary, (8, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        path = f"/tmp/observe_debug_{ts}.jpg"
+        cv2.imwrite(path, vis)
+        self.log.info(f"DEBUG_IMG: Saved {path} ({len(targets)} targets, {len(grasp_objects)} objects)")
 
     def _get_robust_depth(self, depth, mask_cache, bbox, min_depth=0.001, max_depth=2.0):
         """

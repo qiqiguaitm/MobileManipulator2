@@ -20,18 +20,16 @@ class ApproachConfig:
     approach_distance: float = 0.40     # 接近点到目标的距离 (米)
     nav_timeout: float = 60.0           # Nav2 导航超时时间 (秒)
 
-    # ========== 阶段2: 原地旋转对齐 ==========
-    align_tolerance: float = 0.087      # 对齐容差，5° → 8° (弧度)，宁愿误差大不振荡
-    align_kp: float = 0.35              # PD控制器 P增益 (0.6→0.35，降低响应减少超调)
-    align_kd: float = 0.4               # PD控制器 D增益 (0.3→0.4，加大阻尼抑制振荡)
-    align_max_omega: float = 0.25       # 最大角速度 (0.4→0.25 弧度/秒，限制转速上限)
-    align_max_alpha: float = 0.6        # 最大角加速度 (1.0→0.6 弧度/秒²)，更平滑
-    align_min_omega: float = 0.02       # 死区角速度 (弧度/秒)，低于此值发0避免抖动
-    align_timeout: float = 10.0         # 对齐超时时间 (秒)
+    # ========== 阶段2: 原地旋转对齐 (纯 P 控制) ==========
+    align_tolerance: float = 0.087      # 对齐容差 5° (弧度)
+    align_kp: float = 1.5              # P 增益 (纯 P，无需 D 项; 差速底盘直接接受角速度)
+    align_max_omega: float = 0.5       # 最大角速度 (弧度/秒)
+    align_min_omega: float = 0.03       # 死区角速度 (弧度/秒)，克服静摩擦
+    align_timeout: float = 15.0         # 对齐超时 (秒)
     min_align_distance: float = 0.10    # 距离小于此值跳过对齐 (米)
     align_settle_time: float = 0.8      # 粗对齐后停稳等待时间 (秒)
     depth_warmup_frames: int = 5        # 深度传感器预热帧数，丢弃前N帧不稳定数据
-    camera_lateral_offset: float = -0.013 # 机器人中心在相机光学系的x偏移 (米，相机光学系x=右，-0.013=中心在相机左侧1.3cm)
+    camera_lateral_offset: float = 0.033  # 机器人中心在相机光学系的x偏移 (米，相机光学系x=右，+0.033=中心在相机右侧3.3cm，来源：外参translation.x)
 
     # ========== 阶段3: 精确接近 ==========
     final_approach_speed: float = 0.12      # 最大前进速度 (米/秒)
@@ -57,7 +55,7 @@ class ApproachConfig:
 
     # ========== 去噪参数 ==========
     outlier_radius: float = 0.05            # 半径异常值去除: 搜索半径 (米)
-    outlier_min_neighbors: int = 3          # 半径异常值去除: 最少邻居数
+    outlier_min_neighbors: int = 5          # 半径异常值去除: 最少邻居数 (5=要求空间一致性更强，抑制飞点)
 
     # ========== RANSAC 地面拟合参数 ==========
     ransac_distance_threshold: float = 0.03 # 点到平面距离阈值 (米)
@@ -105,9 +103,7 @@ def load_config_from_node(node) -> ApproachConfig:
         # 阶段2
         ('align_tolerance', config.align_tolerance),
         ('align_kp', config.align_kp),
-        ('align_kd', config.align_kd),
         ('align_max_omega', config.align_max_omega),
-        ('align_max_alpha', config.align_max_alpha),
         ('align_min_omega', config.align_min_omega),
         ('align_timeout', config.align_timeout),
         ('min_align_distance', config.min_align_distance),
@@ -164,9 +160,7 @@ def load_config_from_node(node) -> ApproachConfig:
     config.nav_timeout = node.get_parameter('nav_timeout').value
     config.align_tolerance = node.get_parameter('align_tolerance').value
     config.align_kp = node.get_parameter('align_kp').value
-    config.align_kd = node.get_parameter('align_kd').value
     config.align_max_omega = node.get_parameter('align_max_omega').value
-    config.align_max_alpha = node.get_parameter('align_max_alpha').value
     config.align_min_omega = node.get_parameter('align_min_omega').value
     config.align_timeout = node.get_parameter('align_timeout').value
     config.min_align_distance = node.get_parameter('min_align_distance').value

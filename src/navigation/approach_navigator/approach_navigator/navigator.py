@@ -223,6 +223,10 @@ class ApproachNavigator(Node):
             self.get_logger().error("无法获取机器人位姿")
             return ApproachResult(False, "TF_ERROR", "无法获取机器人位姿", stage=0)
 
+        self.get_logger().info(
+            f"approach_to_target: input=({target_position.x:.3f},{target_position.y:.3f}), "
+            f"robot=({robot_pos.x:.3f},{robot_pos.y:.3f}) yaw={math.degrees(robot_yaw):.1f}°")
+
         # 计算接近位姿
         approach_pose = compute_approach_pose(
             target_position,
@@ -307,6 +311,9 @@ class ApproachNavigator(Node):
         if target_position is None:
             target_position = self._compute_target_from_approach_pose(approach_pose)
         self.target_map_position = target_position
+        self.get_logger().info(
+            f"目标设定: target_map=({target_position.x:.3f},{target_position.y:.3f}), "
+            f"approach=({approach_pose.pose.position.x:.3f},{approach_pose.pose.position.y:.3f})")
 
         def notify(stage: NavStage, msg: str):
             """通知阶段变化"""
@@ -604,93 +611,65 @@ class ApproachNavigator(Node):
         if abs(camera_offset) > 0.001:
             self.get_logger().info(f"相机横向偏移补偿: {camera_offset * 100:.1f}cm")
 
-        # PD 控制循环 — 对齐到目标聚类中心
-        loop_dt = 0.05                  # 20 Hz
+        # 纯 P 控制循环 — 对齐到目标聚类中心
+        cfg = self.config
         start_time = time.time()
-        last_error = 0.0
-        last_time = start_time
-        current_omega = 0.0             # 平滑用
         prev_cx, prev_cz = cx, cz      # 时序连续性
 
         while rclpy.ok() and not self._cancel_requested:
-            current_time = time.time()
-
-            if current_time - start_time > self.config.align_timeout:
+            if time.time() - start_time > cfg.align_timeout:
                 self._stop_robot()
                 return False, "精对齐超时"
 
             robot_pos, robot_yaw = self._get_robot_pose()
             if robot_pos is None:
-                time.sleep(loop_dt)
+                time.sleep(0.05)
                 continue
 
             clusters = self.depth_sensor.get_all_cluster_centroids()
             if not clusters:
-                time.sleep(loop_dt)
+                time.sleep(0.05)
                 continue
 
             best = self._select_cluster(
                 clusters, robot_pos, robot_yaw, prev_cx, prev_cz)
             if best is None:
-                time.sleep(loop_dt)
+                time.sleep(0.05)
                 continue
             cx, cy, cz = best
             prev_cx, prev_cz = cx, cz
 
             # 角度误差: cx>0 → 偏右 → 需右转 (omega<0)
-            # camera_offset 补偿相机与机器人中心线的横向偏移
             error = -math.atan2(cx - camera_offset, cz)
 
-            if abs(error) < self.config.align_tolerance:
+            if abs(error) < cfg.align_tolerance:
                 self._stop_robot()
-                # 保存锁定种子，供阶段3继承
                 self._locked_target_cx = cx
                 self._locked_target_cz = cz
                 self.get_logger().info(
-                    f"精对齐完成，误差: {math.degrees(error):.2f}°, "
-                    f"目标距离: {cz:.3f}m"
-                )
+                    f"精对齐完成，误差={math.degrees(error):.1f}°, "
+                    f"目标距离={cz:.3f}m")
                 return True, ""
 
-            # PD 控制
-            actual_dt = current_time - last_time
-            if actual_dt > 0.001:
-                d_error = (error - last_error) / actual_dt
-            else:
-                d_error = 0.0
+            # 纯 P + 限幅 + 死区
+            omega = max(-cfg.align_max_omega,
+                        min(cfg.align_max_omega, cfg.align_kp * error))
+            if 0 < abs(omega) < cfg.align_min_omega:
+                omega = math.copysign(cfg.align_min_omega, omega)
 
-            target_omega = self.config.align_kp * error + self.config.align_kd * d_error
-            target_omega = max(-self.config.align_max_omega,
-                               min(self.config.align_max_omega, target_omega))
-
-            # 角加速度限幅 — 平滑omega变化，防止突变导致晃动
-            max_delta = self.config.align_max_alpha * loop_dt
-            omega_diff = target_omega - current_omega
-            if abs(omega_diff) > max_delta:
-                current_omega += max_delta if omega_diff > 0 else -max_delta
-            else:
-                current_omega = target_omega
-
-            # 死区 — 极小omega不足以克服摩擦力，发0避免电机抖动
             cmd = Twist()
-            if abs(current_omega) >= self.config.align_min_omega:
-                cmd.angular.z = current_omega
+            cmd.angular.z = omega
             self.cmd_vel_pub.publish(cmd)
-
-            last_error = error
-            last_time = current_time
-            time.sleep(loop_dt)
+            time.sleep(0.05)
 
         self._stop_robot()
         return False, "被中断"
 
     def _do_alignment_by_map(self) -> tuple:
-        """回退方案: 基于地图坐标的对齐
+        """基于 map 坐标原地旋转对齐 — 纯 P 控制
 
-        使用 self.target_map_position 计算目标航向，PD 控制原地旋转对齐。
-
-        Returns:
-            (bool, str): (成功标志, 错误消息)
+        差速底盘直接接受角速度指令，电机驱动器内部已有速度闭环。
+        外层只需 P 控制: 误差大→转快，误差小→转慢，到位→停。
         """
         robot_pos, robot_yaw = self._get_robot_pose()
         if robot_pos:
@@ -700,62 +679,73 @@ class ApproachNavigator(Node):
             if dist < self.config.min_align_distance:
                 self.get_logger().info(f"距离过近 ({dist:.3f}m)，跳过对齐")
                 return True, ""
+            target_heading = math.atan2(dy, dx)
+            init_err = math.degrees(normalize_angle(target_heading - robot_yaw))
+            self.get_logger().info(
+                f"粗对齐开始: robot=({robot_pos.x:.3f},{robot_pos.y:.3f}) "
+                f"yaw={math.degrees(robot_yaw):.1f}°, "
+                f"target=({self.target_map_position.x:.3f},"
+                f"{self.target_map_position.y:.3f}), "
+                f"heading={math.degrees(target_heading):.1f}°, "
+                f"误差={init_err:.1f}°, dist={dist:.2f}m, "
+                f"kp={self.config.align_kp} max_ω={self.config.align_max_omega}")
 
-        loop_dt = 0.05                  # 20 Hz
+        cfg = self.config
         start_time = time.time()
-        last_error = 0.0
-        last_time = start_time
-        current_omega = 0.0             # 平滑用
+        last_log_time = 0.0
 
         while rclpy.ok() and not self._cancel_requested:
-            current_time = time.time()
-
-            if current_time - start_time > self.config.align_timeout:
+            elapsed = time.time() - start_time
+            if elapsed > cfg.align_timeout:
                 self._stop_robot()
+                robot_pos, robot_yaw = self._get_robot_pose()
+                if robot_pos:
+                    dx = self.target_map_position.x - robot_pos.x
+                    dy = self.target_map_position.y - robot_pos.y
+                    err = normalize_angle(math.atan2(dy, dx) - robot_yaw)
+                    self.get_logger().warn(
+                        f"对齐超时! 最终误差={math.degrees(err):.1f}° "
+                        f"yaw={math.degrees(robot_yaw):.1f}°")
                 return False, "对齐超时"
 
             robot_pos, robot_yaw = self._get_robot_pose()
             if robot_pos is None:
-                time.sleep(loop_dt)
+                time.sleep(0.05)
                 continue
 
             dx = self.target_map_position.x - robot_pos.x
             dy = self.target_map_position.y - robot_pos.y
-            target_yaw = math.atan2(dy, dx)
-            error = normalize_angle(target_yaw - robot_yaw)
+            target_heading = math.atan2(dy, dx)
+            error = normalize_angle(target_heading - robot_yaw)
 
-            if abs(error) < self.config.align_tolerance:
+            if abs(error) < cfg.align_tolerance:
                 self._stop_robot()
-                self.get_logger().info(f"对齐完成 (地图回退)，误差: {math.degrees(error):.2f}°")
+                self.get_logger().info(
+                    f"粗对齐完成: 误差={math.degrees(error):.1f}°, "
+                    f"耗时={elapsed:.1f}s, "
+                    f"yaw={math.degrees(robot_yaw):.1f}°, "
+                    f"heading={math.degrees(target_heading):.1f}°")
                 return True, ""
 
-            actual_dt = current_time - last_time
-            if actual_dt > 0.001:
-                d_error = (error - last_error) / actual_dt
-            else:
-                d_error = 0.0
+            # 纯 P + 限幅 + 死区
+            omega = max(-cfg.align_max_omega,
+                        min(cfg.align_max_omega, cfg.align_kp * error))
+            if 0 < abs(omega) < cfg.align_min_omega:
+                omega = math.copysign(cfg.align_min_omega, omega)
 
-            target_omega = self.config.align_kp * error + self.config.align_kd * d_error
-            target_omega = max(-self.config.align_max_omega,
-                               min(self.config.align_max_omega, target_omega))
+            # 周期性诊断日志 (每0.5秒)
+            now = time.time()
+            if now - last_log_time >= 0.5:
+                self.get_logger().info(
+                    f"对齐中: err={math.degrees(error):.1f}° "
+                    f"ω={omega:.3f} yaw={math.degrees(robot_yaw):.1f}° "
+                    f"heading={math.degrees(target_heading):.1f}°")
+                last_log_time = now
 
-            # 角加速度限幅
-            max_delta = self.config.align_max_alpha * loop_dt
-            omega_diff = target_omega - current_omega
-            if abs(omega_diff) > max_delta:
-                current_omega += max_delta if omega_diff > 0 else -max_delta
-            else:
-                current_omega = target_omega
-
-            # 死区
             cmd = Twist()
-            if abs(current_omega) >= self.config.align_min_omega:
-                cmd.angular.z = current_omega
+            cmd.angular.z = omega
             self.cmd_vel_pub.publish(cmd)
-
-            last_error = error
-            last_time = current_time
-            time.sleep(loop_dt)
+            time.sleep(0.05)
 
         self._stop_robot()
         return False, "被中断"
@@ -832,15 +822,29 @@ class ApproachNavigator(Node):
             nearest_any = self.depth_sensor.get_nearest_obstacle()
             nearest_any_z = nearest_any[2] if nearest_any else None
 
-            # (B) 选择最近聚类，仅比当前更近时才更新
+            # (B) 选择最近聚类，带跳变保护
             clusters = self.depth_sensor.get_all_cluster_centroids()
             obstacle_x = None
             lateral_cx = None
 
             if clusters:
                 nearest = min(clusters, key=lambda c: c[2])
-                # 容差 3cm: 允许深度噪声抖动，防止间歇丢失横向修正
-                if tracked_cz is None or nearest[2] <= tracked_cz + 0.03:
+                if tracked_cz is not None:
+                    # 跳变保护: 深度骤降超过 max(10cm, 30%) → 假目标，忽略
+                    max_drop = max(0.10, tracked_cz * 0.3)
+                    if nearest[2] < tracked_cz - max_drop:
+                        self.get_logger().warn(
+                            f"[跳变过滤] z={nearest[2]:.3f}m → 忽略 "
+                            f"(跟踪={tracked_cz:.3f}m, 阈值={max_drop:.2f}m)",
+                            throttle_duration_sec=1.0
+                        )
+                    elif nearest[2] <= tracked_cz + 0.03:
+                        # 正常更新: 更近或噪声容差内
+                        tracked_cx, tracked_cz = nearest[0], nearest[2]
+                        obstacle_x = tracked_cz
+                        lateral_cx = tracked_cx
+                else:
+                    # 首次读取
                     tracked_cx, tracked_cz = nearest[0], nearest[2]
                     obstacle_x = tracked_cz
                     lateral_cx = tracked_cx

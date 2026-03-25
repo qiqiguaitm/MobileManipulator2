@@ -948,30 +948,10 @@ class PiperGraspNode(Node):
                 )
 
                 if not result:
-                    # Post-check: SDK timeout doesn't mean arm failed — re-read fresh position
-                    try:
-                        import math as _math
-                        _, cur = self.arm.get_position(return_gripper_center=True)
-                        tol = self.config.get('grasp', {}).get('ready_position_tolerance', 30)
-                        dist = _math.sqrt(sum((cur[i] - [ready_pos['x'], ready_pos['y'], ready_pos['z']][i])**2
-                                             for i in range(3)))
-                        if dist <= tol:
-                            self.get_logger().warn(
-                                f"GO_READY: SDK timeout but arm IS at ready (dist={dist:.1f}mm ≤ {tol}mm), "
-                                f"treating as success")
-                            result = True
-                    except Exception:
-                        pass
-
-                if not result:
-                    # Get error state for diagnosis
-                    try:
-                        has_err, err_type = self.arm._get_error_type()
-                        _, cur = self.arm.get_position(return_gripper_center=True)
-                        msg = (f"Failed to reach ready position: error={err_type if has_err else 'NONE'}, "
-                               f"current=({cur[0]:.1f},{cur[1]:.1f},{cur[2]:.1f})")
-                    except Exception:
-                        msg = "Failed to reach ready position (could not read status)"
+                    has_err, err_type = self.arm._get_error_type()
+                    _, cur = self.arm.get_position(return_gripper_center=True)
+                    msg = (f"Failed to reach ready position: error={err_type if has_err else 'NONE'}, "
+                           f"current=({cur[0]:.1f},{cur[1]:.1f},{cur[2]:.1f})")
                     self.get_logger().error(f"GO_READY: {msg}")
                     raise RuntimeError(msg)
 
@@ -1187,6 +1167,8 @@ class PiperGraspNode(Node):
                         }
 
                     # Build batch grasp queue from all_objects (filter + transform, no lock held during compute)
+                    # Sorted by score descending — higher score wins spatial dedup
+                    dedup_dist = grasp_cfg.get('queue_dedup_dist_mm', 30)
                     new_queue = []
                     for obj in sorted(percept_resp.all_objects,
                                       key=lambda o: o.grasp_score, reverse=True):
@@ -1202,6 +1184,19 @@ class PiperGraspNode(Node):
                             continue
                         is_bl, _ = self._check_blacklist(obj.category, t['point_in_base'])
                         if is_bl:
+                            continue
+                        # 空间去重：与已入队目标距离 < dedup_dist 则跳过（高分优先已保证）
+                        pt = t['point_in_base']
+                        too_close = False
+                        for q in new_queue:
+                            qp = q['point3d_base']
+                            d = math.sqrt((pt[0]-qp[0])**2 + (pt[1]-qp[1])**2 + (pt[2]-qp[2])**2)
+                            if d < dedup_dist:
+                                too_close = True
+                                break
+                        if too_close:
+                            self.get_logger().info(
+                                f'Grasp queue dedup: skip {obj.category} (dist={d:.0f}mm < {dedup_dist}mm)')
                             continue
                         new_queue.append({
                             'valid': True,

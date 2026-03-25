@@ -78,10 +78,12 @@ class CategoryCompatibility:
     """类别兼容性检查器"""
 
     # 相似类别映射（可扩展）
+    # 所有可抓取小物体互相兼容（避免跨相机分类不一致导致幽灵目标）
     SIMILAR_CATEGORIES = {
-        'bottle': {'bottle', 'cup', 'glass', 'container'},
-        'cup': {'cup', 'bottle', 'glass', 'mug'},
-        'box': {'box', 'package', 'carton'},
+        'bottle': {'bottle', 'cup', 'glass', 'container', 'can', 'box'},
+        'cup': {'cup', 'bottle', 'glass', 'mug', 'can'},
+        'can': {'can', 'bottle', 'cup', 'box', 'container'},
+        'box': {'box', 'package', 'carton', 'can', 'bottle'},
         'person': {'person', 'human', 'people'},
         'chair': {'chair', 'seat', 'stool'},
     }
@@ -186,9 +188,10 @@ class CostFunction:
         """
         details = {}
 
-        # ===== 1. 3D距离代价 =====
+        # ===== 1. 2D距离代价（仅XY，忽略Z） =====
+        # Z轴因双相机视角差异存在系统偏差(近距~47mm)，用2D匹配更准确
         if det_chassis.position_3d is not None and det_top.position_3d is not None:
-            dist_3d = np.linalg.norm(det_chassis.position_3d - det_top.position_3d)
+            dist_3d = np.linalg.norm(det_chassis.position_3d[:2] - det_top.position_3d[:2])
             details['distance_3d'] = dist_3d
             # 软阈值：超过阈值惩罚为1.0，但不直接判死刑
             if dist_3d > self.dist_thresh:

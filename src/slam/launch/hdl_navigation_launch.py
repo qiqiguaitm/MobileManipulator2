@@ -258,6 +258,7 @@ def generate_launch_description():
     )
 
     nav2_config = os.path.join(slam_pkg, 'config', 'nav2_minimal_params.yaml')
+    custom_bt_xml = os.path.join(slam_pkg, 'config', 'navigate_to_pose_custom.xml')
     map_server_params = os.path.join(slam_pkg, 'config', 'map_server_params.yaml')
     map_server_node = Node(
         package='nav2_map_server',
@@ -278,7 +279,11 @@ def generate_launch_description():
         package='nav2_bt_navigator',
         executable='bt_navigator',
         name='bt_navigator',
-        parameters=[nav2_config, {'odom_topic': '/odom/fused'}],
+        parameters=[nav2_config, {
+            'odom_topic': '/odom/fused',
+            'default_nav_to_pose_bt_xml': custom_bt_xml,
+            'default_nav_through_poses_bt_xml': custom_bt_xml,
+        }],
     )
     behavior_server_node = Node(
         package='nav2_behaviors',

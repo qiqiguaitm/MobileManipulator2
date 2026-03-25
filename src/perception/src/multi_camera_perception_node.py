@@ -132,6 +132,8 @@ class MultiCameraPerceptionNode(Node):
         self._last_detect_time = 0.0
         self._last_results = {'top': None, 'chassis': None, 'fused': None}
         self._results_lock = threading.Lock()  # 保护 _last_results 和 fusion 的线程安全
+        self._tracker_lock = threading.Lock()  # 保护 ByteTracker3D.update() 的线程安全
+        self._detection_paused = False  # Timer检测暂停标志 (由 PerceptionConfig.detection_control 控制)
         self._fused_counter = 0  # 融合对象顺序计数器（替代 id(obj) % 10000）
 
         # 端到端帧率追踪
@@ -236,7 +238,7 @@ class MultiCameraPerceptionNode(Node):
             if image_stamp is not None:
                 img_t = image_stamp.sec + image_stamp.nanosec * 1e-9
                 delta = abs(tf_t - img_t) * 1000
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f'[TF] mode={tf_mode} img_age={now-img_t:.3f}s '
                     f'tf_age={tf_age:.3f}s delta={delta:.1f}ms')
             t = ts.transform.translation
@@ -398,26 +400,27 @@ class MultiCameraPerceptionNode(Node):
         tracker_cfg = TrackerConfig(
             match_thresh=0.15,       # 第一阶段: 15cm 匹配阈值
             second_thresh=0.25,      # 第二阶段: 25cm (ByteTrack低置信度恢复)
-            track_buffer_s=3.0,      # Lost轨迹保留3秒
+            track_buffer_s=120.0,    # Lost轨迹保留120s（静态世界：物体不动，够机器人转几圈回来）
             confirm_time_s=0.8,      # 新轨迹确认：持续观测0.8s（@5Hz≈4帧，防ghost 0.4s内抢占）
-            min_confirm_hits=2,      # 新轨迹确认：至少匹配2次（防单帧误检）
+            min_confirm_hits=4,      # 新轨迹确认：至少匹配4次（防ghost抢占）
             age_penalty_weight=0.15, # 年轻轨迹匹配惩罚权重（ghost vs 老轨迹竞争时起效）
             age_stable_frames=10,    # 10次匹配后视为稳定（@5Hz≈2s）
-            lost_velocity_decay=0.7, # Lost轨迹速度衰减（防遮挡边缘深度腐蚀注入伪速度）
             reid_thresh=0.3,         # Re-ID: 30cm (比匹配更宽松)
-            reid_buffer_s=10.0,      # Re-ID窗口10秒
+            reid_buffer_s=120.0,     # Re-ID窗口120s（与 track_buffer_s 对齐）
             cost_debug=True,         # 开启匹配代价日志（配合 _cc_track_debug.py --cost）
+            position_n_max=30,       # 递推均值上限（30次 ≈ 6s@5Hz）
+            reactivate_n=10,         # Lost→Tracked 重激活时 N 重置值
         )
         self._tracker = ByteTracker3D(tracker_cfg, self.get_logger())
         self.get_logger().info(
-            f"[TRACKER] ByteTracker3D 已初始化: "
+            f"[TRACKER] ByteTracker3D 已初始化 (静态世界模型): "
             f"match_thresh={tracker_cfg.match_thresh}m, "
             f"second_thresh={tracker_cfg.second_thresh}m, "
             f"buffer={tracker_cfg.track_buffer_s}s, "
             f"confirm={tracker_cfg.confirm_time_s}s(min {tracker_cfg.min_confirm_hits}hits), "
             f"age_penalty={tracker_cfg.age_penalty_weight}(stable@{tracker_cfg.age_stable_frames}hits), "
-            f"lost_vel_decay={tracker_cfg.lost_velocity_decay}, "
-            f"reid_thresh={tracker_cfg.reid_thresh}m, reid_buf={tracker_cfg.reid_buffer_s}s"
+            f"reid_thresh={tracker_cfg.reid_thresh}m, reid_buf={tracker_cfg.reid_buffer_s}s, "
+            f"n_max={tracker_cfg.position_n_max}, reactivate_n={tracker_cfg.reactivate_n}"
         )
 
     def _health_check(self):
@@ -714,11 +717,28 @@ class MultiCameraPerceptionNode(Node):
             f'min_score={self._current_min_score:.2f}'
         )
 
+        # 检测控制: 1=暂停Timer检测, 2=恢复Timer检测
+        if msg.detection_control == 1 and not self._detection_paused:
+            self._detection_paused = True
+            self.get_logger().info('Timer检测已暂停 (by PerceptionConfig)')
+        elif msg.detection_control == 2 and self._detection_paused:
+            self._detection_paused = False
+            self.get_logger().info('Timer检测已恢复 (by PerceptionConfig)')
+
+        # Tracker 重置
+        if msg.reset_tracker and self._tracker is not None:
+            with self._tracker_lock:
+                self._tracker.reset()
+            self.get_logger().info('ByteTracker3D 已重置 (by PerceptionConfig)')
+
     def _on_camera_timer(self, camera_name: str):
         """
         Timer 回调（per-camera）：采集该相机最新帧 → 放入 Queue。
         Queue 满（Worker 还在处理上一帧）时跳过，实现自然背压。
         """
+        if self._detection_paused:
+            return
+
         q = self._task_queues.get(camera_name)
         sensor = self.cameras.get(camera_name)
         if not q or not sensor:
@@ -906,7 +926,7 @@ class MultiCameraPerceptionNode(Node):
         rgb = task.rgb
 
         result = Object3DArray()
-        result.header.stamp = self.get_clock().now().to_msg()
+        result.header.stamp = task.image_stamp if task.image_stamp else self.get_clock().now().to_msg()
         result.header.frame_id = self.target_frame
 
         _t0 = time.time()
@@ -947,7 +967,7 @@ class MultiCameraPerceptionNode(Node):
         try:
             d_pub = depth_mm if depth_mm is not None else (optimized_depth * 1000).astype(np.uint16)
             depth_msg = self._bridge.cv2_to_imgmsg(d_pub, encoding='16UC1')
-            depth_msg.header.stamp = self.get_clock().now().to_msg()
+            depth_msg.header.stamp = task.image_stamp if task.image_stamp else self.get_clock().now().to_msg()
             depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
             if camera_name in self.pubs:
                 self.pubs[camera_name]['depth'].publish(depth_msg)
@@ -1109,7 +1129,7 @@ class MultiCameraPerceptionNode(Node):
 
         # ── 原有模式: SAM3 + FS 分离并行 ──
         result = Object3DArray()
-        result.header.stamp = self.get_clock().now().to_msg()
+        result.header.stamp = task.image_stamp if task.image_stamp else self.get_clock().now().to_msg()
         result.header.frame_id = self.target_frame
 
         rgb = task.rgb
@@ -1268,7 +1288,7 @@ class MultiCameraPerceptionNode(Node):
         try:
             depth_mm = (optimized_depth * 1000).astype(np.uint16)
             depth_msg = self._bridge.cv2_to_imgmsg(depth_mm, encoding='16UC1')
-            depth_msg.header.stamp = self.get_clock().now().to_msg()
+            depth_msg.header.stamp = task.image_stamp if task.image_stamp else self.get_clock().now().to_msg()
             depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
             if camera_name in self.pubs:
                 self.pubs[camera_name]['depth'].publish(depth_msg)
@@ -1355,31 +1375,33 @@ class MultiCameraPerceptionNode(Node):
                 cameras=cameras
             )
 
-            # 返回指定相机或第一个相机的结果
             if results:
-                if request.camera_id and request.camera_id != 'all':
-                    # 返回指定相机结果
-                    response.result = results.get(request.camera_id)
-                else:
-                    # 返回第一个有结果的相机
-                    for cam in cameras:
-                        if cam in results:
-                            response.result = results[cam]
-                            break
-
-                # 发布所有结果（不做融合）
+                # 发布各相机独立结果
                 for camera_name, result in results.items():
                     if camera_name in self.pubs and result:
                         self.pubs[camera_name]['objects'].publish(result)
 
-                # 智能融合发布（聚类+融合）
+                # 融合 + 跟踪（统一双相机结果）
                 if len(results) >= 2:
                     fused = self._fuse_results(results)
                     if fused:
+                        if fused.header.frame_id == 'map':
+                            fused = self._apply_tracking(fused)
                         fused.objects = [o for o in fused.objects
                                          if o.confidence >= self.min_confidence
                                          and o.score >= self._current_min_score]
                         self.pub_fused.publish(fused)
+                        # 返回融合跟踪结果（除非指定了单相机）
+                        if not request.camera_id or request.camera_id == 'all':
+                            response.result = fused
+                        else:
+                            response.result = results.get(request.camera_id)
+                elif results:
+                    # 单相机也过tracking
+                    single_result = next(iter(results.values()))
+                    if single_result and single_result.header.frame_id == 'map':
+                        single_result = self._apply_tracking(single_result)
+                    response.result = single_result
 
             self._publish_status()
 
@@ -1483,6 +1505,10 @@ class MultiCameraPerceptionNode(Node):
         if not data:
             return None
 
+        image_stamp = data.get('timestamp')
+        if image_stamp:
+            result.header.stamp = image_stamp
+
         rgb = data['rgb']
         depth = data['depth']
 
@@ -1514,8 +1540,7 @@ class MultiCameraPerceptionNode(Node):
         try:
             depth_mm = (optimized_depth * 1000).astype(np.uint16)
             depth_msg = self._bridge.cv2_to_imgmsg(depth_mm, encoding='16UC1')
-            # 使用系统时间戳，避免与其他节点时间不同步
-            depth_msg.header.stamp = self.get_clock().now().to_msg()
+            depth_msg.header.stamp = image_stamp if image_stamp else self.get_clock().now().to_msg()
             depth_msg.header.frame_id = f'{camera_name}_camera_optical_frame'
             if camera_name in self.pubs:
                 self.pubs[camera_name]['depth'].publish(depth_msg)
@@ -1621,7 +1646,9 @@ class MultiCameraPerceptionNode(Node):
         直接将所有相机的检测结果拼接在一起，添加相机前缀区分
         """
         merged = Object3DArray()
-        merged.header.stamp = self.get_clock().now().to_msg()
+        # 使用输入结果中最早的图像时间戳
+        earliest = min(results.values(), key=lambda r: r.header.stamp.sec + r.header.stamp.nanosec * 1e-9)
+        merged.header.stamp = earliest.header.stamp
         merged.header.frame_id = self.target_frame
 
         total_count = 0
@@ -1655,6 +1682,9 @@ class MultiCameraPerceptionNode(Node):
         有定位(map系):  融合 → 跟踪(距离+类别) → 发布
         无定位(base_link): 融合 → 直接发布（不跟踪）
         """
+        if self._detection_paused:
+            return
+
         try:
             # 收集有效的最新结果（只考虑相机，排除 'fused' 键）
             valid_results = {}
@@ -1783,8 +1813,9 @@ class MultiCameraPerceptionNode(Node):
                 '_original': obj,
             })
 
-        # 调用 ByteTracker3D
-        tracked_objects = self._tracker.update(fused_objects)
+        # 调用 ByteTracker3D（加锁保护：Timer路径和Service路径可能并发调用）
+        with self._tracker_lock:
+            tracked_objects = self._tracker.update(fused_objects)
 
         # 构建跟踪后的 Object3DArray
         result = Object3DArray()
@@ -1835,7 +1866,8 @@ class MultiCameraPerceptionNode(Node):
         4. 未匹配的直接保留
         """
         fused = Object3DArray()
-        fused.header.stamp = self.get_clock().now().to_msg()
+        earliest = min(results.values(), key=lambda r: r.header.stamp.sec + r.header.stamp.nanosec * 1e-9)
+        fused.header.stamp = earliest.header.stamp
         actual_frame = next(iter(results.values())).header.frame_id
         fused.header.frame_id = actual_frame
 

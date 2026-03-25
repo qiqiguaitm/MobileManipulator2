@@ -234,8 +234,19 @@ class DepthSensor:
         )
         front_points = points[roi_mask]
         if len(front_points) < 50:
+            # 诊断: 打印各维度范围，帮助定位 ROI 过滤原因
+            x_range = f"x=[{xc.min():.2f},{xc.max():.2f}]"
+            y_range = f"y=[{yc.min():.2f},{yc.max():.2f}]"
+            z_range = f"z=[{zc.min():.2f},{zc.max():.2f}]"
+            cfg = self._config
+            n_z = int(np.sum((zc > cfg.depth_min_valid) & (zc < cfg.depth_max_valid)))
+            n_x = int(np.sum(np.abs(xc) < cfg.depth_detect_width))
+            n_y = int(np.sum((yc > cfg.depth_obstacle_min_height) & (yc < cfg.depth_obstacle_max_height)))
             self._node.get_logger().info(
-                f"[depth] ROI过滤后不足: total={len(points)} roi={len(front_points)} (<50)",
+                f"[depth] ROI过滤后不足: total={len(points)} roi={len(front_points)} "
+                f"pass_z={n_z} pass_x={n_x} pass_y={n_y} "
+                f"{x_range} {y_range} {z_range} "
+                f"(filter: |x|<{cfg.depth_detect_width} y∈[{cfg.depth_obstacle_min_height},{cfg.depth_obstacle_max_height}])",
                 throttle_duration_sec=2.0)
             self._clear_results()
             return

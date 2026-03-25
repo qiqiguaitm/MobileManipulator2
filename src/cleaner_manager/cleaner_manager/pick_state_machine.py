@@ -1,7 +1,7 @@
 """
 PickStateMachine — blocking state machine for autonomous pick-and-place.
 
-Flow: PLANNING → NAVIGATING → PICKING (展臂→observe→pick→place→收臂) → SCANNING (3s) → PLANNING
+Flow: PLANNING → NAVIGATING → PICKING (展臂→observe→pick→place→收臂) → PLANNING
 
 Runs in a dedicated daemon thread. Communicates with ROS2 services/actions
 via call_async() + polling (never spin_until_future_complete).
@@ -116,7 +116,6 @@ class PickStateMachine:
             PickState.PLANNING:   self._do_planning,
             PickState.NAVIGATING: self._do_navigating,
             PickState.PICKING:    self._do_picking,
-            PickState.SCANNING:   self._do_scanning,
             PickState.ERROR:      self._do_error,
         }
 
@@ -163,7 +162,6 @@ class PickStateMachine:
             self._flog.warning("ABORTED by user")
             self._cancel_active_goal()
             self._nav.cancel()
-            self._pool.resume()
             self._safe_stow(abort_event=None)  # best-effort stow
             self._set_state(PickState.IDLE)
 
@@ -280,7 +278,6 @@ class PickStateMachine:
 
     def _do_navigating(self, abort_event) -> PickState:
         target = self._ctx.current_target
-        self._pool.pause()
 
         nav_point = Point()
         nav_point.x = target.position_map.x
@@ -309,7 +306,6 @@ class PickStateMachine:
             self._flog.warning(
                 f"NAV FAIL {target.category}: {result.error_message} {nav_ms:.0f}ms")
         self._ctx.consecutive_nav_failures += 1
-        self._pool.resume()
 
         if self._ctx.consecutive_nav_failures >= self._cfg.max_consecutive_failures:
             self._ctx.error_message = f"Nav failed {self._ctx.consecutive_nav_failures} times"
@@ -335,7 +331,7 @@ class PickStateMachine:
             self._ctx.error_message = "Deploy (go_ready) failed"
             return PickState.ERROR
 
-        # 目标池保持暂停，仅在 SCANNING 期间接受新增
+        # 目标池和感知在整个流程中保持活跃
 
         # --- 2. observe → pick → place 循环 ---
         picks_done = 0
@@ -377,14 +373,24 @@ class PickStateMachine:
                         self._log.info(f"已抓取 {picks_done} 个，无更多目标")
                     break
 
-                # observe 成功 → 重置 re-approach 计数
-                reapproach_count = 0
-
                 # observe 成功时一次计算 map 位置
                 observed_map_pos = self._base_to_map(obs_pos_mm)
                 if observed_map_pos:
                     self._log.info(
                         f"Observe {obs_cat} → map({observed_map_pos.x:.2f},{observed_map_pos.y:.2f})")
+
+                # Observe 成功后立即评估 re-approach（太近/太远 → pick 大概率失败）
+                if obs_pos_mm and reapproach_count < self._cfg.max_reapproach:
+                    reapproach_ok = self._try_reapproach(
+                        obs_pos_mm, obs_cat, reapproach_count, abort_event)
+                    if abort_event.is_set():
+                        break
+                    if reapproach_ok:
+                        reapproach_count += 1
+                        continue  # re-observe from new position
+
+                # 位置 OK，进入 pick → 重置 re-approach 计数
+                reapproach_count = 0
             else:
                 self._log.info(f"Batch pick [{picks_done + 1}]: 队列剩余 {local_queue_remaining}")
 
@@ -403,7 +409,12 @@ class PickStateMachine:
                 self._ctx.consecutive_pick_failures += 1
                 if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
                     break
-                continue  # 重试 observe
+                # 回 ready 位置再重新 observe（避免中间位置导致 WIDTH_REJECT）
+                self._call_go_ready(self._cfg.pick_speed, open_gripper=True,
+                                    abort_event=abort_event)
+                if abort_event.is_set():
+                    break
+                continue
 
             self._ctx.consecutive_pick_failures = 0
             gripper_holding = True  # pick成功，夹爪夹住物体
@@ -465,29 +476,9 @@ class PickStateMachine:
         if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
             self._ctx.error_message = "Pick failed consecutively"
             return PickState.ERROR
-        return PickState.SCANNING
-
-    def _do_scanning(self, abort_event) -> PickState:
-        """收臂后观察期：恢复目标池接受新增目标。"""
-        self._pool.resume()
-        dur = self._cfg.scan_duration
-        self._log.info(f"观察中 ({dur}s)...")
-        deadline = time.time() + dur
-        while time.time() < deadline and not abort_event.is_set():
-            time.sleep(0.2)
-        # 不再 pause — PLANNING 需要 pool 保持 active 以接收数据
-        if abort_event.is_set():
-            return PickState.IDLE
-        stats = self._pool.stats
-        self._log.info(f"观察结束: 目标池 {stats['remaining']} 可用 / {stats['active']} 活跃")
-        if self._flog:
-            self._flog.info(
-                f"SCAN DONE viable={stats['remaining']} "
-                f"active={stats['active']} total={stats['total']}")
         return PickState.PLANNING
 
     def _do_error(self, abort_event) -> PickState:
-        self._pool.resume()
         self._log.error(f"ERROR: {self._ctx.error_message}")
         self._ctx.error_retries += 1
         if self._ctx.error_retries >= self._cfg.max_error_retries:

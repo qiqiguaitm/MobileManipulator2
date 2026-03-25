@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-ByteTracker3D - 基于ByteTrack思想的3D目标跟踪器
+ByteTracker3D - 静态世界模型下的 3D 目标跟踪器
 
-用于对双相机融合后的检测结果进行跨帧跟踪。
+设计假设：所有物体在 map 系下静止不动。
+核心改动（相比传统 ByteTrack）：
+1. StaticPositionEstimator 替代 KalmanFilter3D：无速度状态，有上限的递推均值
+2. Track ID 长期保持：物体出视野后 track 保留 120s，回来即复用原 ID
+3. Re-ID 严格类别匹配：防止抓取机器人搞混不同类型物体
 
-核心创新（来自ByteTrack）：
-1. 两阶段匹配：利用低置信度检测恢复被遮挡的轨迹
-2. 匈牙利算法：全局最优匹配（替代贪心）
-3. Kalman滤波：预测轨迹位置，处理快速移动
-
-适配你的场景：
-- 高置信度 = source='fused'（双相机融合成功）
-- 低置信度 = source='*_only'（单相机独立检测）
+保留的 ByteTrack 机制：
+- 两阶段匹配（高/低置信度）
+- 匈牙利算法全局最优匹配
+- 年轻轨迹惩罚 + 类别投票
 
 参考：
 - ByteTrack: https://arxiv.org/abs/2110.06864
@@ -39,8 +39,8 @@ class TrackerConfig:
     match_thresh: float = 0.15      # 第一阶段匹配阈值 (15cm, map系下静态物体噪声~3cm)
     second_thresh: float = 0.25     # 第二阶段匹配阈值 (25cm, 恢复Lost轨迹)
 
-    # 轨迹管理
-    track_buffer_s: float = 3.0     # Lost轨迹保留时间（秒），与 update() 调用频率无关
+    # 轨迹管理（静态世界：物体不动，track 需长期保留以支持 Re-ID）
+    track_buffer_s: float = 120.0   # Lost轨迹保留时间（秒），120s 够机器人转几圈回来
 
     # 新轨迹确认：基于真实时间，不受 update() 调用频率影响
     # 物理含义：新检测必须持续观测 confirm_time_s 秒 + 至少 min_confirm_hits 次匹配才能成为稳定轨迹
@@ -52,27 +52,13 @@ class TrackerConfig:
     # 年轻轨迹代价惩罚：在匈牙利匹配中给 tracklet_len 少的轨迹附加惩罚代价
     # 目的：防止 ghost 轨迹（tracklet_len=1）在位置恰好更近时抢走 Lost 老轨迹（tracklet_len=17）的检测
     # 公式：age_penalty = age_penalty_weight * (1 - min(tracklet_len/age_stable_frames, 1))
-    # 效果示例（bottle 遮挡场景）：
-    #   ghost (len=1):    stability=0.10, age_penalty = 0.15 * 0.90 = 0.135，总代价 0.003+0.135 = 0.138
-    #   track_1 (len=17): stability=1.00, age_penalty = 0.15 * 0.00 = 0.000，总代价 0.045+0.000 = 0.045 ← 胜出
-    #   注意: stability = min(tracklet_len/age_stable_frames, 1.0)，len≥age_stable_frames时上限截断为1.0
     age_penalty_weight: float = 0.15   # 年轻轨迹代价惩罚权重
     age_stable_frames: int = 10        # 达到此匹配次数后视为稳定（惩罚趋于 0）
 
-    # Lost 轨迹速度衰减：每次 predict() 前将 Kalman 速度乘以 decay
-    # 目的：遮挡边缘期深度腐蚀会给 Kalman 注入伪速度（如 z 漂移），
-    #        Lost 期间 predict() 按伪速度外推 → 位置偏离真实位置 → 输给 ghost。
-    # 衰减使 Lost 轨迹的预测位置收敛到 last-seen 位置附近，
-    # 恢复后 Kalman 增益自动增大（P 在 Lost 期间增长），一次 update 即可修正。
-    # 仅影响 Lost 状态，Tracked 状态完全不受影响。
-    lost_velocity_decay: float = 0.7   # Lost 轨迹速度衰减因子（每次 predict 前乘以此值）
-
     # Re-ID: 从 Removed 池恢复旧 ID（物体消失后重新出现）
-    # 注意: position 在 base_link 坐标系，机器人移动时 Re-ID 不可靠
+    # 静态世界：物体位置稳定，Re-ID 可靠；类别要求严格相同（抓取机器人安全考虑）
     reid_thresh: float = 0.3        # Re-ID 距离阈值 (30cm)
-    reid_buffer_s: float = 10.0     # Removed 轨迹保留时间（秒），与调用频率无关
-    reid_cat_weight: float = 0.05   # Re-ID 类别软代价权重 (m)：同类=0, 兼容=+1.5cm, 不兼容=+5cm
-                                    # 距离仍为硬门控，类别仅作排序偏好（防分类抖动导致 Re-ID 失败）
+    reid_buffer_s: float = 120.0    # Removed 轨迹保留时间（秒），与 track_buffer_s 对齐
 
     # 代价函数权重（归一化代价，与 dual_camera_matcher 同构）
     # cost = 0.85*dist_norm + 0.15*cat_cost + age_penalty
@@ -87,10 +73,9 @@ class TrackerConfig:
     # 调试：每次成功匹配时打印代价分解（配合 _cc_track_debug.py --cost 使用）
     cost_debug: bool = False
 
-    # Kalman滤波器参数
-    process_noise_pos: float = 0.01     # 位置过程噪声
-    process_noise_vel: float = 0.05     # 速度过程噪声
-    measurement_noise: float = 0.05     # 观测噪声 (深度误差±5cm)
+    # 静态位置估计器参数
+    position_n_max: int = 30        # 递推均值观测上限（30次 ≈ 6s@5Hz → σ≈0.55cm）
+    reactivate_n: int = 10          # Lost→Tracked 重激活时 N 重置到此值，加速收敛
 
 
 # ============================================================================
@@ -101,102 +86,51 @@ class TrackState(Enum):
     """轨迹状态"""
     New = 0         # 新检测，待确认
     Tracked = 1     # 活跃跟踪中
-    Lost = 2        # 暂时丢失
-    Removed = 3     # 已删除
+    Lost = 2        # 暂时丢失（物体仍在，只是不在视野内）
+    Removed = 3     # 已删除（可用于 Re-ID）
 
 
 # ============================================================================
-# Kalman滤波器（3D位置）
+# 静态位置估计器
 # ============================================================================
 
-class KalmanFilter3D:
+class StaticPositionEstimator:
     """
-    3D位置Kalman滤波器
+    静态物体位置估计器 — 有上限的递推均值
 
-    状态向量: [x, y, z, vx, vy, vz]
-    观测向量: [x, y, z]
+    设计假设：物体在 map 系下不动，所有观测都是 true_position + noise。
 
-    运动模型: 匀速运动
+    行为：
+      n < N_max 时：标准 running mean，每个观测权重 1/n
+      n >= N_max 时：EMA，α = 1/N_max，老观测指数衰减
+
+    特性：
+      - 无速度状态 → 不会从噪声中拟合出伪速度
+      - predict() 返回当前位置 → 匹配目标极稳定
+      - N_max 防止过度锁定 → 允许定位微漂时慢慢修正
     """
 
-    def __init__(self, cfg: TrackerConfig):
-        self.cfg = cfg
-
-        # 状态维度
-        self.dim_x = 6  # [x, y, z, vx, vy, vz]
-        self.dim_z = 3  # [x, y, z]
-
-        # 状态转移矩阵 F (匀速运动，dt=1)
-        self.F = np.eye(6, dtype=np.float32)
-        self.F[0, 3] = 1  # x += vx
-        self.F[1, 4] = 1  # y += vy
-        self.F[2, 5] = 1  # z += vz
-
-        # 观测矩阵 H
-        self.H = np.zeros((3, 6), dtype=np.float32)
-        self.H[0, 0] = 1
-        self.H[1, 1] = 1
-        self.H[2, 2] = 1
-
-        # 过程噪声 Q
-        self.Q = np.diag([
-            cfg.process_noise_pos,  # x
-            cfg.process_noise_pos,  # y
-            cfg.process_noise_pos,  # z
-            cfg.process_noise_vel,  # vx
-            cfg.process_noise_vel,  # vy
-            cfg.process_noise_vel,  # vz
-        ]).astype(np.float32)
-
-        # 观测噪声 R
-        self.R = np.diag([
-            cfg.measurement_noise,
-            cfg.measurement_noise,
-            cfg.measurement_noise,
-        ]).astype(np.float32)
-
-        # 状态和协方差
-        self.x = np.zeros(6, dtype=np.float32)
-        self.P = np.eye(6, dtype=np.float32) * 0.1
-
-    def init(self, position: np.ndarray):
-        """用初始位置初始化"""
-        self.x[:3] = position
-        self.x[3:] = 0  # 初始速度为0
-        self.P = np.eye(6, dtype=np.float32) * 0.1
+    def __init__(self, position: np.ndarray, n_max: int = 30):
+        self._position = np.array(position, dtype=np.float64)
+        self.n = 1.0
+        self.n_max = n_max
 
     def predict(self) -> np.ndarray:
-        """预测下一帧位置"""
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.x[:3].copy()
+        """静态物体预测：位置不变"""
+        return self._position.copy()
 
     def update(self, z: np.ndarray) -> np.ndarray:
-        """用观测修正"""
-        z = np.asarray(z, dtype=np.float32)
-
-        # 残差
-        y = z - self.H @ self.x
-
-        # 卡尔曼增益
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # 更新状态
-        self.x = self.x + K @ y
-        self.P = (np.eye(6) - K @ self.H) @ self.P
-
-        return self.x[:3].copy()
+        """用新观测更新位置估计"""
+        z = np.asarray(z, dtype=np.float64)
+        self.n = min(self.n + 1.0, self.n_max)
+        alpha = 1.0 / self.n
+        self._position = (1.0 - alpha) * self._position + alpha * z
+        return self._position.copy()
 
     @property
     def position(self) -> np.ndarray:
-        """当前位置估计"""
-        return self.x[:3].copy()
-
-    @property
-    def velocity(self) -> np.ndarray:
-        """当前速度估计"""
-        return self.x[3:].copy()
+        """当前最佳位置估计"""
+        return self._position.copy()
 
 
 # ============================================================================
@@ -240,28 +174,26 @@ class STrack3D:
         self.last_chassis_bbox: Optional[List[float]] = None  # fused/chassis 检测的bbox
         self.last_top_bbox: Optional[List[float]] = None      # top 检测的bbox
 
-        # Kalman滤波器
-        self.kalman = KalmanFilter3D(cfg)
-        self.kalman.init(np.asarray(position))
+        # 静态位置估计器（替代 KalmanFilter3D）
+        self.estimator = StaticPositionEstimator(
+            np.asarray(position), n_max=cfg.position_n_max)
 
         # 配置
         self.cfg = cfg
 
     @property
     def position(self) -> np.ndarray:
-        """当前位置（Kalman估计）"""
-        return self.kalman.position
+        """当前位置（递推均值估计）"""
+        return self.estimator.position
 
     def predict(self):
-        """Kalman预测"""
-        if self.state == TrackState.Lost:
-            self.kalman.x[3:6] *= self.cfg.lost_velocity_decay
-        self.kalman.predict()
+        """静态预测：位置不变，仅为匹配提供稳定的参考点"""
+        self.estimator.predict()
 
     def update(self, detection: dict, frame_id: int):
         """用检测结果更新轨迹"""
-        # Kalman修正
-        self.kalman.update(detection['position'])
+        # 位置更新（递推均值）
+        self.estimator.update(detection['position'])
 
         # 更新属性
         self.confidence = detection['confidence']
@@ -341,6 +273,8 @@ class STrack3D:
     def reactivate(self, detection: dict, frame_id: int,
                    current_time: Optional[float] = None):
         """重新激活轨迹（Lost → Tracked）"""
+        # 降低 N 以加速对新观测的响应（Lost 期间定位可能微漂）
+        self.estimator.n = min(self.estimator.n, self.cfg.reactivate_n)
         self.update(detection, frame_id)
         self.state = TrackState.Tracked
         # 修复：New → Lost → reactivate 路径中 track_id 永远为 None 的 bug
@@ -360,14 +294,17 @@ class STrack3D:
 
 class ByteTracker3D:
     """
-    基于ByteTrack思想的3D目标跟踪器
+    静态世界 3D 目标跟踪器
 
-    替换SimpleTracker，对融合后的检测结果进行跟踪。
+    基于 ByteTrack 两阶段匹配 + 静态位置估计器。
+    专为 map 系下静态物体设计：物体不动，track ID 长期保持。
 
-    核心改进:
+    核心特性:
     1. 匈牙利算法（全局最优）替代贪心匹配
-    2. Kalman滤波预测（处理快速移动）
+    2. 静态位置估计（递推均值，无速度状态）
     3. 两阶段匹配（恢复遮挡轨迹）- ByteTrack核心
+    4. Track ID 永续：出视野 120s 内回来自动复用原 ID
+    5. remove_object() API：抓取后显式移除物体
     """
 
     def __init__(self, cfg: TrackerConfig = None, log=None):
@@ -424,8 +361,7 @@ class ByteTracker3D:
         if self.log:
             self.log.debug(f"Frame {self.frame_id}: {len(high_dets)} high, {len(low_dets)} low detections")
 
-        # ========== Step 1: Kalman预测所有轨迹 ==========
-        # 合并活跃和丢失轨迹
+        # ========== Step 1: 预测所有轨迹（静态: 位置不变）==========
         all_stracks = self.tracked_stracks + self.lost_stracks
         for track in all_stracks:
             track.predict()
@@ -682,7 +618,7 @@ class ByteTracker3D:
         """
         计算归一化代价矩阵（距离 + 类别）
 
-        cost = 0.80*dist_norm + 0.20*cat_cost + age_penalty
+        cost = 0.85*dist_norm + 0.15*cat_cost + age_penalty
 
         cat_cost: 0.0=相同 / 0.3=兼容 / 1.0=不兼容（软门控）
         最终由 cost_max=0.75 决定是否接受。
@@ -726,9 +662,6 @@ class ByteTracker3D:
                 new_tracked.append(track)
             elif track.state == TrackState.Removed:
                 # 只保留已激活（track_id 已分配）的轨迹用于 Re-ID
-                # - 普通轨迹：activate() 在 confirm_time_s 达标后触发，track_id 非 None
-                # - Re-ID 轨迹：创建时立即 activate()，track_id 非 None（即使存活仅 1 帧）
-                # - 噪声轨迹：从未 activate()，track_id = None，不保留
                 if track.track_id is not None:
                     self.removed_stracks.append(track)
 
@@ -745,12 +678,9 @@ class ByteTracker3D:
         """
         尝试从 Removed 池中找到位置接近的旧轨迹，复用其 track_id。
 
-        匹配策略：距离为硬门控（> reid_thresh 直接跳过），类别为软代价偏好。
-        cost = dist + reid_cat_weight * cat_cost
-        - 同类别：cost = dist（无惩罚）
-        - 兼容类别：cost = dist + reid_cat_weight * 0.3
-        - 不兼容：cost = dist + reid_cat_weight * 1.0
-        分类器抖动（box→bottle）时距离足够近仍可 Re-ID，但同类候选优先。
+        静态世界策略：
+        - 距离硬门控：> reid_thresh 直接跳过
+        - 类别严格相同：抓取机器人安全要求，不同类物体不复用 ID
 
         Returns:
             旧 track_id (int) 如果匹配成功，否则 None
@@ -758,27 +688,24 @@ class ByteTracker3D:
         if not self.removed_stracks:
             return None
 
-        best_cost = float('inf')
+        best_dist = self.cfg.reid_thresh
         best_idx = -1
 
         det_pos = detection['position']
         det_cat = detection['category']
 
         for i, track in enumerate(self.removed_stracks):
+            # 严格类别匹配：不同类别直接跳过
+            if track.category != det_cat:
+                continue
             dist = float(np.linalg.norm(track.position - det_pos))
-            if dist >= self.cfg.reid_thresh:
-                continue  # 距离硬门控
-            cat_cost = CategoryCompatibility.compute_category_cost(track.category, det_cat)
-            cost = dist + self.cfg.reid_cat_weight * cat_cost
-            if cost < best_cost:
-                best_cost = cost
+            if dist < best_dist:
+                best_dist = dist
                 best_idx = i
 
         if best_idx >= 0:
             old_track = self.removed_stracks.pop(best_idx)
             # 清除 pool 中所有同位置的竞争轨迹（同一物体被重复创建的不同 ID）
-            # 根因：分类器抖动(box↔can)在 pool 里积累了 track_2(box)+track_5(can) 两个竞争者，
-            # 之后检测类别决定复活哪个，导致振荡。清除同位置竞争者可彻底切断循环。
             self.removed_stracks = [
                 t for t in self.removed_stracks
                 if float(np.linalg.norm(t.position - det_pos)) >= self.cfg.reid_thresh
@@ -792,7 +719,7 @@ class ByteTracker3D:
         构建输出结果
 
         策略：返回所有输入检测，为已确认轨迹添加 track_id
-        - 已确认轨迹：添加 track_id + Kalman 滤波位置
+        - 已确认轨迹：添加 track_id + 递推均值位置（稳定）
         - 未确认检测：保持原样（track_id=None）
 
         这样保证融合结果不丢失任何检测，同时为稳定跟踪的物体提供持久 ID。
@@ -800,7 +727,6 @@ class ByteTracker3D:
         output = []
 
         # 1. 收集所有已确认轨迹，建立检测ID到轨迹的映射
-        # 使用 id(detection) 作为 key，因为每个检测是独立的 dict 对象
         confirmed_tracks = {}
         for track in self.tracked_stracks:
             if track.track_id is not None and track.last_detection:
@@ -812,12 +738,12 @@ class ByteTracker3D:
             det_id = id(det)
 
             if det_id in confirmed_tracks:
-                # 已确认轨迹：使用 track_id + Kalman 滤波位置
+                # 已确认轨迹：使用 track_id + 递推均值位置
                 track = confirmed_tracks[det_id]
                 obj = {
                     'track_id': f"track_{track.track_id}",
                     'category': track.category,
-                    'position': track.position,  # Kalman 滤波后的位置
+                    'position': track.position,  # 递推均值估计位置
                     'confidence': track.confidence,
                     'source': det.get('source', 'tracked'),
                     'quality': 'tracked',
@@ -845,6 +771,37 @@ class ByteTracker3D:
 
         return output
 
+    def remove_object(self, track_id) -> bool:
+        """
+        显式移除一个物体（如抓取成功后调用）。
+
+        从所有轨迹池中彻底删除，不进入 Re-ID 池。
+
+        Args:
+            track_id: "track_5" (str) 或 5 (int)
+
+        Returns:
+            True 如果找到并移除，False 如果未找到
+        """
+        if isinstance(track_id, str) and track_id.startswith('track_'):
+            try:
+                tid = int(track_id.split('_')[1])
+            except (IndexError, ValueError):
+                return False
+        elif isinstance(track_id, int):
+            tid = track_id
+        else:
+            return False
+
+        for pool in (self.tracked_stracks, self.lost_stracks, self.removed_stracks):
+            for i, track in enumerate(pool):
+                if track.track_id == tid:
+                    pool.pop(i)
+                    if self.log:
+                        self.log.info(f'[REMOVE] track_{tid} removed (category={track.category})')
+                    return True
+        return False
+
     def reset(self):
         """重置跟踪器"""
         self.tracked_stracks = []
@@ -863,14 +820,14 @@ class ByteTracker3D:
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("ByteTracker3D 测试")
+    print("ByteTracker3D 测试（静态世界模型）")
     print("=" * 70)
 
     # 创建跟踪器
     cfg = TrackerConfig(
         match_thresh=0.15,
         second_thresh=0.25,
-        track_buffer_s=3.0,
+        track_buffer_s=120.0,
         confirm_time_s=0.8,
         min_confirm_hits=2,
     )
@@ -894,7 +851,7 @@ if __name__ == '__main__':
     print("\n--- 帧 2: bottle被遮挡，只有chassis看到 ---")
     frame2 = [
         {'position': np.array([1.02, 0.01, 0.51]), 'category': 'bottle',
-         'confidence': 0.7, 'source': 'chassis_only', 'quality': 'single_view'},  # 低置信度
+         'confidence': 0.7, 'source': 'chassis_only', 'quality': 'single_view'},
         {'position': np.array([1.52, 0.21, 0.61]), 'category': 'cup',
          'confidence': 0.87, 'source': 'fused', 'quality': 'GOOD'},
         {'position': np.array([2.02, -0.09, 0.41]), 'category': 'box',
@@ -921,7 +878,7 @@ if __name__ == '__main__':
     print("\n--- 帧 4: bottle重新出现（chassis_only），应该恢复 ---")
     frame4 = [
         {'position': np.array([1.06, 0.02, 0.52]), 'category': 'bottle',
-         'confidence': 0.65, 'source': 'chassis_only', 'quality': 'single_view'},  # 低置信度恢复
+         'confidence': 0.65, 'source': 'chassis_only', 'quality': 'single_view'},
         {'position': np.array([1.56, 0.23, 0.63]), 'category': 'cup',
          'confidence': 0.88, 'source': 'fused', 'quality': 'GOOD'},
         {'position': np.array([2.06, -0.07, 0.43]), 'category': 'box',
@@ -932,9 +889,16 @@ if __name__ == '__main__':
     for obj in result4:
         print(f"  ID={obj['track_id']}, {obj['category']}, pos={obj['position']}, len={obj['tracklet_len']}")
 
+    # 测试 remove_object
+    print("\n--- 测试 remove_object ---")
+    removed = tracker.remove_object('track_1')
+    print(f"remove_object('track_1'): {removed}")
+    print(f"Tracked: {len(tracker.tracked_stracks)}, Lost: {len(tracker.lost_stracks)}")
+
     print("\n" + "=" * 70)
-    print("✅ ByteTracker3D 测试完成")
-    print("   - 帧2: bottle用低置信度检测继续跟踪（第一阶段未匹配，第二阶段恢复）")
-    print("   - 帧3: bottle完全丢失，进入Lost状态")
-    print("   - 帧4: bottle用低置信度检测恢复（ByteTrack核心创新）")
+    print("ByteTracker3D 测试完成（静态世界模型）")
+    print("   - 帧2: bottle用低置信度检测继续跟踪")
+    print("   - 帧3: bottle完全丢失，进入Lost状态（保留120s）")
+    print("   - 帧4: bottle用低置信度检测恢复")
+    print("   - remove_object: 抓取后显式移除")
     print("=" * 70)

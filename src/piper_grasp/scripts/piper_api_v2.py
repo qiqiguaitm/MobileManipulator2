@@ -342,6 +342,22 @@ class PiperAPI:
             print(f"[PiperAPI] ✗ Set position failed: {e}")
             return False
 
+    def _is_can_ok(self) -> bool:
+        """Check CAN receive thread health via SDK's built-in FPS monitor."""
+        try:
+            return self.piper.isOk()
+        except Exception:
+            return False
+
+    def _verify_at_target(self, target_gc: dict, tolerance: float = 30.0) -> Tuple[bool, float]:
+        """Verify arm is at target position (gripper center).
+        Returns (at_target, distance_mm).
+        """
+        _, gc = self.get_position(return_gripper_center=True)
+        tx, ty, tz = target_gc.get('x', 0), target_gc.get('y', 0), target_gc.get('z', 0)
+        dist = math.sqrt((gc[0]-tx)**2 + (gc[1]-ty)**2 + (gc[2]-tz)**2)
+        return dist <= tolerance, dist
+
     def _wait_position_reached(self, target, timeout: float = 5.0,
                                 tolerance: int = 5000, speed: int = 30,
                                 move_mode: int = 0x00) -> bool:
@@ -361,6 +377,7 @@ class PiperAPI:
         Safety:
             - Error detection: arm_status 0x02/0x03/0x04, joint limit bits
             - Resend once at 1s if firmware never started moving
+            - CAN thread health check via SDK isOk()
 
         Args:
             target: Target position in SDK units
@@ -376,6 +393,7 @@ class PiperAPI:
         REACHED_CONFIRM = 2  # require N consecutive 0x00 to confirm arrival
         ERROR_GRACE = 0.3  # ignore transient TARGET_LIMIT right after command
         RESEND_DEADLINE = 1.0  # firmware mode switch takes ~100ms; 1s is safe margin
+        STALE_DEADLINE = 2.0  # check CAN health after this
 
         while True:
             elapsed = time.time() - start
@@ -404,19 +422,21 @@ class PiperAPI:
                 reached_count = 0  # reset: arm still moving
 
             # Reached target: require N consecutive 0x00 reads after seen_moving
-            # to filter out stale CAN bus data from previous command completion
             if motion_st == 0x00 and seen_moving:
                 reached_count += 1
                 if reached_count >= REACHED_CONFIRM:
                     return True
 
             # Position check: independent of motion_status
-            # Firmware may keep motion_status=0x01 even after arm reaches target,
-            # so always check position once arm started moving or after grace period.
             if elapsed > ERROR_GRACE:
                 current = self._get_current_pose()
                 if all(abs(current[i] - target[i]) < tolerance for i in range(3)):
                     return True
+
+            # CAN thread dead → break early instead of wasting timeout
+            if elapsed > STALE_DEADLINE and not self._is_can_ok():
+                print(f"[PiperAPI] CAN thread dead, breaking early (t={elapsed:.2f}s)")
+                break
 
             # Command lost / mode-switch drop: resend once after deadline
             if elapsed > RESEND_DEADLINE and not resent and not seen_moving:
@@ -432,7 +452,8 @@ class PiperAPI:
             current = self._get_current_pose()
             diff = [abs(current[i] - target[i]) / self.FACTOR for i in range(3)]
             print(f"[PiperAPI] ✗ Timeout ({timeout}s), motion_status=0x{int(motion_st):02X}, "
-                  f"seen_moving={seen_moving}, diff=[{diff[0]:.1f},{diff[1]:.1f},{diff[2]:.1f}]mm")
+                  f"seen_moving={seen_moving}, can_ok={self._is_can_ok()}, "
+                  f"diff=[{diff[0]:.1f},{diff[1]:.1f},{diff[2]:.1f}]mm")
         except Exception:
             print(f"[PiperAPI] ✗ Timeout ({timeout}s), motion_status=0x{int(motion_st):02X}, "
                   f"seen_moving={seen_moving}")
@@ -932,24 +953,31 @@ class PiperAPI:
             result = self.set_position(**target_kw)
 
             if not result:
-                # SDK end-pose cache may be stale after CAN write storm.
-                # Brief pause (no CAN writes) lets SDK process pending feedback.
-                time.sleep(0.5)
-                _, gc = self.get_position(return_gripper_center=True)
-                tx, ty, tz = pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)
-                dist = math.sqrt((gc[0]-tx)**2 + (gc[1]-ty)**2 + (gc[2]-tz)**2)
-                if dist < 30.0:
-                    print(f"[PiperAPI] ⚠ go_ready: SDK refreshed — arm IS at target "
-                          f"(dist={dist:.1f}mm), treating as success")
-                    result = True
+                # Step 1: Hardware error → fast fail
+                has_err, err_type = self._get_error_type()
+                if has_err:
+                    print(f"[PiperAPI] go_ready: hardware error ({err_type})")
                 else:
-                    has_err, err_type = self._get_error_type()
-                    if has_err:
-                        print(f"[PiperAPI] ⚠ go_ready: hardware error ({err_type}), skip retry")
+                    # Step 2: CAN stale → wait for arm to physically settle
+                    if not self._is_can_ok():
+                        print("[PiperAPI] go_ready: CAN feedback stale, waiting 3s for arm to settle")
+                        time.sleep(3.0)
+
+                    # Step 3: Verify position (works whether CAN was stale or not)
+                    at_target, dist = self._verify_at_target(pos)
+                    if at_target:
+                        print(f"[PiperAPI] go_ready: arm at target (dist={dist:.1f}mm)")
+                        result = True
                     else:
-                        print(f"[PiperAPI] ⚠ go_ready: no HW error, dist={dist:.1f}mm — retrying once")
+                        # Step 4: One retry
+                        print(f"[PiperAPI] go_ready: dist={dist:.1f}mm, retrying once")
                         time.sleep(0.5)
                         result = self.set_position(**target_kw)
+                        if not result:
+                            at_target, dist = self._verify_at_target(pos)
+                            if at_target:
+                                print(f"[PiperAPI] go_ready: retry OK (dist={dist:.1f}mm)")
+                                result = True
 
             if result:
                 print("[PiperAPI] ✓ Ready position reached")
@@ -1118,6 +1146,7 @@ class PiperAPI:
         msg = self.piper.GetArmEndPoseMsgs()
         if msg is None or not hasattr(msg, 'end_pose'):
             if self._last_valid_pose:
+                print("[PiperAPI] Using cached pose (CAN read failed)")
                 return self._last_valid_pose
             raise RuntimeError("Cannot read pose")
 
@@ -1330,6 +1359,11 @@ class PiperAPI:
                 print(f"[PiperAPI] ⚠ No joint motion after {RESEND_DEADLINE}s, resending")
                 self.piper.JointCtrl(*target_sdk)
                 resent = True
+
+            # CAN thread dead → break early
+            if elapsed > 2.0 and not self._is_can_ok():
+                print(f"[PiperAPI] CAN thread dead during joint wait, breaking early")
+                break
 
             time.sleep(0.05)
 

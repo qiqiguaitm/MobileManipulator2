@@ -147,6 +147,7 @@ def generate_launch_description():
                     ),
                     launch_arguments={
                         'hand_enable': 'true',
+                        'hand_enable_infra': 'true',
                     }.items()
                 )
             ]

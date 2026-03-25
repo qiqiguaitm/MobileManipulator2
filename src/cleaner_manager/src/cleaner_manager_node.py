@@ -83,7 +83,6 @@ class CleanerManagerNode(Node):
         self.declare_parameter('grasp_distance_max',      6.0)
         self.declare_parameter('grasp_physical_min_size', 0.02)
         self.declare_parameter('grasp_physical_max_size', 0.25)
-        self.declare_parameter('detection_mode', 'topic')  # "topic" or "service"
         self.declare_parameter('costmap_max_cost', 99)     # OccupancyGrid: 99=inscribed, 100=lethal
         self.declare_parameter('costmap_topic', '/global_costmap/costmap')
 
@@ -125,25 +124,18 @@ class CleanerManagerNode(Node):
         )
         self._log.info(f"Costmap filter: topic={costmap_topic}, max_cost={self.get_parameter('costmap_max_cost').value}")
 
-        # --- Detection mode ---
-        self._detection_mode = self.get_parameter('detection_mode').value
-        self._log.info(f"检测模式: {self._detection_mode.upper()}")
+        # --- 订阅跟踪结果（唯一的感知输入） ---
+        topic = self.get_parameter('tracked_objects_topic').value
+        self.create_subscription(
+            Object3DArray, topic,
+            self._tracked_objects_cb, 10,
+            callback_group=self._cb_group,
+        )
+        self._log.info(f"订阅感知topic: {topic}")
 
-        if self._detection_mode == 'topic':
-            # --- Subscription: tracked objects ---
-            topic = self.get_parameter('tracked_objects_topic').value
-            self.create_subscription(
-                Object3DArray, topic,
-                self._tracked_objects_cb, 10,
-                callback_group=self._cb_group,
-            )
-        else:
-            # --- Service client: on-demand detection ---
-            from perception.srv import DetectObjects
-            self._detect_client = self.create_client(
-                DetectObjects, '/multi_camera_perception/detect',
-                callback_group=self._cb_group,
-            )
+        # --- 感知检测控制（暂停/恢复Timer检测） ---
+        self._perception_config_pub = self.create_publisher(
+            PerceptionConfig, '/perception/config', 1)
 
         # --- Subscription: grasp filter config ---
         self.create_subscription(
@@ -193,13 +185,6 @@ class CleanerManagerNode(Node):
         self._worker_thread = None
         self._running = False
 
-        # Service 模式：定时检测喂池（状态机 NAVIGATING/PICKING 暂停时自动跳过）
-        if self._detection_mode == 'service':
-            self._detect_timer = self.create_timer(
-                1.0, self._periodic_detect, callback_group=self._cb_group)
-        self._last_detect_log_n = -1   # throttle detect log
-        self._detect_log_skip = 0
-
         self._log.info("CleanerManagerNode initialized — call ~/start to begin")
 
     def set_navigator(self, navigator: ApproachNavigator):
@@ -230,75 +215,16 @@ class CleanerManagerNode(Node):
     def _tracked_objects_cb(self, msg):
         if not self._localization_ok:
             return  # localization not ready — discard perception data
+        # 接受所有经过 ByteTracker3D 确认的结果（含单相机跟踪）
+        # min_confirm_hits=4 + min_observations=4 已足够过滤误检
         msg.objects = self._filter.filter(msg.objects)
         self._pool.update_from_tracker(msg)
 
-    def detect_and_update_pool(self, timeout: float = 5.0) -> int:
-        """Service 模式：调 DetectObjects → 过滤 → 喂入池。返回物体数。"""
-        if not self._localization_ok:
-            return 0
-        from perception.srv import DetectObjects
-        req = DetectObjects.Request()
-        req.camera_id = 'all'
-        future = self._detect_client.call_async(req)
-        deadline = _time.time() + timeout
-        while not future.done():
-            if _time.time() > deadline:
-                self._log.warn("detect_and_update_pool: 超时")
-                return 0
-            _time.sleep(0.05)
-        resp = future.result()
-        if not resp or not resp.success:
-            return 0
-        msg = resp.result
-        msg.objects = self._filter.filter(msg.objects)
-        self._pool.update_from_tracker(msg)
-        n = len(msg.objects)
-        if n > 0:
-            # 只在数量变化时或每10次检测时打一次日志，避免刷屏
-            self._detect_log_skip += 1
-            if n != self._last_detect_log_n or self._detect_log_skip >= 10:
-                self._log.info(f"detect_and_update_pool: {n} objects")
-                self._last_detect_log_n = n
-                self._detect_log_skip = 0
-        return n
-
-    def _periodic_detect(self):
-        """Service 模式定时检测（异步，不阻塞 executor）。
-        detect_and_update_pool 的阻塞版保留给 worker 线程使用。"""
-        if self._pool.paused:
-            return
-        if not self._localization_ok:
-            return
-        if getattr(self, '_detect_pending', False):
-            return  # 上次请求还没回来，跳过
-        from perception.srv import DetectObjects
-        req = DetectObjects.Request()
-        req.camera_id = 'all'
-        self._detect_pending = True
-        future = self._detect_client.call_async(req)
-        future.add_done_callback(self._on_periodic_detect_done)
-
-    def _on_periodic_detect_done(self, future):
-        """异步检测结果回调"""
-        self._detect_pending = False
-        try:
-            resp = future.result()
-        except Exception as e:
-            self._log.warn(f"detect_and_update_pool: 异常 {e}")
-            return
-        if not resp or not resp.success:
-            return
-        msg = resp.result
-        msg.objects = self._filter.filter(msg.objects)
-        self._pool.update_from_tracker(msg)
-        n = len(msg.objects)
-        if n > 0:
-            self._detect_log_skip += 1
-            if n != self._last_detect_log_n or self._detect_log_skip >= 10:
-                self._log.info(f"detect_and_update_pool: {n} objects")
-                self._last_detect_log_n = n
-                self._detect_log_skip = 0
+    def _set_detection_paused(self, paused: bool):
+        """控制感知节点的Timer检测暂停/恢复"""
+        msg = PerceptionConfig()
+        msg.detection_control = 1 if paused else 2
+        self._perception_config_pub.publish(msg)
 
     def _build_pick_config(self) -> PickConfig:
         return PickConfig(
@@ -353,9 +279,13 @@ class CleanerManagerNode(Node):
 
     def _reset_pool_cb(self, request, response):
         self._pool.reset()
-        self._log.info("Target pool cleared by request")
+        # 同步重置 tracker，防止老 track 立刻回填 pool
+        msg = PerceptionConfig()
+        msg.reset_tracker = True
+        self._perception_config_pub.publish(msg)
+        self._log.info("Target pool + tracker cleared by request")
         response.success = True
-        response.message = "Pool cleared"
+        response.message = "Pool + tracker cleared"
         return response
 
     def _abort_cb(self, request, response):
@@ -432,7 +362,7 @@ class CleanerManagerNode(Node):
         msg.pool_targets = entries
 
         self._status_pub.publish(msg)
-        self._publish_target_markers(entries)
+        self._publish_target_markers([e for e in entries if e.viable])
 
     # ------------------------------------------------------------------
     # RViz target markers
@@ -542,11 +472,6 @@ class CleanerManagerNode(Node):
             return False, f"TF map->base_link unavailable: {e}"
         if self._navigator is None:
             return False, "Navigator not set"
-
-        # Detect service (service mode only)
-        if self._detection_mode == 'service':
-            if not self._detect_client.wait_for_service(timeout_sec=3.0):
-                return False, "Service /multi_camera_perception/detect not available"
 
         # Services (2s timeout each)
         for name, client in [
