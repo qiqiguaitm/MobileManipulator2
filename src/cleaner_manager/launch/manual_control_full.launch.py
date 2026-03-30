@@ -176,7 +176,7 @@ def generate_launch_description():
             {'top_detect_rate':     LaunchConfiguration('top_detect_rate')},
             {'chassis_detect_rate': LaunchConfiguration('chassis_detect_rate')},
             {'fusion_publish_rate': LaunchConfiguration('fusion_publish_rate')},
-            {'default_prompt':      "can.vegetable.bottle.box.food.Rubik's cube.tool"},
+            {'default_prompt':      "can.vegetable.bottle.box.food.Rubik's cube.tool.bread.objects"},
             {'detector_type':       LaunchConfiguration('detector_type')},
             {'extrinsics_dir':      perception_config_dir},
             {'extrinsics_suffix':   LaunchConfiguration('extrinsics_suffix')},

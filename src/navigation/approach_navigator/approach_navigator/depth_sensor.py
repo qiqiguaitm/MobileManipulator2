@@ -395,8 +395,7 @@ class DepthSensor:
         # 将平面参数应用到全量地面候选点
         if normal is not None:
             # 有符号距离: 正值=地面以下(或在地面上), 负值=地面以上(物体)
-            # 只将位于地面平面 1cm 以上至 3cm 以下范围内的点视为地面,
-            # 避免将低矮物体顶面(可能距地面仅 2-3cm)误判为地面点而去除
+            # 只将位于地面平面 1cm 以上至 5cm 以下范围内的点视为地面
             signed = potential_ground @ normal - d_plane
             inliers = (signed >= self._config.ground_inlier_min_dist) & \
                        (signed < self._config.ground_inlier_max_dist)
@@ -486,19 +485,18 @@ class DepthSensor:
     def _cluster(self, points: np.ndarray) -> List[np.ndarray]:
         tolerance = self._config.cluster_tolerance
         min_size = self._config.cluster_min_size
-        max_size = self._config.cluster_max_size
         if len(points) < min_size:
             return []
         if self._use_sklearn:
-            return self._cluster_dbscan(points, tolerance, min_size, max_size)
+            return self._cluster_dbscan(points, tolerance, min_size)
         try:
             from scipy.spatial import cKDTree  # noqa: F401
-            return self._cluster_kdtree(points, tolerance, min_size, max_size)
+            return self._cluster_kdtree(points, tolerance, min_size)
         except ImportError:
             return []
 
     def _cluster_dbscan(self, points: np.ndarray, tolerance: float,
-                        min_size: int, max_size: int) -> List[np.ndarray]:
+                        min_size: int) -> List[np.ndarray]:
         """sklearn DBSCAN (最快, C++ 实现)"""
         from sklearn.cluster import DBSCAN
         labels = DBSCAN(
@@ -512,12 +510,12 @@ class DepthSensor:
                 continue
             mask = labels == label
             cnt  = int(np.sum(mask))
-            if min_size <= cnt <= max_size:
+            if cnt >= min_size:
                 clusters.append(points[mask])
         return clusters
 
     def _cluster_kdtree(self, points: np.ndarray, tolerance: float,
-                        min_size: int, max_size: int) -> List[np.ndarray]:
+                        min_size: int) -> List[np.ndarray]:
         """KDTree BFS 聚类 (scipy), deque 保证 O(n) BFS"""
         from scipy.spatial import cKDTree
         tree      = cKDTree(points)
@@ -534,14 +532,12 @@ class DepthSensor:
             while q:
                 idx = q.popleft()
                 cluster_idx.append(idx)
-                if len(cluster_idx) > max_size:
-                    break
                 for nb in tree.query_ball_point(points[idx], tolerance):
                     if not processed[nb]:
                         processed[nb] = True
                         q.append(nb)
 
-            if min_size <= len(cluster_idx) <= max_size:
+            if len(cluster_idx) >= min_size:
                 clusters.append(points[cluster_idx])
 
         return clusters
@@ -757,11 +753,12 @@ class DepthSensor:
                 return None
             return self._nearest_obstacle
 
-    def get_all_cluster_centroids(self) -> List[Tuple[float, float, float]]:
+    def get_all_cluster_centroids(self) -> List[Tuple[float, float, float, int]]:
         """获取所有聚类的质心信息 (用于阶段2目标选择)
 
         Returns:
-            list of (centroid_x, centroid_y, front_z)，空列表表示无数据
+            list of (centroid_x, centroid_y, front_z, n_points)，空列表表示无数据
+            向后兼容: c[0]=cx, c[1]=cy, c[2]=front_z, c[3]=点数
         """
         with self._result_lock:
             if time.time() - self._result_timestamp > 1.5:
@@ -770,7 +767,8 @@ class DepthSensor:
             for cluster in self._clusters:
                 centroid = np.mean(cluster, axis=0)
                 front_z = float(np.min(cluster[:, 2]))
-                result.append((float(centroid[0]), float(centroid[1]), front_z))
+                result.append((float(centroid[0]), float(centroid[1]),
+                               front_z, len(cluster)))
             return result
 
     def get_target_depth(self) -> Optional[float]:

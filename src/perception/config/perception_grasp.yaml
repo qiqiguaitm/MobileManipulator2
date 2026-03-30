@@ -13,7 +13,7 @@ perception_grasp_node:
       realtime_mode:
         enabled: false
         rate: 1.0
-        default_prompt: "can.vegetable.bottle.box.food.Rubik's cube.tool"
+        default_prompt: "can.vegetable.bottle.box.food.Rubik's cube.tool.bread"
         prompt_topic: '/usr/prompt/grasp'
 
     # 检测服务配置

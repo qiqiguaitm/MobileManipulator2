@@ -48,10 +48,10 @@ class ApproachConfig:
     # 相机坐标系: y 向下为正, 相机离地约 15cm → 地面在 y ≈ +0.15m
     # 空中物体 y < 0 (负), 地面 y ≈ +0.15, 地面以下 y > 0.15
     depth_downsample: int = 4               # 深度图降采样因子 (4=每4像素取1个)
-    depth_ground_max_height: float = 0.15   # 地面高度: +15cm (相机离地15cm, y向下为正)
+    depth_ground_max_height: float = 0.158  # 地面高度: +15.8cm (相机离地15cm, y向下为正)
     depth_obstacle_min_height: float = -0.50 # ROI上方截止: -50cm (y向上为负, 排除过高处)
-    depth_obstacle_max_height: float = 0.22  # ROI下方截止: +22cm (包含地面y=0.15, 供RANSAC)
-    depth_detect_width: float = 0.4         # 前方检测宽度 (米)，左右各此值
+    depth_obstacle_max_height: float = 0.24  # ROI下方截止: +24cm (包含地面+余量, 供RANSAC)
+    depth_detect_width: float = 0.8         # 前方检测宽度 (米)，左右各此值
 
     # ========== 去噪参数 ==========
     outlier_radius: float = 0.05            # 半径异常值去除: 搜索半径 (米)
@@ -59,16 +59,15 @@ class ApproachConfig:
 
     # ========== RANSAC 地面拟合参数 ==========
     ransac_distance_threshold: float = 0.03 # 点到平面距离阈值 (米)
-    ransac_max_iterations: int = 50         # 最大迭代次数
+    ransac_max_iterations: int = 80         # 最大迭代次数
     ransac_min_inlier_ratio: float = 0.3    # 最小内点比例
-    ground_candidate_margin: float = 0.05   # 地面候选点 y 下限容差 (米)
-    ground_inlier_min_dist: float = -0.005  # 地面内点有符号距离下限 (米, 平面上方5mm以内视为地面)
-    ground_inlier_max_dist: float = 0.03    # 地面内点有符号距离上限 (米, 平面下方)
+    ground_candidate_margin: float = 0.08   # 地面候选点 y 下限容差 (米)
+    ground_inlier_min_dist: float = -0.01   # 地面内点有符号距离下限 (米, 平面上方1cm)
+    ground_inlier_max_dist: float = 0.05    # 地面内点有符号距离上限 (米, 平面下方5cm)
 
     # ========== 聚类参数 ==========
     cluster_tolerance: float = 0.05         # DBSCAN eps / KDTree 邻域半径 (米)
-    cluster_min_size: int = 50              # 最小聚类点数
-    cluster_max_size: int = 10000           # 最大聚类点数
+    cluster_min_size: int = 20              # 最小聚类点数
 
     # ========== 机器人几何参数 ==========
     # robot_front_offset: 用于导航计算接近点 (total_offset = robot_front_offset + approach_distance)
@@ -140,7 +139,6 @@ def load_config_from_node(node) -> ApproachConfig:
         # 聚类
         ('cluster_tolerance', config.cluster_tolerance),
         ('cluster_min_size', config.cluster_min_size),
-        ('cluster_max_size', config.cluster_max_size),
         # 机器人几何
         ('camera_forward_offset', config.camera_forward_offset),
         ('robot_front_offset', config.robot_front_offset),
@@ -191,7 +189,6 @@ def load_config_from_node(node) -> ApproachConfig:
     config.ground_inlier_max_dist = node.get_parameter('ground_inlier_max_dist').value
     config.cluster_tolerance = node.get_parameter('cluster_tolerance').value
     config.cluster_min_size = node.get_parameter('cluster_min_size').value
-    config.cluster_max_size = node.get_parameter('cluster_max_size').value
     config.camera_forward_offset = node.get_parameter('camera_forward_offset').value
     config.robot_front_offset = node.get_parameter('robot_front_offset').value
     config.control_rate = node.get_parameter('control_rate').value

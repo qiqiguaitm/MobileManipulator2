@@ -54,12 +54,16 @@ class TargetPool:
                  max_attempts: int = 3,
                  target_ttl: float = 60.0,
                  match_threshold: float = 0.20,
-                 min_observations: int = 2):
+                 min_observations: int = 2,
+                 z_min: float = -0.30,
+                 z_max: float = 0.50):
         self._logger = logger
         self._max_attempts = max_attempts
         self._target_ttl = target_ttl           # Fix 1: 0 = disabled
         self._match_threshold = match_threshold  # Fix 2: was hardcoded 0.08
         self._min_observations = min_observations  # Fix 3
+        self._z_min = z_min
+        self._z_max = z_max
 
         self._lock = threading.Lock()
         self._targets: List[TargetRecord] = []
@@ -196,15 +200,19 @@ class TargetPool:
                 if merged:
                     break
 
-    def is_viable(self, t: 'TargetRecord') -> bool:
-        """Check if a target passes all navigation filters (no lock required, reads immutable params)."""
-        now = time.time()
+    def _is_viable_locked(self, t: 'TargetRecord', now: float) -> bool:
+        """Core viability check (no lock, caller must hold or use immutable params)."""
         return (
             t.status == TargetStatus.ACTIVE
             and t.attempts < self._max_attempts
             and t.observation_count >= self._min_observations
             and (self._target_ttl <= 0 or (now - t.last_seen) < self._target_ttl)
+            and self._z_min <= t.position_map.z <= self._z_max
         )
+
+    def is_viable(self, t: 'TargetRecord') -> bool:
+        """Check if a target passes all navigation filters (no lock required, reads immutable params)."""
+        return self._is_viable_locked(t, time.time())
 
     def get_nav_target(self, robot_pos_map: Point) -> Optional[TargetRecord]:
         """Return nearest active target that hasn't exceeded max attempts."""
@@ -212,10 +220,7 @@ class TargetPool:
             now = time.time()
             candidates = [
                 t for t in self._targets
-                if t.status == TargetStatus.ACTIVE
-                and t.attempts < self._max_attempts
-                and t.observation_count >= self._min_observations  # Fix 3
-                and (self._target_ttl <= 0 or (now - t.last_seen) < self._target_ttl)  # Fix 1
+                if self._is_viable_locked(t, now)
             ]
             if not candidates:
                 return None
@@ -230,32 +235,22 @@ class TargetPool:
         """Return active targets within working area, sorted by distance."""
         with self._lock:
             now = time.time()
-            results = []
-            for t in self._targets:
-                if t.status != TargetStatus.ACTIVE:
-                    continue
-                if t.attempts >= self._max_attempts:
-                    continue
-                if t.observation_count < self._min_observations:  # Fix 3
-                    continue
-                if self._target_ttl > 0 and (now - t.last_seen) >= self._target_ttl:  # Fix 1
-                    continue
-                if in_working_area_fn(t.position_map):
-                    results.append(t)
+            results = [
+                t for t in self._targets
+                if self._is_viable_locked(t, now)
+                and in_working_area_fn(t.position_map)
+            ]
             results.sort(key=lambda t: _point_distance_2d(t.position_map, robot_pos_map))
             return results
 
     def get_all_active(self, robot_pos_map: Point) -> List[TargetRecord]:
-        """Return all ACTIVE targets passing TTL and min_observations filters, sorted by distance.
+        """Return all ACTIVE targets passing viability filters, sorted by distance.
         Does NOT call in_working_area RPC — used for geometric pre-filter in SCANNING."""
         with self._lock:
             now = time.time()
             results = [
                 t for t in self._targets
-                if t.status == TargetStatus.ACTIVE
-                and t.attempts < self._max_attempts
-                and t.observation_count >= self._min_observations
-                and (self._target_ttl <= 0 or (now - t.last_seen) < self._target_ttl)
+                if self._is_viable_locked(t, now)
             ]
             results.sort(key=lambda t: _point_distance_2d(t.position_map, robot_pos_map))
             return results
@@ -320,13 +315,7 @@ class TargetPool:
         with self._lock:
             now = time.time()
             active = sum(1 for t in self._targets if t.status == TargetStatus.ACTIVE)
-            viable = sum(
-                1 for t in self._targets
-                if t.status == TargetStatus.ACTIVE
-                and t.attempts < self._max_attempts
-                and t.observation_count >= self._min_observations
-                and (self._target_ttl <= 0 or (now - t.last_seen) < self._target_ttl)
-            )
+            viable = sum(1 for t in self._targets if self._is_viable_locked(t, now))
             return {
                 'total': len(self._targets),
                 'active': active,

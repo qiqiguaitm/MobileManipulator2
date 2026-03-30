@@ -9,6 +9,8 @@ Deliberately separate from TargetPool: pool manages tracking lifetime,
 this filter decides what enters the pool in the first place.
 """
 
+import math
+
 
 class TargetFilter:
     """Filter Object3D detections for grasp suitability.
@@ -16,8 +18,10 @@ class TargetFilter:
     Uses a fixed D435 focal length approximation for physical size
     estimation; accurate enough for go/no-go decisions.
 
-    Costmap check: rejects targets whose map-frame position falls on
-    occupied / inscribed cells in the global costmap.
+    Costmap check: rejects targets whose position falls on occupied /
+    inscribed cells.  Supports TF transform (map→costmap_frame) and
+    nearby-radius search so objects near walls are not rejected when the
+    robot can still reach them with its arm.
     """
 
     # Fallback focal length (RealSense D435 @ 1280x720)
@@ -33,6 +37,8 @@ class TargetFilter:
                  size_min: float = 0.02,
                  size_max: float = 0.20,
                  costmap_max_cost: int = 99,
+                 nearby_radius: float = 0.5,
+                 tf_buffer=None,
                  logger=None):
         self.z_min    = z_min
         self.z_max    = z_max
@@ -41,7 +47,9 @@ class TargetFilter:
         self.size_min = size_min
         self.size_max = size_max
         self._costmap_max_cost = costmap_max_cost
+        self._nearby_radius = nearby_radius
         self._costmap = None      # nav_msgs/OccupancyGrid, set by node
+        self._tf_buffer = tf_buffer
         self._log     = logger
 
     # ------------------------------------------------------------------
@@ -52,10 +60,68 @@ class TargetFilter:
         """Update global costmap reference (nav_msgs/OccupancyGrid)."""
         self._costmap = costmap
 
-    def _costmap_passable(self, x: float, y: float) -> bool:
-        """Check if (x, y) in map frame is navigable in the global costmap.
+    # ------------------------------------------------------------------
+    # TF: map → costmap frame
+    # ------------------------------------------------------------------
 
-        OccupancyGrid values: -1=unknown, 0=free, 1-98=inflated, 99=inscribed, 100=lethal.
+    def _lookup_map_to_costmap_tf(self):
+        """Return 2D affine (tx, ty, r00, r01, r10, r11) for map→costmap_frame.
+
+        Returns None on failure (caller should fallback).
+        """
+        cm = self._costmap
+        if cm is None or self._tf_buffer is None:
+            return None
+
+        frame = cm.header.frame_id
+        if frame == 'map':
+            return (0.0, 0.0, 1.0, 0.0, 0.0, 1.0)  # identity
+
+        try:
+            from rclpy.time import Time
+            import rclpy.duration
+            tf = self._tf_buffer.lookup_transform(
+                frame, 'map', Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1))
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            # yaw from quaternion (2D rotation only)
+            siny = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny, cosy)
+            c, s = math.cos(yaw), math.sin(yaw)
+            return (t.x, t.y, c, -s, s, c)
+        except Exception as e:
+            if self._log:
+                self._log.debug(f'[TargetFilter] TF map→{frame} failed: {e}')
+            return None
+
+    @staticmethod
+    def _apply_tf2d(tf, x, y):
+        """Apply 2D affine transform: (tx, ty, r00, r01, r10, r11)."""
+        tx, ty, r00, r01, r10, r11 = tf
+        return (r00 * x + r01 * y + tx,
+                r10 * x + r11 * y + ty)
+
+    # ------------------------------------------------------------------
+    # Costmap passable check (approach-ring sampling)
+    # ------------------------------------------------------------------
+
+    # 8 directions on the approach ring (every 45°)
+    _N_APPROACH_SAMPLES = 8
+    _APPROACH_ANGLES = [2.0 * math.pi * i / 8 for i in range(8)]
+
+    def _costmap_passable(self, x: float, y: float) -> bool:
+        """Check if an approach point around (x, y) is navigable.
+
+        The robot navigates to a point *approach_radius* away from the
+        object, not to the object itself.  So we sample 8 points on
+        the approach ring and accept the target if at least one
+        approach direction is passable.
+
+        When nearby_radius == 0, degrades to exact single-cell check
+        at the object position (legacy behavior).
+
         Returns True when no costmap is available (graceful degradation).
         """
         cm = self._costmap
@@ -63,16 +129,37 @@ class TargetFilter:
             return True
 
         info = cm.info
-        col = int((x - info.origin.position.x) / info.resolution)
-        row = int((y - info.origin.position.y) / info.resolution)
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        w = info.width
+        h = info.height
+        data = cm.data
+        max_cost = self._costmap_max_cost
+        approach_r = self._nearby_radius
 
-        if col < 0 or col >= info.width or row < 0 or row >= info.height:
-            return False  # outside costmap bounds
+        if approach_r <= 0 or res <= 0:
+            # exact single-cell check at object position
+            col = int((x - ox) / res) if res > 0 else 0
+            row = int((y - oy) / res) if res > 0 else 0
+            if col < 0 or col >= w or row < 0 or row >= h:
+                return False
+            cost = data[row * w + col]
+            return 0 <= cost < max_cost
 
-        cost = cm.data[row * info.width + col]
-        if cost < 0:
-            return False  # unknown space
-        return cost < self._costmap_max_cost
+        # sample 8 points on the approach ring
+        for angle in self._APPROACH_ANGLES:
+            px = x + approach_r * math.cos(angle)
+            py = y + approach_r * math.sin(angle)
+            col = int((px - ox) / res)
+            row = int((py - oy) / res)
+            if col < 0 or col >= w or row < 0 or row >= h:
+                continue
+            cost = data[row * w + col]
+            if 0 <= cost < max_cost:
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Runtime config update
@@ -95,8 +182,14 @@ class TargetFilter:
                 f'dist=[{self.dist_min},{self.dist_max}]m'
             )
 
-    def is_graspable(self, obj) -> bool:
-        """Return True if obj passes all grasp-suitability checks."""
+    def is_graspable(self, obj, _costmap_xy=None) -> bool:
+        """Return True if obj passes all grasp-suitability checks.
+
+        Args:
+            obj: Object3D detection.
+            _costmap_xy: Pre-transformed (x, y) in costmap frame. If None,
+                         uses obj.position.x/y directly (legacy behavior).
+        """
         cat  = obj.category
         z    = obj.position.z
         dist = obj.distance
@@ -156,16 +249,36 @@ class TargetFilter:
                         f'phys_min={phys_min:.3f}m < {self.size_min}m')
                 return False
 
-        # 4. Costmap navigability (map frame)
-        if not self._costmap_passable(obj.position.x, obj.position.y):
+        # 4. Costmap navigability
+        cx, cy = (_costmap_xy if _costmap_xy is not None
+                  else (obj.position.x, obj.position.y))
+        if not self._costmap_passable(cx, cy):
             if self._log:
                 self._log.debug(
                     f'[FILTER✗] {cat} costmap不可达 '
-                    f'({obj.position.x:.2f}, {obj.position.y:.2f})')
+                    f'map=({obj.position.x:.2f},{obj.position.y:.2f}) '
+                    f'cm=({cx:.2f},{cy:.2f}) r={self._nearby_radius}m')
             return False
 
         return True
 
     def filter(self, objects: list) -> list:
-        """Return subset of objects passing all grasp-suitability checks."""
-        return [o for o in objects if self.is_graspable(o)]
+        """Return subset of objects passing all grasp-suitability checks.
+
+        Performs a single TF lookup (map→costmap_frame) and batch-
+        transforms all object positions for costmap checking.
+        """
+        if not objects:
+            return []
+
+        tf = self._lookup_map_to_costmap_tf()
+
+        result = []
+        for o in objects:
+            if tf is not None:
+                cm_xy = self._apply_tf2d(tf, o.position.x, o.position.y)
+            else:
+                cm_xy = None  # fallback: use map coords directly
+            if self.is_graspable(o, _costmap_xy=cm_xy):
+                result.append(o)
+        return result

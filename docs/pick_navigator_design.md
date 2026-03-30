@@ -1,9 +1,9 @@
-# Robot Manager 设计文档
+# Cleaner Manager 设计文档
 
 > ROS2 自主机器人任务管理系统 — 当前任务: 自主拣取（Pick）
 >
-> 版本: 9.0
-> 日期: 2026-03-02
+> 版本: 9.1
+> 日期: 2026-03-27
 
 ---
 
@@ -21,9 +21,9 @@
 
 ### 1.2 设计原则
 
-**模块解耦**：三大模块（SLAM、Perception、Manipulation）均已独立测试完毕，是稳定的黑盒。RobotManager 作为**薄编排层**，仅通过各模块的 ROS2 接口（Topic/Service/Action）进行协调，不深入了解各模块内部实现细节。
+**模块解耦**：三大模块（SLAM、Perception、Manipulation）均已独立测试完毕，是稳定的黑盒。CleanerManager 作为**薄编排层**，仅通过各模块的 ROS2 接口（Topic/Service/Action）进行协调，不深入了解各模块内部实现细节。
 
-**可拓展性**：包名 `robot_manager` 不绑定特定任务类型。当前实现自主拣取（Pick）任务，未来可扩展巡逻、探索等任务类型，复用相同的模块接口和基础设施（TargetPool、状态反馈、健康检查等）。
+**可拓展性**：包名 `cleaner_manager` 不绑定特定任务类型。当前实现自主拣取（Pick）任务，未来可扩展巡逻、探索等任务类型，复用相同的模块接口和基础设施（TargetPool、状态反馈、健康检查等）。
 
 ### 1.3 核心流程
 
@@ -56,7 +56,7 @@
 │                                                                             │
 │  MultiCameraPerceptionNode          PerceptionGraspNode                     │
 │  (Top+Chassis 双相机融合)            (手部相机 按需)                          │
-│  ├─ DinoX 检测(自然语言)             ├─ DinoX + GraspAnything               │
+│  ├─ SAM3 检测(自然语言)             ├─ SAM3 + GraspAnything               │
 │  ├─ IntelligentFusion 融合           ├─ CDM 深度优化                        │
 │  ├─ ByteTracker3D 跟踪              ├─ 精确位置 ±5mm                        │
 │  └─ 3D 位置 ±5cm                    └─ 抓取角度 + 夹爪宽度                  │
@@ -93,7 +93,7 @@
 │  里程计层                        定位层                   导航层              │
 │  ├─ FastLIO (10Hz)              ├─ HDL NDT (10Hz)       ├─ Nav2             │
 │  ├─ 轮式里程计 (50Hz)           ├─ map→odom TF          │  ├─ Smac2D 规划   │
-│  └─ OdomFusion (50Hz合成)       └─ TF平滑发布(100Hz)    │  ├─ TEB 控制      │
+│  └─ OdomFusion (50Hz合成)       └─ TF平滑发布(100Hz)    │  ├─ MPPI 控制      │
 │                                                          │  └─ 行为树        │
 │  TF树: map → odom → base_link → [传感器/机械臂]          │                   │
 │                                                                             │
@@ -124,7 +124,7 @@ ObjectTrackerNode
   发布 → ~/tracked_objects (TrackedObject3DArray, base_link 坐标, m)
            │
            ▼
-RobotManager
+CleanerManager
   订阅 ← /object_tracker_node/tracked_objects  ← 唯一输入源
 ```
 
@@ -138,14 +138,14 @@ RobotManager
 |------|------|------|------|
 | FastLIO + OdomFusion | ✅ 已实现 | `slam` | 里程计融合，50Hz 平滑输出 |
 | HDL Localization | ✅ 已实现 | `slam` | NDT 全局定位 + TF平滑发布 |
-| Nav2 Stack | ✅ 已实现 | `slam` | Smac2D + TEB，完整导航栈 |
+| Nav2 Stack | ✅ 已实现 | `slam` | Smac2D + MPPI，完整导航栈 |
 | MultiCameraPerceptionNode | ✅ 已实现 | `perception` | 双相机融合 + ByteTracker3D |
 | ObjectTrackerNode | ✅ 已实现 | `perception` | 独立 Top 相机 SAM2 跟踪 |
 | PerceptionGraspNode | ✅ 已实现 | `perception` | 手部相机抓取检测 |
 | ApproachNavigator | ✅ 已实现 | `approach_navigator` | 三阶段精确导航 |
 | PiperGraspNode | ✅ 已实现 | `piper_grasp` | 机械臂控制 + observe/pick/place |
 | PiperAPI V2 | ✅ 已实现 | `piper_grasp` | CAN 总线通信，无ROS依赖 |
-| **RobotManager** | ✅ 已实现 | `robot_manager` | 任务编排 + 状态机 + 目标管理 |
+| **CleanerManager** | ✅ 已实现 | `cleaner_manager` | 任务编排 + 状态机 + 目标管理 |
 
 ### 依赖关系
 
@@ -153,7 +153,7 @@ RobotManager
 Perception
 ├─ MultiCameraPerceptionNode ──remap──► ObjectTrackerNode ──┐
 │                                                            │
-SLAM                                                        ├──► RobotManager
+SLAM                                                        ├──► CleanerManager
 ├─ Nav2 (via ApproachNavigator) ────────────────────────────┤
 ├─ TF树 (map→odom→base_link) ──────────────────────────────┤
 │                                                            │
@@ -162,7 +162,7 @@ Manipulation                                                │
 
 ### 依赖关系图（全部已实现）
 
-所有模块均已开发完毕并通过独立测试。Robot Manager 作为薄编排层将三大模块串联为完整的自主拣取系统。
+所有模块均已开发完毕并通过独立测试。Cleaner Manager 作为薄编排层将三大模块串联为完整的自主拣取系统。
 ```
 
 ---
@@ -182,7 +182,7 @@ Manipulation                                                │
     ↓
 [hdl_odom_to_tf + tf_republisher] → /tf: map→odom (平滑, 100Hz)
     ↓
-Nav2: 路径规划(Smac2D) + 轨迹跟踪(TEB) + 行为树
+Nav2: 路径规划(Smac2D) + 轨迹跟踪(MPPI) + 行为树
     ↓
 /cmd_vel → 底盘控制
 ```
@@ -205,7 +205,7 @@ map                                    (全局，HDL定位)
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | 全局规划器 | Smac2D (A*) | 适合2D地图 |
-| 局部控制器 | TEB | 支持非圆形机器人 |
+| 局部控制器 | MPPI | 模型预测路径积分控制 |
 | 底盘尺寸 | 0.809m × 0.62m | 矩形足迹 |
 | 最大线速度 | 0.3 m/s | |
 | 最大角速度 | 0.5 rad/s | |
@@ -220,7 +220,7 @@ map                                    (全局，HDL定位)
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │              在线服务层（HTTP / GPU 推理）                          │
-│  DinoX (自然语言检测) │ SAM3 (分割) │ GraspAnything │ CDM (深度优化) │
+│  SAM3 (自然语言检测) │ SAM3 (分割) │ GraspAnything │ CDM (深度优化) │
 └───────────────────────┬───────────────────────────────────────────┘
                         │
 ┌───────────────────────▼───────────────────────────────────────────┐
@@ -243,7 +243,7 @@ map                                    (全局，HDL定位)
 - `~/chassis/objects_3d` — Chassis相机独立结果
 - `~/fused/objects_3d` — 融合+去重结果（**需在 launch 中 remap 为 `/perception_3d/objects`**）
 
-### 5.3 ObjectTrackerNode（RobotManager 唯一感知输入）
+### 5.3 ObjectTrackerNode（CleanerManager 唯一感知输入）
 
 **注意**：ObjectTrackerNode 是**独立的感知流水线**，不是 MultiCamera 的简单包装。它：
 1. 接收 MultiCamera 的 `/perception_3d/objects` 作为 SAM2 跟踪的初始化种子
@@ -407,7 +407,7 @@ approach_navigator:
 不能直接比较两个坐标系中的数值!
 ```
 
-**模块解耦原则**：RobotManager 不需要理解机械臂的几何细节。导航模块负责"把机器人送到目标附近"，机械臂模块通过 `/piper/in_working_area` 服务自行判断目标是否可达（该服务内部处理坐标系转换）。
+**模块解耦原则**：CleanerManager 不需要理解机械臂的几何细节。导航模块负责"把机器人送到目标附近"，机械臂模块通过 `/piper/in_working_area` 服务自行判断目标是否可达（该服务内部处理坐标系转换）。
 
 **设计决策**：
 - 导航只负责"到附近"，不保证目标在工作区内
@@ -416,7 +416,7 @@ approach_navigator:
 
 ---
 
-## 8. Robot Manager 状态机（Pick 任务）
+## 8. Cleaner Manager 状态机（Pick 任务）
 
 ### 8.1 状态定义
 
@@ -441,7 +441,7 @@ class PickState(IntEnum):
             │
             ▼
 ┌───────► IDLE
-│           │ /robot_manager/start 服务
+│           │ /cleaner_manager/start 服务
 │           ▼
 │       PLANNING ◄──────────────────────────┐
 │           │                               │
@@ -482,7 +482,7 @@ class PickState(IntEnum):
 │           ▼
 └─────── PLANNING (重试)
 │
-│       /robot_manager/abort 服务 (任何状态均可触发)
+│       /cleaner_manager/abort 服务 (任何状态均可触发)
 │           │
 │           ├─ cancel ApproachNavigator
 │           ├─ cancel Piper pick/place action
@@ -501,13 +501,13 @@ class PickState(IntEnum):
 
 ### 8.4 进程与线程模型
 
-> 源码: `src/robot_manager/src/robot_manager_node.py`
+> 源码: `src/cleaner_manager/src/cleaner_manager_node.py`
 
 ```
-┌─────────────── 进程: robot_manager_node ───────────────┐
+┌─────────────── 进程: cleaner_manager_node ───────────────┐
 │                                                         │
 │  MultiThreadedExecutor (4 threads)                      │
-│  ├─ RobotManagerNode                                    │
+│  ├─ CleanerManagerNode                                    │
 │  │   ├─ Subscription: tracked_objects (5Hz)             │
 │  │   ├─ Timer: status publisher (1Hz)                   │
 │  │   ├─ Service: ~/start, ~/abort                       │
@@ -558,7 +558,7 @@ Executor 线程持续 spin 处理 future 回调，所以 future 会正常 resolv
 
 ### 8.5 状态处理器表（handler 驱动，消除 switch/case）
 
-> 源码: `src/robot_manager/robot_manager/pick_state_machine.py`
+> 源码: `src/cleaner_manager/cleaner_manager/pick_state_machine.py`
 
 ```python
 self._handlers = {
@@ -683,7 +683,7 @@ MATCH_THRESHOLD = 0.08  # 8cm
 
 ### 10.3 TargetPool 实现
 
-> 源码: `src/robot_manager/robot_manager/target_pool.py`
+> 源码: `src/cleaner_manager/cleaner_manager/target_pool.py`
 
 ```python
 class TargetStatus(IntEnum):
@@ -838,7 +838,7 @@ class TargetPool:
 | `final_approach_distance` (80mm) | base_link | ApproachNavigator |
 | `working_area` X/Y/Z 范围 | piper_link_base | PiperGraspNode |
 
-RobotManager 作为编排层，遵循以下解耦原则：
+CleanerManager 作为编排层，遵循以下解耦原则：
 - **不关心**两个坐标系之间的 TF 变换细节
 - **不关心**机械臂的具体几何参数
 - 通过调用 `/piper/in_working_area` 服务判断目标可达性（服务内部完成坐标变换）
@@ -908,7 +908,7 @@ DONE (9)         完成
 
 ### 14.2 转换边界
 
-**RobotManager 内部统一使用 SI 单位（m）**，仅在一个地方做 m→mm 转换：
+**CleanerManager 内部统一使用 SI 单位（m）**，仅在一个地方做 m→mm 转换：
 
 > 源码: `pick_state_machine.py:_check_in_working_area()`
 
@@ -938,10 +938,10 @@ map                                    (全局，HDL定位)
                 └── camera/hand_optical_frame
 ```
 
-**RobotManager 中的坐标系使用**：
+**CleanerManager 中的坐标系使用**：
 - TargetPool 中物体位置存储为 `map` 坐标（静态参考）
 - 调用 `/piper/in_working_area` 时传入 `base_link` 坐标（m→mm 转换后），服务内部处理到 `piper_link_base` 的变换
-- 不需要在 RobotManager 中手动做 base_link ↔ piper_link_base 变换
+- 不需要在 CleanerManager 中手动做 base_link ↔ piper_link_base 变换
 
 ---
 
@@ -949,11 +949,11 @@ map                                    (全局，HDL定位)
 
 ### 15.1 状态反馈话题
 
-> 消息定义: `src/robot_manager/msg/RobotManagerStatus.msg`
+> 消息定义: `src/cleaner_manager/msg/CleanerManagerStatus.msg`
 
 ```yaml
-~/status:                           # 实际话题: /robot_manager_node/status
-  类型: robot_manager/RobotManagerStatus
+~/status:                           # 实际话题: /cleaner_manager_node/status
+  类型: cleaner_manager/CleanerManagerStatus
   频率: 1Hz
   内容:
     header: std_msgs/Header
@@ -972,7 +972,7 @@ map                                    (全局，HDL定位)
 
 ### 15.2 启动健康检查
 
-> 源码: `robot_manager_node.py:_startup_check()`
+> 源码: `cleaner_manager_node.py:_startup_check()`
 
 调用 `~/start` 服务时执行，失败则拒绝启动并返回错误信息：
 
@@ -988,7 +988,7 @@ def _startup_check(self):
 ### 15.3 中止机制
 
 ```yaml
-~/abort:                              # 实际话题: /robot_manager_node/abort
+~/abort:                              # 实际话题: /cleaner_manager_node/abort
   类型: std_srvs/Trigger
   行为:
     1. 设置 abort_event (threading.Event)
@@ -1059,19 +1059,19 @@ src/
 │       ├── piper_grasp_node.yaml
 │       └── collision_config.yaml
 │
-└── robot_manager/                     # ✅ 已实现
-    ├── robot_manager/                 # Python 模块（安装到 site-packages）
+└── cleaner_manager/                     # ✅ 已实现
+    ├── cleaner_manager/                 # Python 模块（安装到 site-packages）
     │   ├── __init__.py
     │   ├── target_pool.py             # TargetPool + TargetRecord (~180行)
     │   └── pick_state_machine.py      # PickStateMachine + PickState (~300行)
     ├── src/
-    │   └── robot_manager_node.py      # ROS2 节点入口 + main() (~230行)
+    │   └── cleaner_manager_node.py      # ROS2 节点入口 + main() (~230行)
     ├── msg/
-    │   └── RobotManagerStatus.msg     # 状态反馈消息
+    │   └── CleanerManagerStatus.msg     # 状态反馈消息
     ├── config/
-    │   └── robot_manager.yaml         # 20+ 参数
+    │   └── cleaner_manager.yaml         # 20+ 参数
     ├── launch/
-    │   └── robot_manager.launch.py
+    │   └── cleaner_manager.launch.py
     ├── CMakeLists.txt                 # ament_cmake + rosidl_generate_interfaces
     └── package.xml
 ```
@@ -1088,33 +1088,33 @@ src/
 - [x] Navigation: ApproachNavigator 三阶段导航
 - [x] 消息定义: perception msg/srv + piper_msgs
 
-### Phase 2: Robot Manager + Pick 任务 ✅ 已完成
+### Phase 2: Cleaner Manager + Pick 任务 ✅ 已完成
 
-- [x] 创建 robot_manager 包 + RobotManagerStatus.msg
+- [x] 创建 cleaner_manager 包 + CleanerManagerStatus.msg
 - [x] 实现 TargetPool（线程安全、map坐标目标管理、暂停/恢复、指数移动平均位置更新）
 - [x] 实现 PickStateMachine（10 个状态、handler 表驱动、Piper service/action 异步调用封装）
-- [x] 实现 RobotManagerNode（MultiThreadedExecutor、daemon worker thread、ReentrantCallbackGroup）
+- [x] 实现 CleanerManagerNode（MultiThreadedExecutor、daemon worker thread、ReentrantCallbackGroup）
 - [x] 实现启动健康检查（TF + services + actions + navigator）
 - [x] 实现 abort 服务（cancel goal + cancel nav + stow arm）
 - [x] 集成 ApproachNavigator（MultiThreadedExecutor 共享）
 - [x] 集成 PiperGraspNode（service/action clients）
 - [x] 集成 /object_tracker_node/tracked_objects（唯一感知输入）
 
-### Phase 3: 端到端集成测试（待执行）
+### Phase 3: 端到端集成测试 ✅ 已完成
 
-- [ ] 启动完整系统（SLAM + Perception + PiperGrasp + RobotManager）
-- [ ] 验证健康检查通过
-- [ ] 验证完整 pick 流程（PLANNING → ... → COMPLETED）
-- [ ] 验证 abort 中断恢复
-- [ ] 验证连续失败自动重试和退出
-- [ ] 长时间运行稳定性测试
+- [x] 启动完整系统（SLAM + Perception + PiperGrasp + CleanerManager）
+- [x] 验证健康检查通过
+- [x] 验证完整 pick 流程（PLANNING → ... → COMPLETED）
+- [x] 验证 abort 中断恢复
+- [x] 验证连续失败自动重试和退出
+- [x] 长时间运行稳定性测试
 
 ---
 
 ## 18. 配置参数
 
 ```yaml
-robot_manager_node:
+cleaner_manager_node:
   ros__parameters:
     # --- 感知输入（唯一来源）---
     tracked_objects_topic: "/object_tracker_node/tracked_objects"
@@ -1159,6 +1159,7 @@ robot_manager_node:
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 9.1 | 2026-03-27 | 包名 robot_manager→cleaner_manager 同步更新；Nav2 控制器 TEB→MPPI；感知管线 DinoX→SAM3+FS；Phase 3 标记完成 |
 | 9.0 | 2026-03-02 | **robot_manager 包实现完毕**。更新全文"待实现"→"已实现"；新增 §8.4 进程/线程模型、§8.5 handler 表驱动、§8.6 状态转移详表；修正 PickState 枚举顺序(ERROR=8,COMPLETED=9)；TargetPool 更新为线程安全实现(threading.Lock + 指数移动平均)；STOWING 改用 go_ready 替代 go_zero；status msg 字段名与实际 .msg 对齐；Phase 2 标记完成，新增 Phase 3 集成测试 |
 | 8.0 | 2026-03-02 | 包名从 pick_mission 恢复为 robot_manager，为后续任务类型拓展留空间；ROS2 命名空间统一为 /robot_manager/*；节点/消息/配置文件同步更名；新增可拓展性设计原则说明 |
 | 7.1 | 2026-03-02 | 修正坐标系错误：导航参数(base_link)和机械臂工作区(piper_link_base)是不同坐标系，移除错误的跨坐标系数值对比；强化模块解耦原则；工作区图表标注正确坐标系 |

@@ -1086,10 +1086,9 @@ class PiperGraspNode(Node):
 
                     # Check working area for primary result (same filter as grasp queue)
                     if not self.in_working_area(offset=offset, target_base_mm=point3d_base):
-                        # --- Scan all_objects for an in-range fallback ---
-                        fallback = None
-                        for obj in sorted(percept_resp.all_objects,
-                                          key=lambda o: o.grasp_score, reverse=True):
+                        # --- Scan all_objects for nearest in-range fallback ---
+                        fallback_candidates = []
+                        for obj in percept_resp.all_objects:
                             if obj.grasp_score < min_score:
                                 continue
                             cam_mm = [obj.position.x * M_TO_MM,
@@ -1102,8 +1101,13 @@ class PiperGraspNode(Node):
                             is_bl, _ = self._check_blacklist(obj.category, t['point_in_base'])
                             if is_bl:
                                 continue
-                            fallback = (t, obj, cam_mm)
-                            break
+                            fallback_candidates.append((t, obj, cam_mm))
+                        # 选最近的 (arm_base_link x 最小 = 最近)
+                        if fallback_candidates:
+                            fallback_candidates.sort(key=lambda c: c[0]['point_in_base'][0])
+                            fallback = fallback_candidates[0]
+                        else:
+                            fallback = None
 
                         if fallback:
                             # Use fallback as primary — override variables for downstream flow
@@ -1167,17 +1171,16 @@ class PiperGraspNode(Node):
                         }
 
                     # Build batch grasp queue from all_objects (filter + transform, no lock held during compute)
-                    # Sorted by score descending — higher score wins spatial dedup
+                    # Nearest first (arm_base_link x ascending) — nearest wins spatial dedup
                     dedup_dist = grasp_cfg.get('queue_dedup_dist_mm', 30)
-                    new_queue = []
-                    for obj in sorted(percept_resp.all_objects,
-                                      key=lambda o: o.grasp_score, reverse=True):
+                    # Step 1: compute transforms, filter
+                    queue_candidates = []
+                    for obj in percept_resp.all_objects:
                         if obj.grasp_score < min_score:
                             continue
                         cam_mm = [obj.position.x * M_TO_MM,
                                   obj.position.y * M_TO_MM,
                                   obj.position.z * M_TO_MM]
-                        # 先算 transform，再用同一份 offset 做工作区检查（避免双重调用 arm.get_position）
                         t = self._compute_grasp_offset(cam_mm, end_pose)
                         if not self.in_working_area(offset=t['offset'],
                                                     target_base_mm=t['point_in_base']):
@@ -1185,7 +1188,12 @@ class PiperGraspNode(Node):
                         is_bl, _ = self._check_blacklist(obj.category, t['point_in_base'])
                         if is_bl:
                             continue
-                        # 空间去重：与已入队目标距离 < dedup_dist 则跳过（高分优先已保证）
+                        queue_candidates.append((obj, t, cam_mm))
+                    # Step 2: sort by arm_base_link x ascending (nearest first)
+                    queue_candidates.sort(key=lambda c: c[1]['point_in_base'][0])
+                    # Step 3: dedup + build queue
+                    new_queue = []
+                    for obj, t, cam_mm in queue_candidates:
                         pt = t['point_in_base']
                         too_close = False
                         for q in new_queue:
@@ -1391,9 +1399,6 @@ class PiperGraspNode(Node):
 
             # Calculate target
             target_x, target_y, target_z = target_base[0], target_base[1], target_base[2]
-
-            # TODO: 外参补偿，重新标定后删除此行
-            target_y -= 20  # mm, Y负方向补偿2cm (外参偏差)
 
             # Apply grasp depth
             category_depths = grasp_cfg.get('category_depths', {})

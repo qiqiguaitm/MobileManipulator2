@@ -44,7 +44,7 @@ class ScenePerceptionCore:
 
     # 算法参数
     DEPTH_MIN = 0.3   # m
-    DEPTH_MAX = 10.0  # m
+    DEPTH_MAX = 5.0   # m
     MASK_ERODE_KERNEL = 5
     IQR_FACTOR = 1.5
     LIDAR_DEPTH_TOLERANCE = 0.3  # m

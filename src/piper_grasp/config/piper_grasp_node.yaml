@@ -23,10 +23,10 @@ piper_ros:
     # === Hand-eye calibration (20260109) ===
     #T_cam2flan: [-0.07583874846136467, 0.05292914229358449, 0.05706895145407312]  # meters
     #q_cam2flan: [0.1558761610824957, -0.16214154506130807, 0.6975255175538586, -0.6803461575790205]  # [x,y,z,w]
-    # === Hand-eye calibration: direct from flan_to_hand_camera (2026-01-26) ===
+    # === Hand-eye calibration (2026-03-25, Horaud, 良好) ===
     # TF convention: (R_tf, t_tf) directly transforms p_flan = R @ p_cam + t
-    T_cam2flan: [-0.05564710239993588, 0.03727781226794723, 0.031246679490387654]
-    q_cam2flan: [-0.12905985339122353, 0.11551209453132931, -0.677635370030719, 0.7147103018307148]
+    T_cam2flan: [-0.0673771956998434, 0.042926743676675656, 0.03636697873160807]
+    q_cam2flan: [-0.12681096731325783, 0.12191545083577231, -0.6867423603565209, 0.705294641911124]
     # Gripper to flange offset (in meters)
     T_gripper2flan: [0.0, 0.0, 0.13503]  # meters (~135mm Z offset)
     # Z correction for grasp (empirical, in meters; 0.005m = 5mm)
@@ -65,7 +65,7 @@ piper_ros:
     # target_box 优先于 reach_envelope; 配置 target_box 后 reach_envelope 不生效
     target_box:
       xmin: 300        # 底盘相机X≈262mm + 38mm安全距离, 避免臂下探撞相机
-      xmax: 450        # 前方最远 450mm, 臂展 ~535mm; 500mm边缘lift会触发TARGET_LIMIT
+      xmax: 450        # 前方最远 450mm, 臂展边缘留100mm余量
       ymin: -250       # 左侧 250mm (机器人半宽 310mm 内)
       ymax: 250        # 右侧 250mm
       zmin: -300       # 低于地面(-250mm) 50mm 容差
@@ -86,7 +86,7 @@ piper_ros:
   grasp:
     enabled: true
     perception_service: "/perception_grasp_node/detect"
-    default_prompt: "can.vegetable.bottle.box.food.Rubik's cube"  # fallback when observe_prompt is empty
+    default_prompt: "can.vegetable.bottle.box.food.Rubik's cube.tool.bread.objects"  # fallback when observe_prompt is empty
     default_speed: 30            # %
     approach_speed: 20           # %
     min_z: -245                  # mm (min Z during grasp), -245 in real
@@ -95,6 +95,7 @@ piper_ros:
     lift_height: 200             # mm
     observe_cache_timeout: 30.0  # seconds
     ready_position_tolerance: 30 # mm
+    queue_dedup_dist_mm: 50      # mm (同一物体多次检测去重距离)
 
     # Approach pitch angle for vertical grasping
     # 0° = perfect vertical (may hit singularity)

@@ -9,7 +9,7 @@ manual_control_node:
     observe_timeout: 10.0
     pick_timeout: 60.0
     place_timeout: 30.0
-    nav_timeout: 45.0
+    nav_timeout: 30.0
     status_rate: 10.0
 
 cleaner_manager_node:
@@ -25,13 +25,13 @@ cleaner_manager_node:
     observe_timeout: 10.0      # s
     pick_timeout: 60.0         # s
     place_timeout: 30.0        # s
-    nav_timeout: 45.0          # s (成功导航一般3-6s, 留够BT recovery)
+    nav_timeout: 30.0          # s (成功导航一般3-6s, 留够BT recovery)
     max_consecutive_failures: 3
     error_cooldown: 5.0        # s
     max_error_retries: 3
     status_rate: 1.0           # Hz
     target_ttl: 0.0            # s, target expiry; 0=disabled
-    match_threshold: 0.10      # m, 2D horizontal merge threshold
+    match_threshold: 0.13      # m, 2D horizontal merge threshold
     min_observations: 4        # min frames before target enters candidate pool
     wait_for_first_target_timeout: 15.0  # s, startup wait for perception
     scan_duration: 3.0         # s, 收臂后观察窗口时长
@@ -40,16 +40,19 @@ cleaner_manager_node:
     reapproach_max_distance_mm: 1000.0  # mm, 超过此距离不 re-approach
     reapproach_depth_timeout: 3.0      # s, 深度相机数据等待超时，无数据则放弃靠近
     reapproach_xmin_mm: 350.0          # mm, base x < 此值视为太近，后退修正 (working_area xmin=300 + 50mm余量)
-    reapproach_xmax_mm: 450.0          # mm, base x > 此值视为太远，前进修正 (= working_area xmax)
+    reapproach_xmax_mm: 450.0          # mm, base x > 此值视为太远，前进修正 (< working_area xmax, 留100mm余量)
     reapproach_ymax_mm: 250.0          # mm, |base y| > 此值侧向无法修正 (= working_area ymax)
+    detect_approach_margin: 0.50       # m, 前进后目标在base_link中的x距离 (≈arm working area center)
+    default_detect_prompt: "can.vegetable.bottle.box.food.Rubik's cube.tool.bread"
     min_scan_time: 2.0         # s, minimum SCANNING dwell time
     # --- TargetFilter: 感知入池统一准入门槛 (可通过 CleanerPanel 运行时更新) ---
     grasp_z_min: -0.25          # m, map frame; 地面物体z可低至-0.20
-    grasp_z_max:  0.25          # m, 35cm above base_link = 50cm above floor
+    grasp_z_max:  0.15          # m, 35cm above base_link = 50cm above floor
     grasp_distance_min: 0.15    # m, 最近有效距离 (D435 最小深度约 0.1m)
-    grasp_distance_max: 4.8     # m, 最远感知跟踪距离
+    grasp_distance_max: 5.0     # m, 最远感知跟踪距离 (匹配 DEPTH_MAX)
     grasp_physical_min_size: 0.02  # m, min object physical size (noise filter)
     grasp_physical_max_size: 0.20  # m, max object physical size (background filter)
     # --- Costmap filter ---
     costmap_max_cost: 99           # OccupancyGrid cost threshold; 99=inscribed, 100=lethal
+    costmap_nearby_radius: 0.5     # m, 邻域搜索半径 (机械臂可达半径)
     costmap_topic: "/global_costmap/costmap"

@@ -18,6 +18,9 @@ from enum import IntEnum
 from typing import Optional
 
 from rclpy.time import Time
+
+def _point_dist_2d(a, b) -> float:
+    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
 from rclpy.duration import Duration
 from geometry_msgs.msg import Point
 from piper_msgs.srv import Observe, GoReady, GoZero
@@ -67,14 +70,16 @@ class PickConfig:
     error_cooldown: float = 5.0
     max_error_retries: int = 3
     wait_for_first_target_timeout: float = 15.0
-    scan_duration: float = 3.0             # s, SCANNING 观察时长
+    scan_duration: float = 2.0             # s, SCANNING 观察时长
     pick_clear_max_dist: float = 0.25      # m, 抓取后清除目标池的最大匹配距离
     max_reapproach: int = 2                # 单次 PICKING 最大 re-approach 次数
     reapproach_max_distance_mm: float = 1000.0  # mm, 超过此距离不 re-approach
     reapproach_depth_timeout: float = 3.0  # s, 深度相机数据等待超时
     reapproach_xmin_mm: float = 350.0     # mm, base x < 此值视为太近，后退修正
-    reapproach_xmax_mm: float = 450.0     # mm, base x > 此值视为太远，前进修正 (= working_area xmax)
+    reapproach_xmax_mm: float = 450.0     # mm, base x > 此值视为太远，前进修正 (< working_area xmax, 留100mm余量)
     reapproach_ymax_mm: float = 250.0     # mm, |base y| > 此值侧向无法修正 (= working_area ymax)
+    detect_approach_margin: float = 0.50   # m, 前进后目标在 base_link 中的 x 距离 (≈arm working area center)
+    default_detect_prompt: str = "can.vegetable.bottle.box.food.Rubik's cube.tool.bread.objects"
 
 
 @dataclass
@@ -116,8 +121,13 @@ class PickStateMachine:
             PickState.PLANNING:   self._do_planning,
             PickState.NAVIGATING: self._do_navigating,
             PickState.PICKING:    self._do_picking,
+            PickState.SCANNING:   self._do_scanning,
             PickState.ERROR:      self._do_error,
         }
+
+    def _set_perception(self, paused: bool):
+        """控制感知检测暂停/恢复"""
+        self._node._set_detection_paused(paused)
 
     @property
     def state(self) -> PickState:
@@ -139,6 +149,8 @@ class PickStateMachine:
         self._flog.info("PICK SESSION START")
         self._flog.info("=" * 60)
         self._log.info("State machine started")
+        self._pool.pause()  # 仅 SCANNING / _wait_for_first_target 时开放
+        self._set_perception(paused=True)
         self._set_state(PickState.PLANNING)
         self._ctx = PickContext()
 
@@ -164,6 +176,9 @@ class PickStateMachine:
             self._nav.cancel()
             self._safe_stow(abort_event=None)  # best-effort stow
             self._set_state(PickState.IDLE)
+
+        self._pool.resume()  # 状态机结束，恢复
+        self._set_perception(paused=False)
 
         # session summary
         stats = self._pool.stats
@@ -219,6 +234,17 @@ class PickStateMachine:
             self._log.info("No more targets — done")
             return PickState.COMPLETED
 
+        # 诊断：打印所有候选目标及距离（帮助确认选择了最近的）
+        all_viable = self._pool.get_all_active(robot_pos)
+        if len(all_viable) > 1:
+            cands = " | ".join(
+                f"{t.category}({_point_dist_2d(t.position_map, robot_pos):.2f}m)"
+                for t in all_viable[:5]
+            )
+            self._log.info(f"候选目标(按距离): {cands}")
+            if self._flog:
+                self._flog.info(f"CANDIDATES {cands}")
+
         # 可达性预检：最多检查 5 个不同目标
         for _ in range(5):
             if target is None:
@@ -258,23 +284,47 @@ class PickStateMachine:
         return PickState.NAVIGATING
 
     def _wait_for_first_target(self, abort_event) -> bool:
-        """Block until get_nav_target returns a qualified target or timeout."""
+        """Block until get_nav_target returns a qualified target or timeout.
+
+        After the first target qualifies, continues waiting for scan_duration
+        to let more targets accumulate observations — ensuring the nearest
+        target is selected, not just the first to qualify.
+
+        目标池在等待期间开放，结束后关闭。
+        """
+        self._set_perception(paused=False)
+        self._pool.resume()
         deadline = time.time() + self._cfg.wait_for_first_target_timeout
         last_diag = 0.0
-        while time.time() < deadline and not abort_event.is_set():
-            robot_pos = self._node.get_robot_pos_map()
-            if robot_pos is not None and self._pool.get_nav_target(robot_pos) is not None:
+        settle_deadline = None
+        try:
+            while time.time() < deadline and not abort_event.is_set():
+                robot_pos = self._node.get_robot_pos_map()
+                if robot_pos is not None and self._pool.get_nav_target(robot_pos) is not None:
+                    if settle_deadline is None:
+                        settle_time = self._cfg.scan_duration
+                        settle_deadline = min(time.time() + settle_time, deadline)
+                        self._log.info(
+                            f"首个目标已出现，继续观察 {settle_time:.0f}s 积累更多候选...")
+                        if self._flog:
+                            self._flog.info(f"FIRST_TARGET_FOUND settle={settle_time:.0f}s")
+                    if time.time() >= settle_deadline:
+                        return True
+                now = time.time()
+                if now - last_diag >= 3.0:
+                    diag = self._pool.get_filter_diagnostics(robot_pos)
+                    self._log.info(f"等待目标: {diag}")
+                    last_diag = now
+                time.sleep(0.3)
+            if settle_deadline is not None:
                 return True
-            now = time.time()
-            if now - last_diag >= 3.0:
-                diag = self._pool.get_filter_diagnostics(robot_pos)
-                self._log.info(f"等待目标: {diag}")
-                last_diag = now
-            time.sleep(0.3)
-        diag = self._pool.get_filter_diagnostics(
-            self._node.get_robot_pos_map())
-        self._log.warn(f"等待目标超时! {diag}")
-        return False
+            diag = self._pool.get_filter_diagnostics(
+                self._node.get_robot_pos_map())
+            self._log.warn(f"等待目标超时! {diag}")
+            return False
+        finally:
+            self._pool.pause()
+            self._set_perception(paused=True)
 
     def _do_navigating(self, abort_event) -> PickState:
         target = self._ctx.current_target
@@ -285,34 +335,43 @@ class PickStateMachine:
         nav_point.z = 0.0  # 2D navigation
 
         t0 = time.time()
-        result = self._nav.approach_to_target(nav_point)
+        # Nav2 only, skip depth-based stages 2,3
+        result = self._nav.approach_to_target(nav_point, skip_stages={2, 3})
         nav_ms = (time.time() - t0) * 1000.0
         self._ctx.last_nav_time_ms = nav_ms
 
         if abort_event.is_set():
             return PickState.IDLE
 
-        if result.success:
-            self._ctx.consecutive_nav_failures = 0
-            self._ctx.consecutive_pick_failures = 0
+        if not result.success:
+            self._log.warn(f"Nav failed: {result.error_message}")
             if self._flog:
-                self._flog.info(
-                    f"NAV OK {target.category} "
-                    f"dist={result.final_distance:.3f}m {nav_ms:.0f}ms")
-            return PickState.PICKING
+                self._flog.warning(
+                    f"NAV FAIL {target.category}: {result.error_message} {nav_ms:.0f}ms")
+            self._ctx.consecutive_nav_failures += 1
 
-        self._log.warn(f"Nav failed: {result.error_message}")
+            if self._ctx.consecutive_nav_failures >= self._cfg.max_consecutive_failures:
+                self._ctx.error_message = f"Nav failed {self._ctx.consecutive_nav_failures} times"
+                return PickState.ERROR
+
+            self._pool.mark_failed(target.position_map, f"nav: {result.error_message}")
+            return PickState.PLANNING
+
+        self._ctx.consecutive_nav_failures = 0
+        self._ctx.consecutive_pick_failures = 0
+
+        # Detection-based approach (替代 depth 聚类的 stages 2+3)
+        prompt = self._cfg.observe_prompt or self._cfg.default_detect_prompt
+        approach_ok = self._detect_align_and_approach(prompt, abort_event)
+        if not approach_ok:
+            self._log.warn("Detection approach 失败，Nav2 已到位，尝试直接抓取")
+
         if self._flog:
-            self._flog.warning(
-                f"NAV FAIL {target.category}: {result.error_message} {nav_ms:.0f}ms")
-        self._ctx.consecutive_nav_failures += 1
+            self._flog.info(
+                f"NAV OK {target.category} "
+                f"detect_approach={'OK' if approach_ok else 'FAIL'} {nav_ms:.0f}ms")
 
-        if self._ctx.consecutive_nav_failures >= self._cfg.max_consecutive_failures:
-            self._ctx.error_message = f"Nav failed {self._ctx.consecutive_nav_failures} times"
-            return PickState.ERROR
-
-        self._pool.mark_failed(target.position_map, f"nav: {result.error_message}")
-        return PickState.PLANNING
+        return PickState.PICKING
 
     def _do_picking(self, abort_event) -> PickState:
         """完整抓取流程：展臂 → (observe → pick → place)* → 收臂"""
@@ -321,7 +380,7 @@ class PickStateMachine:
         # --- 1. 展臂 ---
         self._nav._stop_robot()
         self._log.info("展臂...")
-        time.sleep(0.5)
+        time.sleep(0.2)
         if abort_event.is_set():
             return PickState.IDLE
 
@@ -379,17 +438,7 @@ class PickStateMachine:
                     self._log.info(
                         f"Observe {obs_cat} → map({observed_map_pos.x:.2f},{observed_map_pos.y:.2f})")
 
-                # Observe 成功后立即评估 re-approach（太近/太远 → pick 大概率失败）
-                if obs_pos_mm and reapproach_count < self._cfg.max_reapproach:
-                    reapproach_ok = self._try_reapproach(
-                        obs_pos_mm, obs_cat, reapproach_count, abort_event)
-                    if abort_event.is_set():
-                        break
-                    if reapproach_ok:
-                        reapproach_count += 1
-                        continue  # re-observe from new position
-
-                # 位置 OK，进入 pick → 重置 re-approach 计数
+                # 位置 OK（working_area 已统一为 450mm），进入 pick → 重置计数
                 reapproach_count = 0
             else:
                 self._log.info(f"Batch pick [{picks_done + 1}]: 队列剩余 {local_queue_remaining}")
@@ -476,6 +525,21 @@ class PickStateMachine:
         if self._ctx.consecutive_pick_failures >= self._cfg.max_consecutive_failures:
             self._ctx.error_message = "Pick failed consecutively"
             return PickState.ERROR
+        return PickState.SCANNING
+
+    def _do_scanning(self, abort_event) -> PickState:
+        """收臂后静止观察，感知+目标池仅此时开放。"""
+        duration = self._cfg.scan_duration
+        self._log.info(f"静止观察 {duration:.0f}s (感知+目标池开放)...")
+        if self._flog:
+            self._flog.info(f"SCANNING {duration:.0f}s")
+        self._set_perception(paused=False)
+        self._pool.resume()
+        deadline = time.time() + duration
+        while time.time() < deadline and not abort_event.is_set():
+            time.sleep(0.2)
+        self._pool.pause()
+        self._set_perception(paused=True)
         return PickState.PLANNING
 
     def _do_error(self, abort_event) -> PickState:
@@ -534,7 +598,11 @@ class PickStateMachine:
 
     def _try_reapproach(self, obs_pos_mm, obs_cat, reapproach_count,
                         abort_event) -> bool:
-        """尝试 re-approach: 太近→后退，太远→前进。返回 True 表示可重新 observe。"""
+        """尝试 re-approach: 基于手部相机观测位置直接旋转+前进。
+
+        obs_pos_mm 是 arm_base_link 坐标 (来自 piper_grasp_node point_in_base)。
+        arm_base_link 原点在 base_link 前方 118mm，需要转换后计算。
+        """
         cfg = self._cfg
         if cfg.max_reapproach <= 0:
             return False
@@ -542,109 +610,148 @@ class PickStateMachine:
             self._log.warn(f"Re-approach 已达上限 ({cfg.max_reapproach})")
             return False
 
-        bx, by = obs_pos_mm[0], obs_pos_mm[1]
-
-        # Y 轴偏移检查: 前后移动无法修正横向偏差
-        if abs(by) > cfg.reapproach_ymax_mm:
-            self._log.warn(
-                f"Re-approach: |Y|={abs(by):.0f}mm > {cfg.reapproach_ymax_mm:.0f}mm，侧向偏移无法修正")
-            return False
-
-        # X 轴方向判定 (与 working_area target_box 对齐)
-        too_close = bx < cfg.reapproach_xmin_mm
-        too_far = bx > cfg.reapproach_xmax_mm
-
-        if not too_close and not too_far:
-            # X/Y 都在工作区范围内但 observe 仍返回 TOO_FAR — 前后移动无法修正
-            self._log.warn(
-                f"Re-approach: base=[{bx:.0f},{by:.0f}]mm 在工作区 X/Y 范围内，"
-                f"前后移动无法修正")
-            return False
-
-        # XY 平面距离上限
+        # obs_pos_mm 是 arm_base_link 坐标，转 base_link
+        ARM_BASE_OFFSET_X = 118.0  # mm, arm_base_link 在 base_link 前方
+        ax, ay = obs_pos_mm[0], obs_pos_mm[1]
+        bx = ax + ARM_BASE_OFFSET_X   # base_link x
+        by = ay                        # y 相同
         dist_mm = math.sqrt(bx**2 + by**2)
-        if dist_mm > cfg.reapproach_max_distance_mm:
-            self._log.warn(
-                f"Re-approach: 距离 {dist_mm:.0f}mm > 上限 {cfg.reapproach_max_distance_mm:.0f}mm，放弃")
-            return False
 
-        mode = '太近，后退' if too_close else '太远，前进'
         self._log.info(
             f"Re-approach [{reapproach_count + 1}/{cfg.max_reapproach}]: "
-            f"{obs_cat} @ base x={bx:.0f}mm y={by:.0f}mm dist={dist_mm:.0f}mm ({mode})")
+            f"{obs_cat} @ arm=({ax:.0f},{ay:.0f}) base=({bx:.0f},{by:.0f}) dist={dist_mm:.0f}mm")
         if self._flog:
             self._flog.info(
                 f"REAPPROACH [{reapproach_count+1}] {obs_cat} "
-                f"x={bx:.0f} y={by:.0f} dist={dist_mm:.0f} "
-                f"mode={'BACKUP' if too_close else 'FORWARD'}")
+                f"arm=({ax:.0f},{ay:.0f}) base=({bx:.0f},{by:.0f}) dist={dist_mm:.0f}")
 
         # 1. 收臂
         self._log.info("Re-approach: 收臂...")
         if not self._safe_stow(abort_event) or abort_event.is_set():
             return False
 
-        if too_close:
-            # --- 太近: 开环后退 ---
-            backup_m = (cfg.reapproach_xmin_mm - obs_pos_mm[0] + 30.0) / 1000.0
-            backup_m = max(0.03, min(0.15, backup_m))
-            self._log.info(f"Re-approach: 后退 {backup_m*100:.0f}cm")
-            ok = self._nav.back_up(backup_m)
+        # 2. 朝向修正: 用 base_link 坐标算偏角 (旋转中心是 base_link)
+        angle = math.atan2(by, bx)
+        if abs(angle) > 0.05:  # >~3° 才修正
+            self._log.info(
+                f"Re-approach: 朝向修正 {math.degrees(angle):.1f}°")
+            ok, msg = self._nav.rotate_by_angle(angle)
             if not ok:
-                self._log.warn("Re-approach: 后退失败，放弃")
-                self._call_go_ready(cfg.pick_speed, open_gripper=True,
-                                    abort_event=abort_event)
-                return False
-            time.sleep(0.3)  # 停稳
+                self._log.warn(f"Re-approach: 旋转失败 — {msg}")
+            time.sleep(0.15)
+
+        # 3. 前进: 旋转后物体近似在正前方, x ≈ dist
+        #    detect_approach_margin (default 0.50m) 是 base_link 目标距离
+        dist_m = dist_mm / 1000.0
+        travel = dist_m - cfg.detect_approach_margin
+        if travel > 0.03:  # > 3cm 才前进
+            self._log.info(
+                f"Re-approach: 前进 {travel*100:.0f}cm "
+                f"(base距离={dist_m*100:.0f}cm, margin={cfg.detect_approach_margin*100:.0f}cm)")
+            self._nav.move_forward(travel, speed=0.08)
+            time.sleep(0.15)
         else:
-            # --- 太远: 深度相机前进 (原有逻辑) ---
-            map_pos = self._base_to_map(obs_pos_mm)
-            if map_pos is None:
-                self._log.warn("Re-approach: base→map 变换失败，放弃")
-                # 仍尝试展臂
-                if not self._call_go_ready(cfg.pick_speed, open_gripper=True,
-                                           abort_event=abort_event) or abort_event.is_set():
-                    return False
-                return True
+            self._log.info(f"Re-approach: 已足够近 (dist={dist_m*100:.0f}cm)")
 
-            # 前置检查: 底部深度相机有数据才执行 Phase 3
-            ds = self._nav.depth_sensor
-            ds.activate()
-            depth_ok = False
-            wait_start = time.time()
-            while time.time() - wait_start < cfg.reapproach_depth_timeout:
-                if abort_event.is_set():
-                    ds.deactivate()
-                    return False
-                if ds.has_data:
-                    depth_ok = True
-                    break
-                time.sleep(0.1)
-            ds.deactivate()
-
-            if not depth_ok:
-                self._log.warn("Re-approach: 底部深度相机无数据，放弃靠近")
-                if not self._call_go_ready(cfg.pick_speed, open_gripper=True,
-                                           abort_event=abort_event) or abort_event.is_set():
-                    return False
-                return True
-
-            # Phase 2 旋转对准 + Phase 3 精确前进
-            self._log.info("Re-approach: 对准+精确接近...")
-            nav_point = Point()
-            nav_point.x = map_pos.x
-            nav_point.y = map_pos.y
-            nav_point.z = 0.0
-            result = self._nav.approach_to_target(nav_point)
-            if abort_event.is_set():
-                return False
-            if not result.success:
-                self._log.warn(f"Re-approach: 导航失败 — {result.error_message}")
-
-        # 展臂 → 回到循环重新 observe
+        # 4. 展臂 → 回到循环重新 observe
         self._log.info("Re-approach: 展臂，准备重新 observe...")
         if not self._call_go_ready(cfg.pick_speed, open_gripper=True,
                                    abort_event=abort_event) or abort_event.is_set():
             return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Detection-based approach (底盘相机)
+    # ------------------------------------------------------------------
+
+    def _detect_chassis_target(self, prompt: str, abort_event,
+                               max_retries: int = 3) -> Optional[tuple]:
+        """调用底盘相机检测，返回 (distance, angle, category) 或 None。
+
+        直接使用 position_optical (相机光学系) 和 distance (base_link 距离)，
+        不依赖 map 坐标系或 TF 查询。
+
+        optical 坐标系: x=右, y=下, z=前(深度)
+        angle: 正=物体偏左=左转, 负=物体偏右=右转
+        """
+        from perception.srv import DetectObjects
+
+        for attempt in range(max_retries):
+            if abort_event and abort_event.is_set():
+                return None
+
+            req = DetectObjects.Request()
+            req.prompt = prompt
+            req.camera_id = "chassis"
+            req.enable_lidar = False
+
+            future = self._node.detect_client.call_async(req)
+            resp = self._wait_future(future, 5.0, abort_event)
+
+            if resp is not None and resp.success and resp.result.objects:
+                # 选深度最近的前方目标 (optical.z > 0.1m)
+                best = None
+                for obj in resp.result.objects:
+                    oz = obj.position_optical.z  # 前方深度
+                    if oz <= 0.1:
+                        continue
+                    if best is None or oz < best.position_optical.z:
+                        best = obj
+
+                if best is not None:
+                    oz = best.position_optical.z
+                    ox = best.position_optical.x
+                    # optical x=右 → atan2(-ox, oz): 物体偏右→负角→右转, 偏左→正角→左转
+                    angle = math.atan2(-ox, oz)
+                    dist = best.distance  # base_link 下的距离 (m)
+                    self._log.info(
+                        f"Detection: {best.category} "
+                        f"dist={dist:.3f}m angle={math.degrees(angle):.1f}° "
+                        f"optical=({ox:.3f},{oz:.3f}) score={best.score:.2f}")
+                    return dist, angle, best.category
+
+            if attempt < max_retries - 1:
+                self._log.info(
+                    f"Detection: 第{attempt+1}次未获得结果，重试...")
+                time.sleep(0.5)
+
+        return None
+
+    def _detect_align_and_approach(self, prompt: str, abort_event) -> bool:
+        """检测 → 旋转对准 → 再检测 → 前进"""
+        cfg = self._cfg
+
+        # 1. 检测目标
+        result = self._detect_chassis_target(prompt, abort_event)
+        if result is None:
+            self._log.warn("Detection approach: 未检测到目标")
+            return False
+        dist, angle, cat = result
+
+        # 2. 旋转对准（偏角 > 3° 才修正）
+        if abs(angle) > 0.05:
+            self._log.info(f"Detection approach: 旋转 {math.degrees(angle):.1f}°")
+            ok, msg = self._nav.rotate_by_angle(angle)
+            if not ok:
+                self._log.warn(f"Detection approach: 旋转失败 — {msg}")
+            time.sleep(0.15)
+
+        # 3. 再次检测获取旋转后的距离（旋转后角度/深度都变了）
+        result2 = self._detect_chassis_target(prompt, abort_event)
+        if result2 is not None:
+            dist, angle, cat = result2
+
+        # 4. 计算前进距离
+        travel = dist - cfg.detect_approach_margin
+        if travel > 0.03:  # > 3cm 才前进
+            self._log.info(
+                f"Detection approach: 前进 {travel*100:.0f}cm "
+                f"(目标距离={dist*100:.0f}cm, margin={cfg.detect_approach_margin*100:.0f}cm)")
+            self._nav.move_forward(travel, speed=0.08)
+            time.sleep(0.15)
+        else:
+            self._log.info(f"Detection approach: 已足够近 (dist={dist*100:.0f}cm)")
 
         return True
 

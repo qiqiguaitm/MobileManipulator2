@@ -1361,7 +1361,8 @@ class CombinedPerceptionClient:
         return rgb_buf.tobytes(), ir_l_buf.tobytes(), ir_r_buf.tobytes(), intr_bytes
 
     def forward(self, rgb, ir_left, ir_right, intrinsics,
-                text_prompt='object', _timing=None, _encoded=None):
+                text_prompt='object', _timing=None, _encoded=None,
+                timeout=None):
         """Send perceive request.
 
         Args:
@@ -1403,7 +1404,8 @@ class CombinedPerceptionClient:
 
         try:
             resp = self.session.post(self.api_url, files=files, data=data,
-                                     headers=headers, timeout=self._timeout)
+                                     headers=headers,
+                                     timeout=timeout or self._timeout)
             t_http = time.time()
             resp.raise_for_status()
 

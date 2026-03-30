@@ -13,6 +13,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.time import Time
 
 import tf2_ros
@@ -25,6 +26,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 import time as _time
 
 from perception.msg import Object3DArray, PerceptionConfig
+from perception.srv import DetectObjects
 from piper_msgs.srv import Observe, GoReady, GetStatus, GoZero
 from piper_msgs.action import PiperPick, PiperPlace
 from cleaner_manager.msg import CleanerManagerStatus, TargetEntry
@@ -84,9 +86,14 @@ class CleanerManagerNode(Node):
         self.declare_parameter('grasp_physical_min_size', 0.02)
         self.declare_parameter('grasp_physical_max_size', 0.25)
         self.declare_parameter('costmap_max_cost', 99)     # OccupancyGrid: 99=inscribed, 100=lethal
+        self.declare_parameter('costmap_nearby_radius', 0.5)  # m, 邻域搜索半径 (机械臂可达)
         self.declare_parameter('costmap_topic', '/global_costmap/costmap')
+        self.declare_parameter('detect_approach_margin', 0.50)
+        self.declare_parameter('default_detect_prompt',
+            "can.vegetable.bottle.box.food.Rubik's cube.tool.bread.objects")
 
         # --- TargetFilter (距离/高度/尺寸/costmap 统一准入门槛) ---
+        nearby_r = self.get_parameter('costmap_nearby_radius').value
         self._filter = TargetFilter(
             z_min    = self.get_parameter('grasp_z_min').value,
             z_max    = self.get_parameter('grasp_z_max').value,
@@ -95,16 +102,20 @@ class CleanerManagerNode(Node):
             size_min = self.get_parameter('grasp_physical_min_size').value,
             size_max = self.get_parameter('grasp_physical_max_size').value,
             costmap_max_cost = self.get_parameter('costmap_max_cost').value,
+            nearby_radius = nearby_r,
+            tf_buffer = self.tf_buffer,
             logger   = self._log,
         )
 
-        # --- TargetPool (距离过滤已由 TargetFilter 统一处理) ---
+        # --- TargetPool (z范围与TargetFilter同步，防止EMA漂移产生幽灵目标) ---
         self._pool = TargetPool(
             logger=self._log,
             max_attempts=self.get_parameter('max_attempts').value,
             target_ttl=self.get_parameter('target_ttl').value,
             match_threshold=self.get_parameter('match_threshold').value,
             min_observations=self.get_parameter('min_observations').value,
+            z_min=self.get_parameter('grasp_z_min').value,
+            z_max=self.get_parameter('grasp_z_max').value,
         )
 
         # --- Localization status gate ---
@@ -116,13 +127,20 @@ class CleanerManagerNode(Node):
         )
 
         # --- Costmap subscription (for target filter) ---
+        # Nav2 global_costmap publishes with TRANSIENT_LOCAL; match it to
+        # receive the latched initial grid even if we start after costmap.
         costmap_topic = self.get_parameter('costmap_topic').value
+        costmap_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
         self.create_subscription(
             OccupancyGrid, costmap_topic,
-            lambda msg: self._filter.set_costmap(msg), 1,
+            lambda msg: self._filter.set_costmap(msg), costmap_qos,
             callback_group=self._cb_group,
         )
-        self._log.info(f"Costmap filter: topic={costmap_topic}, max_cost={self.get_parameter('costmap_max_cost').value}")
+        self._log.info(f"Costmap filter: topic={costmap_topic}, max_cost={self.get_parameter('costmap_max_cost').value}, nearby_radius={nearby_r}m")
 
         # --- 订阅跟踪结果（唯一的感知输入） ---
         topic = self.get_parameter('tracked_objects_topic').value
@@ -153,6 +171,9 @@ class CleanerManagerNode(Node):
             GetStatus, '/piper/get_status', callback_group=self._cb_group)
         self.go_zero_client = self.create_client(
             GoZero, '/go_zero_srv', callback_group=self._cb_group)
+        self.detect_client = self.create_client(
+            DetectObjects, '/multi_camera_perception/detect',
+            callback_group=self._cb_group)
 
         # --- Action clients (Piper) ---
         self.pick_client = ActionClient(
@@ -248,6 +269,8 @@ class CleanerManagerNode(Node):
             reapproach_xmin_mm=self.get_parameter('reapproach_xmin_mm').value,
             reapproach_xmax_mm=self.get_parameter('reapproach_xmax_mm').value,
             reapproach_ymax_mm=self.get_parameter('reapproach_ymax_mm').value,
+            detect_approach_margin=self.get_parameter('detect_approach_margin').value,
+            default_detect_prompt=self.get_parameter('default_detect_prompt').value,
         )
 
     def _start_cb(self, request, response):

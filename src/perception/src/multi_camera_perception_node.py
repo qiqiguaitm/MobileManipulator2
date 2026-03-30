@@ -920,7 +920,7 @@ class MultiCameraPerceptionNode(Node):
             })
         return detections
 
-    def _run_combined_detection(self, task, core, client):
+    def _run_combined_detection(self, task, core, client, timeout=None):
         """Combined 模式: SAM3+FS 单次 HTTP 调用"""
         camera_name = task.camera_name
         rgb = task.rgb
@@ -941,10 +941,10 @@ class MultiCameraPerceptionNode(Node):
             text_prompt=task.prompt,
             _timing=_timing,
             _encoded=task.encoded_data,
+            timeout=timeout,
         )
 
         if not resp.get('success'):
-            self.get_logger().warn(f'[{camera_name}] combined failed: {resp.get("error")}')
             return None  # None → worker skips _last_results update, fusion keeps previous valid data
 
         _t_http = time.time()
@@ -1369,10 +1369,11 @@ class MultiCameraPerceptionNode(Node):
             else:
                 cameras = list(self.cameras.keys())
 
-            # 执行检测
+            # 执行检测 — 服务调用用宽松 timeout (Timer 路径用 0.35s 保 5Hz)
             results = self._run_multi_camera_detection(
                 prompt=request.prompt,
-                cameras=cameras
+                cameras=cameras,
+                timeout=(2.0, 2.0),
             )
 
             if results:
@@ -1414,10 +1415,11 @@ class MultiCameraPerceptionNode(Node):
 
         return response
 
-    def _run_multi_camera_detection(self, prompt: str, cameras: List[str]) -> Dict[str, Object3DArray]:
+    def _run_multi_camera_detection(self, prompt: str, cameras: List[str],
+                                        timeout=None) -> Dict[str, Object3DArray]:
         """
         并行执行多相机检测
-        
+
         Returns:
             Dict[str, Object3DArray]: 每个相机的检测结果
         """
@@ -1426,7 +1428,7 @@ class MultiCameraPerceptionNode(Node):
         def detect_single_camera(camera_name: str) -> Tuple[str, Optional[Object3DArray]]:
             """单相机检测函数"""
             try:
-                result = self._run_single_camera_detection(camera_name, prompt)
+                result = self._run_single_camera_detection(camera_name, prompt, timeout=timeout)
                 return camera_name, result
             except Exception as e:
                 self.get_logger().warn(f'{camera_name} 相机检测失败: {e}')
@@ -1443,7 +1445,8 @@ class MultiCameraPerceptionNode(Node):
 
         return results
 
-    def _run_single_camera_detection(self, camera_name: str, prompt: str) -> Optional[Object3DArray]:
+    def _run_single_camera_detection(self, camera_name: str, prompt: str,
+                                         timeout=None) -> Optional[Object3DArray]:
         """执行单个相机的检测流程"""
         sensor = self.cameras.get(camera_name)
         transformer = self.transformers.get(camera_name)
@@ -1485,7 +1488,7 @@ class MultiCameraPerceptionNode(Node):
                 ir_right=data.get('ir_right'),
                 ir_intrinsics=sensor.ir_intrinsics,
             )
-            return self._run_combined_detection(task, core, combined_client)
+            return self._run_combined_detection(task, core, combined_client, timeout=timeout)
 
         result = Object3DArray()
         result.header.stamp = self.get_clock().now().to_msg()

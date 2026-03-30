@@ -173,6 +173,261 @@ class ApproachNavigator(Node):
         self._stop_robot()
         return False
 
+    def move_forward(self, distance_m: float, speed: float = 0.08, timeout: float = 10.0) -> bool:
+        """开环前进指定距离，用 odom 测量实际位移。
+
+        Args:
+            distance_m: 前进距离 (m)，正值
+            speed: 前进速度 (m/s)，正值
+            timeout: 超时 (s)
+
+        Returns:
+            bool: 到达目标距离返回 True
+        """
+        with self._odom_lock:
+            start_x = self._odom_x
+            start_y = self._odom_y
+        if start_x is None:
+            self.get_logger().error("move_forward: 里程计不可用")
+            return False
+
+        self.get_logger().info(f"move_forward: 前进 {distance_m:.3f}m @ {speed:.3f}m/s")
+        start_time = time.time()
+        cmd = Twist()
+        cmd.linear.x = abs(speed)
+
+        while rclpy.ok() and not self._cancel_requested:
+            if time.time() - start_time > timeout:
+                self._stop_robot()
+                self.get_logger().warn("move_forward: 超时")
+                return False
+
+            traveled = self._get_odom_traveled(start_x, start_y)
+            if traveled >= distance_m:
+                self._stop_robot()
+                self.get_logger().info(f"move_forward: 完成，实际前进 {traveled:.3f}m")
+                return True
+
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+
+        self._stop_robot()
+        return False
+
+    # =========================================================================
+    # Re-approach: 闭环深度驱动
+    # =========================================================================
+
+    def rotate_by_angle(self, angle_rad: float, timeout: float = 8.0) -> tuple:
+        """原地旋转指定角度 (P控制, 基于TF反馈)
+
+        Args:
+            angle_rad: 旋转角度 (rad), 正=逆时针(左转), 负=顺时针(右转)
+            timeout: 超时 (s)
+
+        Returns:
+            (bool, str): (成功, 错误消息)
+        """
+        if abs(angle_rad) < 0.02:  # ~1° 无需旋转
+            return True, ""
+
+        robot_pos, start_yaw = self._get_robot_pose()
+        if start_yaw is None:
+            return False, "TF不可用"
+
+        target_yaw = start_yaw + angle_rad
+        cfg = self.config
+        start_time = time.time()
+
+        self.get_logger().info(
+            f"[rotate] 旋转 {math.degrees(angle_rad):.1f}°, "
+            f"当前={math.degrees(start_yaw):.1f}° → 目标={math.degrees(target_yaw):.1f}°")
+
+        while rclpy.ok() and not self._cancel_requested:
+            if time.time() - start_time > timeout:
+                self._stop_robot()
+                return False, "旋转超时"
+
+            _, current_yaw = self._get_robot_pose()
+            if current_yaw is None:
+                time.sleep(0.05)
+                continue
+
+            error = normalize_angle(target_yaw - current_yaw)
+
+            if abs(error) < cfg.align_tolerance:
+                self._stop_robot()
+                self.get_logger().info(
+                    f"[rotate] 完成, 误差={math.degrees(error):.1f}°, "
+                    f"耗时={time.time()-start_time:.1f}s")
+                return True, ""
+
+            omega = max(-cfg.align_max_omega,
+                        min(cfg.align_max_omega, cfg.align_kp * error))
+            if 0 < abs(omega) < cfg.align_min_omega:
+                omega = math.copysign(cfg.align_min_omega, omega)
+
+            cmd = Twist()
+            cmd.angular.z = omega
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+
+        self._stop_robot()
+        return False, "被中断"
+
+    def depth_reapproach(self, max_travel: float = 0.30,
+                        timeout: float = 10.0) -> tuple:
+        """闭环深度驱动 re-approach: 精对齐 + 闭环前进
+
+        1. 深度聚类精对齐 (对准目标)
+        2. 闭环前进直到 final_approach_distance 或行驶达 max_travel
+
+        Args:
+            max_travel: 最大前进距离 (m)，由调用方根据 observe base_x 计算
+            timeout: 超时 (s)
+
+        Returns:
+            (bool, str, float): (成功, 错误消息, 最终距离)
+        """
+        self.depth_sensor.activate()
+        try:
+            # 精对齐
+            align_ok, align_msg = self._do_alignment_by_depth()
+            if not align_ok:
+                return False, f"精对齐失败: {align_msg}", 0.0
+            time.sleep(0.15)  # 停稳
+
+            # 闭环前进
+            return self._depth_reapproach_impl(max_travel, timeout)
+        finally:
+            self.depth_sensor.deactivate()
+
+    def _depth_reapproach_impl(self, max_travel: float,
+                               timeout: float) -> tuple:
+        cfg = self.config
+        loop_dt = 1.0 / cfg.control_rate
+        start_time = time.time()
+        noise_tol = 0.05  # 5cm 噪声容差
+
+        # 速度平滑
+        current_speed = 0.0
+        max_accel = 0.15   # m/s²
+        max_decel = 0.3    # m/s²
+
+        target_distance = None  # 接受的最近距离
+
+        # odom 行驶距离跟踪
+        with self._odom_lock:
+            odom_start_x = self._odom_x
+            odom_start_y = self._odom_y
+        use_odom = odom_start_x is not None
+
+        # 预热: 等深度传感器收敛
+        warmup_start = time.time()
+        warmup_count = 0
+        while warmup_count < cfg.depth_warmup_frames and time.time() - warmup_start < 3.0:
+            if self._cancel_requested:
+                return False, "被中断", 0.0
+            if self.depth_sensor.get_all_cluster_centroids():
+                warmup_count += 1
+            time.sleep(0.1)
+
+        self.get_logger().info(
+            f"[reapproach] 开始闭环前进，max_travel={max_travel:.3f}m "
+            f"目标距离={cfg.final_approach_distance}m")
+
+        while rclpy.ok() and not self._cancel_requested:
+            if time.time() - start_time > timeout:
+                self._stop_robot()
+                return False, "re-approach 超时", target_distance or 0.0
+
+            # odom 行驶距离
+            traveled = 0.0
+            if use_odom:
+                traveled = self._get_odom_traveled(odom_start_x, odom_start_y)
+                if traveled >= max_travel:
+                    self._stop_robot()
+                    self.get_logger().info(
+                        f"[reapproach] 到达最大行驶距离! "
+                        f"traveled={traveled:.3f}m >= max={max_travel:.3f}m")
+                    return True, "", target_distance or 0.0
+
+            # 安全急停: 任意最近障碍物
+            nearest_any = self.depth_sensor.get_nearest_obstacle()
+            if nearest_any and nearest_any[2] <= cfg.emergency_stop_distance:
+                self._stop_robot()
+                self.get_logger().warn(
+                    f"[reapproach] 紧急刹车! {nearest_any[2]:.3f}m")
+                return True, "", nearest_any[2]
+
+            # 取最近聚类
+            clusters = self.depth_sensor.get_all_cluster_centroids()
+            if clusters:
+                nearest = min(clusters, key=lambda c: c[2])
+                new_z = nearest[2]
+
+                if target_distance is None:
+                    target_distance = new_z
+                    self.get_logger().info(
+                        f"[reapproach] 初始距离: {target_distance:.3f}m")
+                elif new_z < target_distance:
+                    target_distance = new_z
+                elif new_z <= target_distance + noise_tol:
+                    target_distance = new_z  # 噪声容差内，接受并更新
+                else:
+                    self.get_logger().info(
+                        f"[reapproach] 拒绝跳变: {new_z:.3f}m "
+                        f"(当前={target_distance:.3f}m)",
+                        throttle_duration_sec=1.0)
+
+            if target_distance is None:
+                self.get_logger().info(
+                    "[reapproach] 等待深度数据...",
+                    throttle_duration_sec=1.0)
+                time.sleep(loop_dt)
+                continue
+
+            # 停止条件: 深度到位
+            if target_distance <= cfg.final_approach_distance:
+                self._stop_robot()
+                self.get_logger().info(
+                    f"[reapproach] 到达! 距离={target_distance:.3f}m "
+                    f"traveled={traveled:.3f}m")
+                return True, "", target_distance
+
+            # 速度控制: 取深度剩余和里程剩余的较小值
+            depth_remaining = target_distance - cfg.final_approach_distance
+            odom_remaining = max_travel - traveled if use_odom else float('inf')
+            remaining = min(depth_remaining, odom_remaining)
+
+            max_speed = cfg.final_approach_speed
+            if remaining > 0.3:
+                target_speed = max_speed
+            else:
+                ratio = remaining / 0.3
+                target_speed = 0.02 + (max_speed - 0.02) * math.sqrt(ratio)
+
+            speed_diff = target_speed - current_speed
+            if speed_diff > 0:
+                current_speed += min(speed_diff, max_accel * loop_dt)
+            else:
+                current_speed += max(speed_diff, -max_decel * loop_dt)
+            current_speed = max(0.0, min(max_speed, current_speed))
+
+            cmd = Twist()
+            cmd.linear.x = current_speed
+            self.cmd_vel_pub.publish(cmd)
+
+            self.get_logger().info(
+                f"[reapproach] dist={target_distance:.3f}m "
+                f"v={current_speed:.3f}m/s traveled={traveled:.3f}m/{max_travel:.3f}m",
+                throttle_duration_sec=0.5)
+
+            time.sleep(loop_dt)
+
+        self._stop_robot()
+        return False, "被中断", 0.0
+
     # =========================================================================
     # 主接口
     # =========================================================================
@@ -198,7 +453,8 @@ class ApproachNavigator(Node):
         self,
         target_position: Point,
         status_callback: Callable[[NavStage, str], None] = None,
-        skip_stages: set = None
+        skip_stages: set = None,
+        depth_only_align: bool = False
     ) -> ApproachResult:
         """直接接近目标位置 (简化接口)
 
@@ -209,6 +465,7 @@ class ApproachNavigator(Node):
             target_position: 目标物体在 map 坐标系中的位置
             status_callback: 阶段状态回调
             skip_stages: 要跳过的阶段集合，如 {1}, {1,2}, {2,3} 等
+            depth_only_align: True 跳过 map 粗对齐，直接深度精对齐 (re-approach)
 
         Returns:
             ApproachResult: 导航结果
@@ -258,17 +515,24 @@ class ApproachNavigator(Node):
             # 执行阶段2: 对齐 (除非跳过)
             if 2 not in skip_stages:
                 _notify(NavStage.ALIGNING, "对准目标方向...")
-                success, msg = self._do_alignment()
+                success, msg = self._do_alignment(depth_only=depth_only_align)
                 if not success:
                     self.depth_sensor.deactivate()
                     return ApproachResult(False, "ALIGN_FAILED", msg, stage=2)
-                time.sleep(1.0)
+                time.sleep(0.2)
             else:
                 self.get_logger().info("跳过阶段2")
 
-            # 执行阶段3: 精确接近 (除非跳过)
+            # 执行阶段3: 精确接近 (除非跳过或已足够近)
             # _notify 同步调用 status_callback，callback 中的 input() 会阻塞直到用户确认
-            if 3 not in skip_stages:
+            skip_approach = (self._locked_target_cz is not None
+                             and self._locked_target_cz <= 0.25)
+            if skip_approach:
+                self.get_logger().info(
+                    f"目标距相机仅 {self._locked_target_cz:.3f}m，已足够近，跳过精确接近")
+                self.depth_sensor.deactivate()
+                final_dist = self._locked_target_cz
+            elif 3 not in skip_stages:
                 _notify(NavStage.FINAL_APPROACH, "精确接近中...")
                 success, msg, final_dist = self._do_final_approach()
                 if not success:
@@ -281,14 +545,17 @@ class ApproachNavigator(Node):
             return ApproachResult(True, final_distance=final_dist)
 
         # 执行完整三阶段导航
-        return self.approach_to_pose(approach_pose, target_position, status_callback, skip_stages)
+        return self.approach_to_pose(
+            approach_pose, target_position, status_callback, skip_stages,
+            depth_only_align=depth_only_align)
 
     def approach_to_pose(
         self,
         approach_pose: PoseStamped,
         target_position: Optional[Point] = None,
         status_callback: Callable[[NavStage, str], None] = None,
-        skip_stages: set = None
+        skip_stages: set = None,
+        depth_only_align: bool = False
     ) -> ApproachResult:
         """执行三阶段导航到接近位姿
 
@@ -297,6 +564,7 @@ class ApproachNavigator(Node):
             target_position: 目标物体位置，用于阶段2/3。None 则从 approach_pose 反推
             status_callback: 阶段状态回调，参数为 (NavStage, 消息字符串)
             skip_stages: 要跳过的阶段集合，如 {1}, {1,2}, {2,3} 等
+            depth_only_align: True 跳过 map 粗对齐，直接深度精对齐
 
         Returns:
             ApproachResult: 导航结果
@@ -345,7 +613,7 @@ class ApproachNavigator(Node):
 
             # 阶段1完成后等待车辆停稳
             self.get_logger().info("Nav2 到达，等待车辆停稳...")
-            time.sleep(0.3)  # 等待0.3秒
+            time.sleep(0.15)
 
         # ========== 阶段2: 对齐 ==========
         if 2 in skip_stages:
@@ -355,7 +623,7 @@ class ApproachNavigator(Node):
             msg = "skipped"
         else:
             notify(NavStage.ALIGNING, "对准目标方向...")
-            success, msg = self._do_alignment()
+            success, msg = self._do_alignment(depth_only=depth_only_align)
 
             if self._cancel_requested:
                 self.depth_sensor.deactivate()
@@ -369,10 +637,20 @@ class ApproachNavigator(Node):
 
             # 阶段2完成后等待车辆停稳
             self.get_logger().info("对齐完成，等待车辆停稳...")
-            time.sleep(0.3)  # 等待0.3秒让车子停稳
+            time.sleep(0.15)
 
         # ========== 阶段3: 精确接近 ==========
-        if 3 in skip_stages:
+        skip_approach = (self._locked_target_cz is not None
+                         and self._locked_target_cz <= 0.25)
+        if skip_approach:
+            self.get_logger().info(
+                f"目标距相机仅 {self._locked_target_cz:.3f}m，已足够近，跳过精确接近")
+            self.depth_sensor.deactivate()
+            notify(NavStage.FINAL_APPROACH, "已足够近，跳过精确接近")
+            final_dist = self._locked_target_cz
+            success = True
+            msg = "close_enough"
+        elif 3 in skip_stages:
             self.get_logger().info("跳过阶段3 (精确接近)")
             self.depth_sensor.deactivate()  # 阶段2可能已激活，清理
             notify(NavStage.FINAL_APPROACH, "跳过阶段3")
@@ -452,31 +730,36 @@ class ApproachNavigator(Node):
     # 阶段2: 对齐
     # =========================================================================
 
-    def _do_alignment(self) -> tuple:
-        """两步对齐: 先 map 粗对齐 (把目标带入相机视野)，再深度聚类精对齐
+    def _do_alignment(self, depth_only=False) -> tuple:
+        """对齐: 可选 map 粗对齐 + 深度聚类精对齐
 
-        步骤1: 基于 map 坐标原地旋转，使机器人大致朝向目标
-        步骤2: 激活深度传感器，用点云聚类精确对齐到目标中心
-
-        深度传感器在对齐完成后保持激活状态，供阶段3复用。
+        Args:
+            depth_only: True 则跳过 map 粗对齐，直接深度精对齐
 
         Returns:
             (bool, str): (成功标志, 错误消息)
         """
-        # ===== 步骤1: map 粗对齐 =====
-        self.get_logger().info("对齐步骤1: map 坐标粗对齐")
-        success, msg = self._do_alignment_by_map()
-        if not success:
-            return False, msg
+        # 粗对齐: 角度偏差大时先用 map 坐标旋转到大致朝向
+        # 阶段1跳过时机器人可能面向任意方向，深度相机 FOV 有限
+        if not depth_only:
+            robot_pos, robot_yaw = self._get_robot_pose()
+            if robot_pos and self.target_map_position:
+                dx = self.target_map_position.x - robot_pos.x
+                dy = self.target_map_position.y - robot_pos.y
+                target_heading = math.atan2(dy, dx)
+                error = abs(normalize_angle(target_heading - robot_yaw))
+                coarse_threshold = self.config.align_tolerance * 2  # ~10°
+                if error > coarse_threshold:
+                    self.get_logger().info(
+                        f"角度偏差 {math.degrees(error):.1f}° > "
+                        f"{math.degrees(coarse_threshold):.1f}°，先执行粗对齐")
+                    success, msg = self._do_alignment_by_map()
+                    if not success:
+                        return success, msg
+                    time.sleep(self.config.align_settle_time)
 
-        # 粗对齐后停稳，等惯性消散 + IMU收敛
-        settle = self.config.align_settle_time
-        self.get_logger().info(f"粗对齐完成，停稳等待 {settle:.1f}s")
-        self._stop_robot()
-        time.sleep(settle)
-
-        # ===== 步骤2: 深度聚类精对齐 =====
-        self.get_logger().info("对齐步骤2: 深度聚类精对齐")
+        # 深度聚类精对齐
+        self.get_logger().info("深度聚类精对齐")
         return self._do_alignment_by_depth()
 
     def _map_to_camera(self, target_map, robot_pos, robot_yaw) -> tuple:
@@ -497,38 +780,18 @@ class ApproachNavigator(Node):
         cam_x = -by
         return cam_x, cam_z
 
-    def _select_cluster(self, clusters, robot_pos, robot_yaw,
+    def _select_cluster(self, clusters, robot_pos=None, robot_yaw=None,
                         prev_cx=None, prev_cz=None):
-        """两级聚类选择: map期望 > 时序连续，无兜底
-
-        1. 距 map 期望位置最近的聚类 (容差 0.5m)
-        2. 距上帧聚类最近的 (容差 0.3m，时序连续性)
-        3. 都不匹配 → 返回 None (跳过深度对齐)
+        """聚类选择: 直接取最近的 (front_z 最小)
 
         Returns:
-            (cx, cy, cz) or None
+            (cx, cy, front_z, n_pts) or None
         """
-        # map 期望位置
-        exp_cx, exp_cz = self._map_to_camera(
-            self.target_map_position, robot_pos, robot_yaw)
-        by_map = min(clusters, key=lambda c:
-                     (c[0] - exp_cx) ** 2 + (c[2] - exp_cz) ** 2)
-        map_dist = math.sqrt(
-            (by_map[0] - exp_cx) ** 2 + (by_map[2] - exp_cz) ** 2)
-        if map_dist < 0.8:
-            return by_map
-
-        # 时序连续性
-        if prev_cx is not None:
-            by_prev = min(clusters, key=lambda c:
-                         (c[0] - prev_cx) ** 2 + (c[2] - prev_cz) ** 2)
-            prev_dist = math.sqrt(
-                (by_prev[0] - prev_cx) ** 2 + (by_prev[2] - prev_cz) ** 2)
-            if prev_dist < 0.3:
-                return by_prev
-
-        # 无匹配 — 目标可能被遮挡或太小不可见
-        return None
+        if not clusters:
+            return None
+        # front_z = c[2]，取最近的聚类
+        nearest = min(clusters, key=lambda c: c[2])
+        return nearest
 
     def _match_locked_target(self, clusters, prev_cx, prev_cz, tolerance=0.15):
         """在聚类中匹配锁定目标（纯时序连续性）
@@ -555,9 +818,10 @@ class ApproachNavigator(Node):
         Returns:
             (bool, str): (成功标志, 错误消息)
         """
+        # TF 可选: 有则用 map 匹配，无则靠最大簇兜底
         robot_pos, robot_yaw = self._get_robot_pose()
         if robot_pos is None:
-            return False, "无法获取机器人位姿"
+            self.get_logger().warn("TF不可用，将使用最大簇兜底选择目标")
 
         # 激活深度传感器
         self.depth_sensor.activate()
@@ -588,21 +852,23 @@ class ApproachNavigator(Node):
             self.get_logger().warn("深度聚类无结果，跳过精对齐")
             return True, ""
 
-        # 选择: map期望 > 时序连续，无匹配则跳过
-        exp_cx, exp_cz = self._map_to_camera(
-            self.target_map_position, robot_pos, robot_yaw)
+        # 选择: map期望 > 时序连续 > 最大簇
         best = self._select_cluster(clusters, robot_pos, robot_yaw)
 
         if best is None:
+            # 诊断: 打印每个聚类位置
+            cls_info = ", ".join(
+                f"({c[0]:+.2f},{c[2]:.2f},n={c[3] if len(c)>3 else '?'})"
+                for c in clusters)
             self.get_logger().warn(
-                f"无匹配聚类 (期望cam=({exp_cx:.3f},{exp_cz:.3f}), "
-                f"共{len(clusters)}个聚类)，跳过精对齐，保留map粗对齐")
+                f"无匹配聚类 共{len(clusters)}个: [{cls_info}]，"
+                f"跳过精对齐，保留map粗对齐")
             return True, ""
 
-        cx, cy, cz = best
+        cx, cy, cz = best[0], best[1], best[2]
+        n_pts = best[3] if len(best) > 3 else 0
         self.get_logger().info(
-            f"选定目标聚类: cam_x={cx:.3f}m cam_z={cz:.3f}m "
-            f"期望cam=({exp_cx:.3f},{exp_cz:.3f}) "
+            f"选定目标聚类: cam_x={cx:.3f}m cam_z={cz:.3f}m n={n_pts} "
             f"共{len(clusters)}个聚类"
         )
 
@@ -612,43 +878,49 @@ class ApproachNavigator(Node):
             self.get_logger().info(f"相机横向偏移补偿: {camera_offset * 100:.1f}cm")
 
         # 纯 P 控制循环 — 对齐到目标聚类中心
+        # TF 可选: 有则用 map 匹配，无则靠时序连续 + 最大簇兜底
         cfg = self.config
         start_time = time.time()
-        prev_cx, prev_cz = cx, cz      # 时序连续性
+        first_error_logged = False
+        prev_cx, prev_cz = cx, cz
 
         while rclpy.ok() and not self._cancel_requested:
             if time.time() - start_time > cfg.align_timeout:
                 self._stop_robot()
                 return False, "精对齐超时"
 
-            robot_pos, robot_yaw = self._get_robot_pose()
-            if robot_pos is None:
-                time.sleep(0.05)
-                continue
-
             clusters = self.depth_sensor.get_all_cluster_centroids()
             if not clusters:
                 time.sleep(0.05)
                 continue
 
+            # TF 可选: 有则传入，无则 None (走时序/最大簇)
+            robot_pos, robot_yaw = self._get_robot_pose()
             best = self._select_cluster(
                 clusters, robot_pos, robot_yaw, prev_cx, prev_cz)
             if best is None:
                 time.sleep(0.05)
                 continue
-            cx, cy, cz = best
+            cx, cy, cz = best[0], best[1], best[2]
             prev_cx, prev_cz = cx, cz
 
             # 角度误差: cx>0 → 偏右 → 需右转 (omega<0)
             error = -math.atan2(cx - camera_offset, cz)
+
+            if not first_error_logged:
+                self.get_logger().info(
+                    f"精对齐开始: err={math.degrees(error):.1f}° "
+                    f"cx={cx:.3f}m cz={cz:.3f}m")
+                first_error_logged = True
 
             if abs(error) < cfg.align_tolerance:
                 self._stop_robot()
                 self._locked_target_cx = cx
                 self._locked_target_cz = cz
                 self.get_logger().info(
-                    f"精对齐完成，误差={math.degrees(error):.1f}°, "
-                    f"目标距离={cz:.3f}m")
+                    f"精对齐完成: err={math.degrees(error):.1f}° "
+                    f"cx={cx:.3f}m cz={cz:.3f}m "
+                    f"耗时={time.time()-start_time:.1f}s")
                 return True, ""
 
             # 纯 P + 限幅 + 死区
@@ -718,7 +990,8 @@ class ApproachNavigator(Node):
             target_heading = math.atan2(dy, dx)
             error = normalize_angle(target_heading - robot_yaw)
 
-            if abs(error) < cfg.align_tolerance:
+            coarse_tol = cfg.align_tolerance * 2  # 粗对齐放宽 (~10°)，精对齐兜底
+            if abs(error) < coarse_tol:
                 self._stop_robot()
                 self.get_logger().info(
                     f"粗对齐完成: 误差={math.degrees(error):.1f}°, "

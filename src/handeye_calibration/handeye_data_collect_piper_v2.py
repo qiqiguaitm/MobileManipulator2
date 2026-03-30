@@ -18,12 +18,6 @@ Design: Separation of Concerns
 import sys
 import os
 
-# IMPORTANT: Setup paths for Pinocchio/CasADi BEFORE any other imports
-# Path order matters for Pinocchio with CasADi + hpp-fcl support
-sys.path.insert(0, '/opt/ros/noetic/lib/python3.8/site-packages')  # For hppfcl
-sys.path.insert(0, '/usr/local/lib/python3.8/site-packages')  # For pinocchio
-sys.path.insert(0, '/home/agilex/.local/lib/python3.8/site-packages')  # For casadi
-sys.path.insert(0, '/home/agilex/MobileManipulator/src/piper/piper_driver/scripts')  # For piper_pinocchio
 import cv2
 import numpy as np
 import json
@@ -31,7 +25,7 @@ import time
 from datetime import datetime
 
 # Robot control - using piper_api_v2
-sys.path.append('/home/agilex/MobileManipulator/src/piper/piper_grasp/scripts')
+sys.path.insert(0, '/data/workspace/MobileManipulator2/src/piper_grasp/scripts')
 from piper_api_v2 import PiperAPI
 
 # Camera intrinsics
@@ -584,12 +578,8 @@ class HandEyeDataCollector:
             return True
 
         try:
-            # IMPORTANT: Path order matters for Pinocchio with CasADi + hpp-fcl
-            import sys
-            sys.path.insert(0, '/opt/ros/noetic/lib/python3.8/site-packages')  # For hppfcl
-            sys.path.insert(0, '/usr/local/lib/python3.8/site-packages')  # For pinocchio
-            sys.path.insert(0, '/home/agilex/.local/lib/python3.8/site-packages')  # For casadi
-            sys.path.insert(0, '/home/agilex/MobileManipulator/src/piper/piper_driver/scripts')
+            # DEPRECATED: Pinocchio IK not available on current system
+            # Kept for reference only - joint control is the preferred method
             from piper_pinocchio import Arm_IK
 
             print("  🔧 初始化 Pinocchio IK 求解器...")

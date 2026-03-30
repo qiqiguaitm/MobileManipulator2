@@ -91,7 +91,7 @@ class DepthMeasurer:
     """
 
     DEPTH_MIN = 0.3   # m
-    DEPTH_MAX = 10.0  # m
+    DEPTH_MAX = 3.5   # m — D435 深度误差 ∝ z², 收紧避免远距离噪声污染
     MASK_ERODE_KERNEL = 5
     IQR_FACTOR = 1.5
     MIN_DEPTH_POINTS = 10

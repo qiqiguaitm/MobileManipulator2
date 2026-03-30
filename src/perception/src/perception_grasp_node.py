@@ -541,6 +541,10 @@ class PerceptionGraspNode(Node):
             else:
                 targets = []
 
+            # === bbox IoU NMS: 同一物体多类别检测去重 ===
+            if len(targets) > 1:
+                targets = self._nms_targets(targets, iou_threshold=0.5)
+
             if verbose:
                 self.log.info(f"DETECT: GraspAnything: {len(affs[0]) if affs and affs[0] else 0} objects, "
                               f"DinoX: {len(targets)} targets")
@@ -707,6 +711,45 @@ class PerceptionGraspNode(Node):
                          f"dist_score={distance_score:.3f}, combined={combined:.3f}")
 
         return combined
+
+    @staticmethod
+    def _nms_targets(targets, iou_threshold=0.5):
+        """bbox IoU NMS: 同一物体多类别检测去重，保留得分最高的"""
+        if len(targets) <= 1:
+            return targets
+
+        # 按 score 降序排序
+        sorted_targets = sorted(targets, key=lambda t: t.get('score', 0.0), reverse=True)
+        keep = []
+
+        for t in sorted_targets:
+            bb = t.get('bbox', [])
+            if len(bb) < 4:
+                keep.append(t)
+                continue
+
+            suppressed = False
+            for k in keep:
+                kb = k.get('bbox', [])
+                if len(kb) < 4:
+                    continue
+                # 计算 IoU
+                ix1 = max(bb[0], kb[0])
+                iy1 = max(bb[1], kb[1])
+                ix2 = min(bb[2], kb[2])
+                iy2 = min(bb[3], kb[3])
+                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                area_a = (bb[2] - bb[0]) * (bb[3] - bb[1])
+                area_b = (kb[2] - kb[0]) * (kb[3] - kb[1])
+                union = area_a + area_b - inter
+                iou = inter / union if union > 0 else 0
+                if iou > iou_threshold:
+                    suppressed = True
+                    break
+            if not suppressed:
+                keep.append(t)
+
+        return keep
 
     def _build_grasp_objects(self, rgb, depth, affs, targets, img_w, img_h, verbose=True):
         """

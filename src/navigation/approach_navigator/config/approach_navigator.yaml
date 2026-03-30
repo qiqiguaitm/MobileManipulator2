@@ -37,7 +37,7 @@ approach_navigator:
     # ============================================================
     depth_topic: "/camera/chassis/aligned_depth_to_color/image_raw"
     depth_min_valid: 0.10             # 最小有效深度，D435 约 0.1m (米)
-    depth_max_valid: 2.0              # 最大有效深度 (米)
+    depth_max_valid: 1.0              # 最大有效深度 (米)
     depth_data_timeout: 0.5           # 深度数据超时判定 (秒)
 
     # ============================================================
@@ -49,8 +49,8 @@ approach_navigator:
     # 相机坐标系: y 向下为正, 相机离地约 15cm → 地面在 y ≈ +0.15m
     # ROI 上限必须 > depth_ground_max_height, 才能让地面点进入 RANSAC 去除
     depth_ground_max_height: 0.158      # 地面高度: +15cm (相机离地15cm, y向下为正)
-    depth_obstacle_min_height: -0.50   # ROI 上方截止: -50cm (排除50cm以上高处, y向上为负)
-    depth_obstacle_max_height: 0.24    # ROI 下方截止: +22cm (包含地面+7cm余量, 供RANSAC使用)
+    depth_obstacle_min_height: -0.35   # ROI 上方截止: -50cm (排除50cm以上高处, y向上为负)
+    depth_obstacle_max_height: 0.22    # ROI 下方截止: +22cm (包含地面+7cm余量, 供RANSAC使用)
 
     # 检测范围: 前方 |y| < 此值的范围
     depth_detect_width: 0.8           # 检测宽度 (米)，左右各此值
@@ -64,19 +64,18 @@ approach_navigator:
     # ============================================================
     # RANSAC 地面拟合参数
     # ============================================================
-    ransac_distance_threshold: 0.02   # 点到平面距离阈值 (米)
+    ransac_distance_threshold: 0.01   # 点到平面距离阈值 (米)
     ransac_max_iterations: 80         # 最大迭代次数
     ransac_min_inlier_ratio: 0.3      # 最小内点比例，低于则拟合失败
-    ground_candidate_margin: 0.05     # 地面候选点 y 容差 (米)，y >= ground_max - margin
+    ground_candidate_margin: 0.08     # 地面候选点 y 容差 (米)，y >= ground_max - margin
     ground_inlier_min_dist: -0.01     # 地面内点有符号距离下限 (米，平面上方1cm)
-    ground_inlier_max_dist: 0.03      # 地面内点有符号距离上限 (米，平面下方3cm)
+    ground_inlier_max_dist: 0.05      # 地面内点有符号距离上限 (米，平面下方5cm)
 
     # ============================================================
     # 聚类参数
     # ============================================================
     cluster_tolerance: 0.05           # DBSCAN eps / KDTree 邻域半径 (米)
-    cluster_min_size: 50              # 最小聚类点数
-    cluster_max_size: 10000           # 最大聚类点数
+    cluster_min_size: 20              # 最小聚类点数
 
     # ============================================================
     # 机器人几何参数

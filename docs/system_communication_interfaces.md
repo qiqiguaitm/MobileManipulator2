@@ -1,8 +1,8 @@
 # 系统通信接口与信息流文档
 
-> 模块：perception / piper_grasp / slam / robot_manager
+> 模块：perception / piper_grasp / slam / cleaner_manager
 >
-> 更新日期：2026-03-03
+> 更新日期：2026-03-27
 
 ---
 
@@ -13,13 +13,13 @@
 | **perception** | 感知层 | 多相机 3D 目标检测、跟踪、手部抓取检测 |
 | **piper_grasp** | 执行层 | 机械臂控制（CAN 总线）、抓取/放置动作执行 |
 | **slam** | 定位导航层 | LiDAR SLAM、里程计融合、Nav2 导航栈 |
-| **robot_manager** | 编排层 | 状态机编排，串联 感知→导航→抓取→放置 |
+| **cleaner_manager** | 编排层 | 状态机编排，串联 感知→导航→抓取→放置 |
 
 架构分层关系：
 
 ```
 ┌──────────────────────────────────────────┐
-│            robot_manager (编排层)         │
+│            cleaner_manager (编排层)         │
 │  状态机驱动，调度下层三个模块协同工作       │
 └────┬──────────────┬──────────────┬───────┘
      │              │              │
@@ -34,7 +34,7 @@
 
 ## 2. 模块间直接通信接口
 
-### 2.1 perception → robot_manager（Topic）
+### 2.1 perception → cleaner_manager（Topic）
 
 ```
 perception::ObjectTrackerNode
@@ -46,11 +46,11 @@ perception::ObjectTrackerNode
     │  内容: track_id, category, position, distance, track_score, position_confidence
     │
     ▼
-robot_manager::TargetPool
+cleaner_manager::TargetPool
     → TF 变换到 map 坐标 → 目标池管理 → 供状态机调度
 ```
 
-**唯一直接数据通道。** robot_manager 被动接收场景跟踪结果，通过 TF 转到 map 坐标系后存入全局目标池，不主动触发场景感知。
+**唯一直接数据通道。** cleaner_manager 被动接收场景跟踪结果，通过 TF 转到 map 坐标系后存入全局目标池，不主动触发场景感知。
 
 ### 2.2 perception ← piper_grasp（Service）
 
@@ -67,9 +67,9 @@ piper_grasp::piper_grasp_node         perception::perception_grasp_node
         └──────────── client ──────────► server ───┘
 ```
 
-piper_grasp 是 client，perception_grasp 是 server。此调用封装在 piper_grasp 的 `/piper/observe` 服务内部——robot_manager 调 observe，observe 内部再调 GraspDetect。
+piper_grasp 是 client，perception_grasp 是 server。此调用封装在 piper_grasp 的 `/piper/observe` 服务内部——cleaner_manager 调 observe，observe 内部再调 GraspDetect。
 
-### 2.3 robot_manager → piper_grasp（Service + Action）
+### 2.3 cleaner_manager → piper_grasp（Service + Action）
 
 **Services（同步短时命令）：**
 
@@ -87,10 +87,10 @@ piper_grasp 是 client，perception_grasp 是 server。此调用封装在 piper_
 | `/piper/pick` | `piper_msgs/action/PiperPick` | PICKING | 接近→张开→下降→夹取→验证→抬起 |
 | `/piper/place` | `piper_msgs/action/PiperPlace` | PLACING | 抬起→移动→下降→释放→回 ready |
 
-### 2.4 robot_manager → slam / Nav2（Action + Topic）
+### 2.4 cleaner_manager → slam / Nav2（Action + Topic）
 
 ```
-robot_manager::ApproachNavigator
+cleaner_manager::ApproachNavigator
     │
     │  阶段1: nav2_msgs/action/NavigateToPose (Nav2 全局导航)
     │  阶段2-3: 发布 /cmd_vel (geometry_msgs/Twist, 精确接近控制)
@@ -115,7 +115,7 @@ map ──(hdl_odom_to_tf)──► odom ──(Fast-LIO)──► base_link
 |------|----------|------|
 | perception | base_link 为目标坐标系 | 3D 检测结果统一到 base_link |
 | piper_grasp | arm_base → 手眼标定 → camera_hand_optical | 相机坐标转机械臂坐标 |
-| robot_manager | map ↔ base_link 双向 | 目标池坐标转换、导航目标生成 |
+| cleaner_manager | map ↔ base_link 双向 | 目标池坐标转换、导航目标生成 |
 | Nav2 | map → odom → base_link 完整链 | 全局定位 + 路径规划 |
 
 ---
@@ -263,9 +263,9 @@ map ──(hdl_odom_to_tf)──► odom ──(Fast-LIO)──► base_link
 
 #### 启动的 Nav2 组件（通过 launch）
 
-planner_server (Smac2D), controller_server (TEB), behavior_server, bt_navigator, map_server, lifecycle_manager — 提供标准 Nav2 Action 接口。
+planner_server (Smac2D), controller_server (MPPI), behavior_server, bt_navigator, map_server, lifecycle_manager — 提供标准 Nav2 Action 接口。
 
-### 4.4 robot_manager
+### 4.4 cleaner_manager
 
 #### 自定义消息
 
@@ -273,12 +273,12 @@ planner_server (Smac2D), controller_server (TEB), behavior_server, bt_navigator,
 |------|------|
 | `RobotManagerStatus` | state, state_name, targets_total/picked/failed/remaining, current_target_category, consecutive_failures, last_nav/pick_time_ms, error_message |
 
-#### robot_manager_node 接口
+#### cleaner_manager_node 接口
 
 | 方向 | 接口 | 类型 | 说明 |
 |------|------|------|------|
 | Sub | `/object_tracker_node/tracked_objects` | perception/TrackedObject3DArray | 感知跟踪结果 |
-| Pub | `~/status` | robot_manager/RobotManagerStatus | 状态机状态 |
+| Pub | `~/status` | cleaner_manager/RobotManagerStatus | 状态机状态 |
 | Srv | `~/start` | std_srvs/Trigger | 启动自主任务 |
 | Srv | `~/abort` | std_srvs/Trigger | 中止任务 |
 | Call | `/piper/observe` | piper_msgs/Observe | 触发感知 |
@@ -295,10 +295,10 @@ planner_server (Smac2D), controller_server (TEB), behavior_server, bt_navigator,
 ## 5. 完整信息流：自主抓取任务
 
 ```
-用户调用 /robot_manager_node/start (Trigger)
+用户调用 /cleaner_manager_node/start (Trigger)
 │
 ▼
-┌─── robot_manager 状态机循环 ──────────────────────────────────────────────────┐
+┌─── cleaner_manager 状态机循环 ──────────────────────────────────────────────────┐
 │                                                                               │
 │  ① PLANNING                                                                  │
 │     TargetPool.get_nav_target()                                              │
@@ -327,7 +327,7 @@ planner_server (Smac2D), controller_server (TEB), behavior_server, bt_navigator,
 │  ⑥ PICKING                                                                   │
 │     调 /piper/observe (prompt="bottle.cup.box")                              │
 │       └─ piper 内部调 /perception_grasp_node/detect (GraspDetect)            │
-│         └─ perception 手部相机: DinoX + GraspAnything + CDM                   │
+│         └─ perception 手部相机: SAM3 + GraspAnything + CDM                    │
 │         └─ 返回 point3d(相机系,米) → piper 手眼标定 → base_link(mm)           │
 │     调 /piper/pick Action                                                    │
 │       └─ 反馈: CHECKING→APPROACHING→OPENING→DESCENDING→CLOSING→              │
@@ -350,26 +350,26 @@ planner_server (Smac2D), controller_server (TEB), behavior_server, bt_navigator,
 
 ```
 相机(top/chassis)
-  → multi_camera_perception_node (DinoX 检测 + CDM 深度 + LiDAR 融合)
+  → multi_camera_perception_node (SAM3 检测 + FoundationStereo 深度)
     → Object3DArray (per-camera)
       → 匈牙利匹配 + ByteTracker3D
         → fused/objects_3d
           → object_tracker_node (SAM2 跟踪)
             → TrackedObject3DArray (base_link 坐标)
-              → robot_manager::TargetPool (TF 转 map 坐标)
+              → cleaner_manager::TargetPool (TF 转 map 坐标)
 ```
 
 ### 6.2 抓取感知数据流（精确抓取定位）
 
 ```
-robot_manager 调 /piper/observe
+cleaner_manager 调 /piper/observe
   → piper_grasp_node 调 /perception_grasp_node/detect
     → perception_grasp_node: 手部相机拍照
-      → DinoX 检测 + GraspAnything 抓取点 + CDM 深度优化
+      → SAM3 检测 + GraspAnything 抓取点 + CDM 深度优化
         → point3d (camera_hand_optical 坐标系, 米)
           → piper_grasp_node: 手眼标定 (T_cam2flan, T_gripper2flan)
             → base_link 坐标 (mm)
-              → 返回给 robot_manager (Observe 响应)
+              → 返回给 cleaner_manager (Observe 响应)
 ```
 
 ### 6.3 定位导航数据流
@@ -405,7 +405,7 @@ GlobalMap.pcd → globalmap_publisher → hdl_localization (初始定位)
           │               │               │
           ▼               ▼               ▼
    ┌────────────┐  ┌─────────────┐  ┌───────────┐
-   │ perception │  │robot_manager│  │piper_grasp│
+   │ perception │  │cleaner_manager│  │piper_grasp│
    └──────┬─────┘  └──┬──────┬──┘  └─────┬─────┘
           │            │      │           │
           │  Topic     │      │  Srv/Act  │
@@ -426,7 +426,7 @@ GlobalMap.pcd → globalmap_publisher → hdl_localization (初始定位)
 ```
 
 **依赖方向总结：**
-- robot_manager 依赖全部三个模块
+- cleaner_manager 依赖全部三个模块
 - piper_grasp 依赖 perception（GraspDetect 服务）
 - perception 和 slam 彼此独立，无直接通信
 - slam 是纯基础设施，被全部模块隐式依赖（TF）
