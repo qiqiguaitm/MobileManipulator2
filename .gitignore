@@ -52,3 +52,27 @@ src/cam_lidar_calibration/data/calib_bags_*/
 # Benchmark assets
 scripts/bench_client.tar.gz
 scripts/bench_images/
+
+# Captures, demo, maps (large / machine-specific)
+captures/
+demo/
+maps/
+
+# TF tree dumps
+frames_*.gv
+frames_*.pdf
+
+# Debug data artifacts (scripts/)
+scripts/*.jsonl
+scripts/*_report.txt
+scripts/*.png
+scripts/ghost_debug_*/
+scripts/stereo_test_*/
+scripts/hand_capture/
+
+# Perception runtime data
+src/perception/src/data/
+src/perception/src/output/
+
+# Config backups
+*.bak.*
