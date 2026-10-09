@@ -5,7 +5,7 @@ hdl_global_localization:
     globalmap_downsample_resolution: 0.2
     query_downsample_resolution: 0.2
     # ScanContext engine parameters
-    sc_database_path: /home/didi/workspace/MobileManipulator2/maps/sc_pgo/sc_database.bin
+    sc_database_path: /home/didi/junbin.zhang/MobileManipulator2/maps/mapping_runs/20260920_155443/20260920_155444/sc_database.bin
     sc_dist_threshold: 0.80
     sc_num_candidates: 40            # 20→40: 小房间SC区分度低，多查近邻提高覆盖率
     sc_max_radius: 10.0              # 4.0→10.0: 描述子覆盖更大范围，区分度更高

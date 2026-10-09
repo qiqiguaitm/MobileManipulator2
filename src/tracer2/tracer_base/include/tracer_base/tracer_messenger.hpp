@@ -13,6 +13,8 @@
 #include <string>
 #include <mutex>
 #include <memory>
+#include <cmath>
+#include "tracer_base/command_watchdog.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -32,7 +34,11 @@ template <typename TracerType>
 class TracerMessenger {
  public:
   TracerMessenger(std::shared_ptr<TracerType> tracer, rclcpp::Node *node)
-      : tracer_(tracer), node_(node) {}
+      : tracer_(tracer), node_(node) {
+    if (!node_->has_parameter("command_timeout"))
+      node_->declare_parameter("command_timeout", 0.0);
+    command_watchdog_ = CommandWatchdog(node_->get_parameter("command_timeout").as_double());
+  }
 
   void SetOdometryFrame(std::string frame) { odom_frame_ = frame; }
   void SetBaseFrame(std::string frame) { base_frame_ = frame; }
@@ -67,6 +73,10 @@ class TracerMessenger {
   }
 
   void PublishStateToROS() {
+    // Independent of the Python guard and of ROS/simulation time.
+    if (!simulated_robot_ && command_watchdog_.Expired())
+      tracer_->SetMotionCommand(0.0, 0.0);
+
     current_time_ = node_->get_clock()->now();
 
     static bool init_run = true;
@@ -191,8 +201,15 @@ class TracerMessenger {
     }
     // ROS_INFO("Cmd received:%f, %f", msg->linear.x, msg->angular.z);
   }
+  CommandWatchdog command_watchdog_;
+
   void SetTracerMotionCommand(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
+    if (!std::isfinite(msg->linear.x) || !std::isfinite(msg->angular.z)) {
+      tracer_->SetMotionCommand(0.0, 0.0);
+      return;
+    }
+    command_watchdog_.Received();
     tracer_->SetMotionCommand(msg->linear.x, msg->angular.z);
   }
 

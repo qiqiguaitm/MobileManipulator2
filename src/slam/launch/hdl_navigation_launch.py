@@ -23,7 +23,7 @@ from ament_index_python.packages import PackageNotFoundError
 import os
 
 # 与 ROS1 navigation_3d.launch 一致：地图目录默认路径
-DEFAULT_MAP_DIR = '/home/didi/workspace/MobileManipulator2/maps/sc_pgo'
+DEFAULT_MAP_DIR = '/home/didi/junbin.zhang/MobileManipulator2/maps/mapping_runs/20260920_155443/20260920_155444'
 
 
 def generate_launch_description():
@@ -85,7 +85,7 @@ def generate_launch_description():
         tracer_launch = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(tracer_pkg, 'launch', 'tracer_base.launch.py')),
             launch_arguments={
-                'port_name': 'can1',
+                'port_name': 'can2',
                 'odom_frame': 'wheel_odom',
                 'odom_topic_name': '/wheel_odom',
                 'publish_tf': 'false',

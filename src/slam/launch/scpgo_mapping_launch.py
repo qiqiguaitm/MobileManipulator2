@@ -71,7 +71,7 @@ def generate_launch_description():
         executable='sc_pgo_node',
         name='sc_pgo',
         output='screen',
-        parameters=[sc_pgo_config],
+        parameters=[sc_pgo_config, {'save_directory': LaunchConfiguration('save_dir')}],
         remappings=[
             ('/Odometry', '/fastlio/odom'),
             ('/cloud_registered_body', '/fastlio/cloud_body'),

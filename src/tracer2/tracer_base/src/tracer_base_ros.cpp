@@ -121,11 +121,21 @@ void TracerBaseRos::Run() {
   messenger->SetupSubscription();
   keep_running_ = true;
   rclcpp::Rate rate(50);
-  while (keep_running_) {
-    messenger->PublishStateToROS();
-    rclcpp::spin_some(shared_from_this());
-    rate.sleep();
+  // Keep one executor; spin_some(node) constructs a new executor each cycle
+  // and can attempt to create guard conditions after SIGINT shuts ROS down.
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(shared_from_this());
+  try {
+    while (keep_running_ && rclcpp::ok()) {
+      messenger->PublishStateToROS();
+      executor.spin_some();
+      rate.sleep();
+    }
+  } catch (const rclcpp::exceptions::RCLError &) {
+    robot_->SetMotionCommand(0.0, 0.0);
+    if (rclcpp::ok()) throw;
   }
+  robot_->SetMotionCommand(0.0, 0.0);
   
 }
 }  // namespace westonrobot

@@ -22,6 +22,10 @@ find_package(Ceres REQUIRED)
 include_directories( ${CERES_INCLUDE_DIRS} )
 
 find_package(yaml-cpp REQUIRED)
+# Older yaml-cpp releases export only the unnamespaced target.
+if(NOT TARGET yaml-cpp::yaml-cpp AND TARGET yaml-cpp)
+  add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
+endif()
 include_directories(${YAML_CPP_INCLUDE_DIR})
 
 find_package(glog REQUIRED)

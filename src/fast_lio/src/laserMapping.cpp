@@ -283,7 +283,7 @@ void lasermap_fov_segment()
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
-    scan_count ++;
+    if (scan_count < MAXN) ++scan_count;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -301,7 +301,8 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    if (runtime_pos_log && scan_count < MAXN)
+        s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -313,7 +314,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
-    scan_count ++;
+    if (scan_count < MAXN) ++scan_count;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -342,7 +343,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    if (runtime_pos_log && scan_count < MAXN)
+        s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -625,7 +627,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubMeasurementOdom, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     // 统一使用 now() 时间戳，与 tf_republisher 保持一致，避免 TF 时间戳不一致问题
     auto now_stamp = rclcpp::Clock().now();
@@ -646,6 +648,11 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+
+    // Separate measurement-time stream for sensor deskew. Keep legacy navigation TF unchanged.
+    auto measurement_odom = odomAftMapped;
+    measurement_odom.header.stamp = get_ros_time(lidar_end_time);
+    pubMeasurementOdom->publish(measurement_odom);
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
@@ -672,6 +679,11 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
     jjj++;
     if (jjj % 10 == 0) 
     {
+        // Bound visualization history during multi-day operation. This is not
+        // the filter state or map, and must not grow/publish without a limit.
+        constexpr size_t max_path_poses = 2000;
+        if (path.poses.size() >= max_path_poses)
+            path.poses.erase(path.poses.begin(), path.poses.begin() + 1000);
         path.poses.push_back(msg_body_pose);
         pubPath->publish(path);
     }
@@ -927,7 +939,7 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::QoS(rclcpp::KeepLast(5)).reliable(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
@@ -935,6 +947,7 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubMeasurementOdom_ = this->create_publisher<nav_msgs::msg::Odometry>("/fastlio/odom_measurement", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -954,7 +967,7 @@ public:
     {
         fout_out.close();
         fout_pre.close();
-        fclose(fp);
+        if (fp) fclose(fp);
     }
 
 private:
@@ -1031,6 +1044,7 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+            if (runtime_pos_log && time_log_counter < MAXN)
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
@@ -1064,7 +1078,7 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, pubMeasurementOdom_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1079,7 +1093,7 @@ private:
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
-            if (runtime_pos_log)
+            if (runtime_pos_log && time_log_counter < MAXN)
             {
                 frame_num ++;
                 kdtree_size_end = ikdtree.size();
@@ -1137,6 +1151,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubMeasurementOdom_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;

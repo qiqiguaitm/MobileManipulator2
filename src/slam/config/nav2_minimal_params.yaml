@@ -311,12 +311,12 @@ global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: false
-      global_frame: odom                   # ROS1: odom (避开 map->odom TF 延迟)
+      global_frame: map                    # Static map and global planning share the map frame
       robot_base_frame: base_link
       transform_tolerance: 0.5            # ROS1: 0.5
       update_frequency: 3.0               # ROS1: 3.0
       publish_frequency: 0.5              # ROS1: 0.5
-      rolling_window: true                # ROS1: true (关键! 之前 ROS2 错误地用了 false)
+      rolling_window: false               # Use the full saved map
       width: 20                           # ROS1: 20.0
       height: 20                          # ROS1: 20.0
       resolution: 0.1                     # ROS1: 0.1 (全局规划不需要高精度)
