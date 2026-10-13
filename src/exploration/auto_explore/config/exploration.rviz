@@ -1,0 +1,124 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: map
+    Background Color: 35; 35; 35
+    Frame Rate: 20
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Metric grid
+      Enabled: true
+      Cell Size: 1
+    - Class: rviz_default_plugins/Map
+      Name: Live exploration map
+      Enabled: true
+      Topic:
+        Value: /map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.7
+    - Class: rviz_default_plugins/LaserScan
+      Name: Live obstacles
+      Enabled: true
+      Topic:
+        Value: /explore/scan
+        Reliability Policy: Best Effort
+      Size (m): 0.04
+      Color Transformer: FlatColor
+      Color: 255; 70; 70
+    - Class: rviz_default_plugins/MarkerArray
+      Name: explore_lite frontiers
+      Enabled: true
+      Topic:
+        Value: /explore/frontiers
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Current navigation goal (magenta)
+      Enabled: true
+      Topic:
+        Value: /explore/current_goal
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Nav2 planned path
+      Enabled: true
+      Topic:
+        Value: /plan
+      Color: 0; 210; 255
+    - Class: rviz_default_plugins/MarkerArray
+      Name: DWB rotation diagnostics
+      Enabled: true
+      Topic:
+        Value: /explore/rotation_debug
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Map
+      Name: Local costmap (optional)
+      Enabled: false
+      Topic:
+        Value: /local_costmap/costmap
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Update Topic:
+        Value: /local_costmap/costmap_updates
+      Color Scheme: costmap
+      Alpha: 0.4
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Recorded DWB diagnostics (optional)
+      Enabled: false
+      Topic:
+        Value: /explore/rotation_debug_recorded
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Recorded navigation goal (optional)
+      Enabled: false
+      Topic:
+        Value: /explore/current_goal_recorded
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Map
+      Name: Recorded context map (optional)
+      Enabled: false
+      Topic:
+        Value: /explore/debug_recorded_map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.7
+    - Class: rviz_default_plugins/TF
+      Name: Robot frames
+      Enabled: true
+      Show Names: false
+      Show Arrows: true
+      Show Axes: true
+    - Class: rviz_default_plugins/Marker
+      Name: Startup assumed rear free (orange)
+      Enabled: true
+      Topic:
+        Value: /explore/startup_clearance
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Top down
+      Target Frame: map
+      Scale: 35
+      X: 0
+      Y: 0
+      Angle: 0
+Window Geometry:
+  Width: 1840
+  Height: 1000

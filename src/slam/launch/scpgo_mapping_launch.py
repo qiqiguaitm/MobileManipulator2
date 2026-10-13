@@ -73,7 +73,7 @@ def generate_launch_description():
         output='screen',
         parameters=[sc_pgo_config, {'save_directory': LaunchConfiguration('save_dir')}],
         remappings=[
-            ('/Odometry', '/fastlio/odom'),
+            ('/Odometry', '/fastlio/odom_measurement'),
             ('/cloud_registered_body', '/fastlio/cloud_body'),
         ],
     )

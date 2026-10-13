@@ -159,6 +159,7 @@ public:
 
         // 创建发布者
         pub_odom_aft_pgo_ = create_publisher<nav_msgs::msg::Odometry>("/aft_pgo_odom", 100);
+        pub_pose_snapshot_ = create_publisher<nav_msgs::msg::Path>("/sc_pgo/pose_snapshot", rclcpp::QoS(1).transient_local());
         pub_path_aft_pgo_ = create_publisher<nav_msgs::msg::Path>("/aft_pgo_path", 100);
         pub_map_aft_pgo_ = create_publisher<sensor_msgs::msg::PointCloud2>("/aft_pgo_map", 100);
         pub_loop_scan_local_ = create_publisher<sensor_msgs::msg::PointCloud2>("/loop_scan_local", 100);
@@ -339,7 +340,25 @@ private:
             recent_optimized_x_ = last_pose.translation().x();
             recent_optimized_y_ = last_pose.translation().y();
         }
-        recent_idx_updated_ = keyframe_poses_updated_.size() - 1;
+        recent_idx_updated_ = static_cast<int>(isam_current_estimate_.size()) - 1;
+        // Atomic raw/optimized pairs; each pair shares the original scan timestamp.
+        // Consumers can align the LIO tail and rebuild historical observations.
+        nav_msgs::msg::Path snapshot;
+        snapshot.header.frame_id = "camera_init";
+        snapshot.header.stamp = now();
+        for (int i = 0; i <= recent_idx_updated_; ++i) {
+            for (const Pose6D* pose : {&keyframe_poses_[i], &keyframe_poses_updated_[i]}) {
+                geometry_msgs::msg::PoseStamped msg;
+                msg.header.frame_id = "camera_init";
+                msg.header.stamp = rclcpp::Time(static_cast<int64_t>(keyframe_times_[i]*1e9));
+                msg.pose.position.x=pose->x;msg.pose.position.y=pose->y;msg.pose.position.z=pose->z;
+                tf2::Quaternion q;q.setRPY(pose->roll,pose->pitch,pose->yaw);
+                msg.pose.orientation.x=q.x();msg.pose.orientation.y=q.y();
+                msg.pose.orientation.z=q.z();msg.pose.orientation.w=q.w();
+                snapshot.poses.push_back(msg);
+            }
+        }
+        pub_pose_snapshot_->publish(snapshot);
     }
 
     // 获取回环关键帧附近的点云
@@ -474,10 +493,10 @@ private:
 
                 double delta_trans = std::sqrt(dtf.x*dtf.x + dtf.y*dtf.y + dtf.z*dtf.z);
                 translation_accumulated_ += delta_trans;
-                rotation_accumulated_ += (dtf.roll + dtf.pitch + dtf.yaw);
+                rotation_accumulated_ += std::sqrt(dtf.roll*dtf.roll + dtf.pitch*dtf.pitch + dtf.yaw*dtf.yaw);
 
-                bool is_keyframe = false;
-                if (translation_accumulated_ > keyframe_meter_gap_ ||
+                bool is_keyframe = keyframe_poses_.empty();
+                if (is_keyframe || translation_accumulated_ > keyframe_meter_gap_ ||
                     rotation_accumulated_ > keyframe_rad_gap_) {
                     is_keyframe = true;
                     translation_accumulated_ = 0.0;
@@ -838,6 +857,7 @@ private:
     // ROS2发布者
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_aft_pgo_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_aft_pgo_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_pose_snapshot_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_map_aft_pgo_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_loop_scan_local_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_loop_submap_local_;
