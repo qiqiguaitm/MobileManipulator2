@@ -1,0 +1,37 @@
+global_controller:
+  ros__parameters:
+    allow_execution: false
+    skip_grasp: false
+    map_frame: map
+    target_attempts: 2
+    scene_attempts: 3
+    empty_confirmations: 2
+    max_scene_rounds: 60
+    identity_radius: 0.12
+    target_max_age: 45.0
+navigation_controller:
+  ros__parameters:
+    allow_execution: false
+    allow_mock_front_execution: false
+    map_frame: map
+    base_frame: base_link
+    # Demo pose only. Load a site profile before real front alignment.
+    washer_front_pose: [2.0, 0.0, 0.5, 3.141592653589793]
+    front_extent: 0.434
+    front_clearance: 0.5
+    # Navigation stand-off: 0.5 m from the physical chassis front to the target.
+    # base_link goal distance = front_extent + grasp_front_clearance = 0.934 m.
+    # This is not a verified arm workspace.
+    grasp_front_clearance: 0.5
+    grasp_y_limit: 0.15
+    grasp_z_range: [-0.15, 0.9]
+    grasp_angles_deg: [0.0, 30.0, -30.0, 60.0, -60.0]
+    position_tolerance: 0.05
+    yaw_tolerance: 0.0174533
+    tf_max_age: 0.8
+    navigation_timeout: 180.0
+scene_perception:
+  ros__parameters:
+    vlm_timeout: 20.0
+    # P90-P10 depth spread limit in metres; site bring-up may override it.
+    depth_max_spread_m: 0.12

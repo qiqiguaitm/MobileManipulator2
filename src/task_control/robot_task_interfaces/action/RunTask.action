@@ -1,0 +1,16 @@
+# operate_washer or inspect_objects. Inspection requires a natural-language target description.
+string task
+string description
+bool execute
+---
+bool success
+string code
+string message
+uint32 completed
+uint32 failed
+string report_file
+---
+string state
+string target_name
+uint32 completed
+uint32 failed

@@ -1,0 +1,14 @@
+# Contract for downstream manipulation. Implementations must target this instance,
+# support cancellation, and return only when arm is stowed and ready for base travel.
+# grasp includes placing/releasing the object to permit the next inspection cycle.
+string operation
+string name
+string instance_id
+geometry_msgs/PointStamped target
+bool execute
+---
+bool success
+string code
+string message
+---
+string state

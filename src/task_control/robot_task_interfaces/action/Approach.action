@@ -1,0 +1,15 @@
+# front_align: name only; grasp_ready: map-frame object position.
+string mode
+string name
+geometry_msgs/PointStamped target
+bool execute
+---
+bool success
+string code
+string message
+geometry_msgs/PoseStamped navigation_goal
+float64 position_error
+float64 yaw_error
+---
+string state
+string message

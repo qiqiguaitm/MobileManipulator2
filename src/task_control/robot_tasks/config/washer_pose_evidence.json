@@ -1,0 +1,48 @@
+{
+  "source_run": "log/board_approach/20261013_140943_123577",
+  "frame": "map",
+  "reference": "estimated washer front reference point; +X points outward",
+  "method": "componentwise median of 12 accepted observations; excludes arrival failures and duplicated aggregate goal",
+  "pose": [
+    -0.23523847634246076,
+    2.374447180463129,
+    0.25886738340216,
+    -1.7791760730792876
+  ],
+  "sample_count": 12,
+  "position_min": [
+    -0.27205502358733724,
+    2.367603029352324,
+    0.2362455340699322
+  ],
+  "position_max": [
+    -0.21773958129186577,
+    2.387174680484248,
+    0.28490122276292434
+  ],
+  "yaw_degrees_range": [
+    -103.76891929226635,
+    -99.36746526731473
+  ],
+  "goal_map": [
+    -0.42845969709815057,
+    1.4606520393895503,
+    1.3624165805105057
+  ],
+  "sources": [
+    "approach/observations.json#0",
+    "approach/observations.json#1",
+    "approach/async/frame_0000.json",
+    "approach/async/frame_0001.json",
+    "approach/async/frame_0002.json",
+    "approach/async/frame_0003.json",
+    "approach/async/frame_0004.json",
+    "approach/async/frame_0005.json",
+    "approach/async/frame_0006.json",
+    "approach/async/frame_0008.json",
+    "approach/async/frame_0011.json",
+    "approach/async/frame_0013.json"
+  ],
+  "map_directory": "maps/auto_explore/remap_20261013_1349/navigation",
+  "map_pgm_sha256": "830c238197c9c613f96a9313234d37064b540682d45e57ef6236d8596b1ce5f7"
+}

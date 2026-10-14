@@ -1,0 +1,17 @@
+# robot02 site overrides, loaded after controllers.yaml.
+# Washer pose is valid only for maps/auto_explore/remap_20261013_1349/navigation.
+# See washer_pose_evidence.json; map identity is documented, not checked at runtime.
+navigation_controller:
+  ros__parameters:
+    allow_mock_front_execution: true
+    washer_front_pose: [-0.23523847634246076, 2.374447180463129, 0.25886738340216, -1.7791760730792876]
+    front_extent: 0.434
+scene_perception:
+  ros__parameters:
+    rgb_topic: /camera/top/color/image_raw
+    depth_topic: /camera/top/aligned_depth_to_color/image_raw
+    info_topic: /camera/top/color/camera_info
+    # Relative to workspace, supplied by session or controllers.launch.py.
+    camera_extrinsics_file: src/robot_drivers/camera_driver/config/extrinsics_lidar_to_top_camera_optical_frame.yaml
+    # Temporary flow bring-up setting, not a depth accuracy guarantee.
+    depth_max_spread_m: 1.0

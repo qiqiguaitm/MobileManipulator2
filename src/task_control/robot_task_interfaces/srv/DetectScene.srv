@@ -1,0 +1,8 @@
+# Interpret the full natural-language description to detect matching objects.
+# Empty descriptions are invalid. Errors must not become empty scenes.
+string description
+---
+bool success
+string error
+robot_task_interfaces/ObjectTarget[] objects
+string evidence_dir
