@@ -22,8 +22,9 @@ from ament_index_python.packages import get_package_share_directory
 from ament_index_python.packages import PackageNotFoundError
 import os
 
-# 与 ROS1 navigation_3d.launch 一致：地图目录默认路径
-DEFAULT_MAP_DIR = '/home/didi/junbin.zhang/MobileManipulator2/maps/mapping_runs/20260920_155443/20260920_155444'
+# robot02：2026-10-13 自动建图导出的二维导航地图及配套三维定位地图。
+# 仍可通过 map_dir 启动参数选择其他地图。
+DEFAULT_MAP_DIR = '/home/didi/junbin.zhang/MobileManipulator2/maps/auto_explore/remap_20261013_1349/navigation'
 
 
 def generate_launch_description():

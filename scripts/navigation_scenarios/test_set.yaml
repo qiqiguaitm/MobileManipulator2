@@ -1,0 +1,33 @@
+# 测试集成员清单。只有 enabled: true 的场景属于正式测试集。
+# bag 保存在数据盘，不随代码提交；路径相对于 data_root。
+# 新录制的场景须经用户确认后启用，不按目录扫描自动入集。
+schema_version: 1
+data_host: robot02
+data_root: /data/junbin.zhang/navigation_scenarios
+
+scenes:
+  - id: bin_approach_20261015_01
+    name: 接近垃圾桶
+    enabled: true
+    inclusion_decision: accepted
+    included_on: "2026-10-15"
+    task_description: 接近垃圾桶
+    scene_dir: teleop_bin_20261015T022813_911433Z_trimmed
+    original_scene_dir: teleop_bin_20261015T022813_911433Z
+    capture_mode: teleoperation
+    duration_seconds: 28.39531684
+    map_config: maps/auto_explore/remap_20261013_1349/navigation/map.yaml
+    tags: [navigation, target_detection, static_scene, approximate_closed_loop]
+    baseline_result_dir: simulation_runs/bin_20261015_02
+    data_quality:
+      verification_status: passed_data_checks
+      scan_tf_coverage: 0.9788732394366197
+      known_issues:
+        - 末尾 6 帧激光没有对应时间的 TF。
+        - 轨迹最大采样间隔约 0.72 秒。
+        - 裁剪起点使用开始确认的接收时间，不是 UI 点击的精确时间。
+    evaluation_notes:
+      - 遥控轨迹及终点只用于评价，不作为导航输入目标。
+      - 目标位置由 RGB-D 检测生成；首轮基线使用千问、NavFn 和 TEB。
+      - 当前仅验证一次接近，不含机械臂抓取或完整巡检循环。
+      - 激光观测与运动模型是近似仿真，不能等同实机安全验证。

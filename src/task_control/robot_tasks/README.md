@@ -216,3 +216,11 @@ ROS_DOMAIN_ID=166 ROS_LOCALHOST_ONLY=1 OPENBLAS_NUM_THREADS=1 \
 配置分层及相机快照一致性。mock 成功不等于实机抓取成功。
 目前车头 0.5 m 停靠已通过规划预览，尚未完成该配置下的实机到达验收；
 CAN 暂停恢复已做隔离测试，尚未通过实机主动制造反馈中断来验收。
+
+## 巡检视觉模型
+
+默认使用千问 `qwen3-vl-plus`，读取 `~/.config/robot-object-approach/qwen.json`
+中的 `api_key`、`model`、`region`（beijing 或 singapore）；配置权限须为 600。
+可用 `DASHSCOPE_API_KEY`、`QWEN_MODEL` 覆盖。若需恢复 DeepSeek，
+在启动会话前设置 `ROBOT_TASKS_VLM_PROVIDER=deepseek`。切换代码后重启会话生效。
+识别框仍使用 0–1000 归一化坐标；截断、异常响应不会当成无目标。

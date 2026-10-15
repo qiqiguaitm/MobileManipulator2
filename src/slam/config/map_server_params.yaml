@@ -2,6 +2,6 @@
 map_server:
   ros__parameters:
     use_sim_time: false
-    yaml_filename: "/home/didi/workspace/MobileManipulator2/maps/sc_pgo/map.yaml"
+    yaml_filename: "/home/didi/junbin.zhang/MobileManipulator2/maps/auto_explore/remap_20261013_1349/navigation/map.yaml"
     frame_id: map
     topic_name: map

@@ -67,19 +67,34 @@ def decode(payload, width, height, allowed, max_objects=20):
 
 class Detector:
     def __init__(self, timeout=20.0):
-        path = Path.home() / ".config/robot-object-approach/deepseek.json"
+        self.provider = os.environ.get("ROBOT_TASKS_VLM_PROVIDER", "qwen")
+        if self.provider not in ("qwen", "deepseek"):
+            raise ValueError("Unsupported VLM provider")
+        path = Path.home() / (".config/robot-object-approach/" + self.provider + ".json")
         settings = {}
         if path.exists():
             s = path.stat()
             if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) & 0o077:
-                raise ValueError("DeepSeek config requires owner-only permissions")
+                raise ValueError("VLM config requires owner-only permissions")
             settings = json.loads(path.read_text())
-        self.key = os.environ.get("DEEPSEEK_API_KEY") or settings.get("api_key")
+        key_env = "DASHSCOPE_API_KEY" if self.provider == "qwen" else "DEEPSEEK_API_KEY"
+        model_env = "QWEN_MODEL" if self.provider == "qwen" else "DEEPSEEK_MODEL"
+        self.key = os.environ.get(key_env) or settings.get("api_key")
         if not self.key:
-            raise ValueError("Missing DeepSeek API key")
-        self.model = os.environ.get("DEEPSEEK_MODEL") or settings.get(
-            "model", "deepseek-flash"
+            raise ValueError("Missing " + self.provider + " API key")
+        self.model = os.environ.get(model_env) or settings.get(
+            "model", "qwen3-vl-plus" if self.provider == "qwen" else "deepseek-flash"
         )
+        self.endpoint = "https://api.deepseek.com/responses"
+        if self.provider == "qwen":
+            endpoints = {
+                "beijing": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                "singapore": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+            }
+            region = settings.get("region", "beijing")
+            if region not in endpoints:
+                raise ValueError("Unsupported Qwen region")
+            self.endpoint = endpoints[region]
         self.timeout = timeout
 
     def detect(self, image, description):
@@ -114,11 +129,21 @@ class Detector:
             max_output_tokens=1800,
             temperature=0,
         )
+        if self.provider == "qwen":
+            content = body["input"][0]["content"]
+            body = dict(
+                model=self.model,
+                messages=[dict(role="user", content=[
+                    dict(type="text", text=content[0]["text"]),
+                    dict(type="image_url", image_url=dict(url=content[1]["image_url"])),
+                ])],
+                max_tokens=1800, temperature=0, enable_thinking=False, stream=False,
+            )
         with requests.Session() as session:
             session.trust_env = False
             try:
                 r = session.post(
-                    "https://api.deepseek.com/responses",
+                    self.endpoint,
                     json=body,
                     headers={"Authorization": "Bearer " + self.key},
                     timeout=(5, self.timeout),
@@ -131,6 +156,17 @@ class Detector:
             raw = r.json()
         except ValueError:
             raise ValueError("VLM returned non-JSON response") from None
+        response_id = raw.get("id")
+        if self.provider == "qwen":
+            choices = raw.get("choices", [])
+            if len(choices) != 1 or choices[0].get("finish_reason") != "stop":
+                raise ValueError("Incomplete Qwen response")
+            text = choices[0].get("message", {}).get("content")
+            if not isinstance(text, str):
+                raise ValueError("Qwen returned no text")
+            raw = dict(status="completed", output=[dict(
+                type="message", content=[dict(type="output_text", text=text)]
+            )])
         return decode(raw, image.shape[1], image.shape[0], [description]), dict(
-            provider="deepseek", model=self.model, response_id=raw.get("id")
+            provider=self.provider, model=self.model, response_id=response_id
         )
