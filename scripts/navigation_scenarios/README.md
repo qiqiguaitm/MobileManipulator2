@@ -4,7 +4,7 @@
 
 ```bash
 cd /home/didi/junbin.zhang/MobileManipulator2
-bash scripts/navigation_scenarios/capture.sh first_scene --duration 20
+bash scripts/navigation_scenarios/capture.sh first_scene
 ```
 
 入口会检查地图文件和磁盘、检查/启用 500 kbit/s 的 can2，使用现有
@@ -12,7 +12,11 @@ bash scripts/navigation_scenarios/capture.sh first_scene --duration 20
 底盘轮速与融合里程计、地图和 Nav2。明确传入 2026-10-13 新地图目录。
 CAN 启用使用 `sudo -n`，系统未授权时明确失败，不保存密码。
 不会下发导航目标或运动指令；等待 `LOCALIZATION READY` 和 `READY` 后再遥控。
-`--duration` 从定位检查通过、正式建包时开始计算；Ctrl-C 提前结束。
+默认检查通过后输出 `AWAITING START` 并等待，不创建 bag。开始按钮确认后，
+向日志中的 `recorder_pid` 发送 `kill -USR1 <recorder_pid>`，等待录制 `READY` 后遥控。
+结束按钮发送 `kill -INT <recorder_pid>`，关闭并校验 bag；不需要裁剪。
+默认持续录制直到结束确认。可选 `--duration` 从正式建包开始计时；
+`--auto-start` 仅用于无需交互确认的自动测试。
 结束后停止本脚本启动的节点并自动离线验包，CAN 保持已启用状态。
 
 已有硬件进程时默认拒绝重复启动（包括其他 ROS 域）；先确认是本次使用的完整链路，
@@ -24,7 +28,8 @@ bash scripts/navigation_scenarios/capture.sh straight_stop --duration 60 --exist
 
 录制门槛：`/status` ScanMatchingStatus 收敛且内点比例 ≥ 0.80（同项目 RuntimeHealth），
 地图逐格匹配指定 map.yaml/PGM，scan/odom/TF 新鲜、scan 时间戳可变换到 map，
-连续正常 3 秒才创建 bag。等待默认最多 180 秒，失败不创建正式场景。
+连续正常 3 秒后允许开始录制。就绪检查默认最多 180 秒，失败不创建正式场景；
+等待人工开始确认不受此超时限制，就绪状态持续复查。
 期间若定位或数据检查持续失败超过 1 秒，停止录制并标记 incomplete。
 数值门槛不能排除错误地点匹配；开录前仍应在 RViz 确认位置和点云对齐。
 地图直接录入，不做离线建图；不运行闭环仿真或自主任务。
@@ -56,9 +61,9 @@ export CYCLONEDDS_URI=file:///home/didi/junbin.zhang/MobileManipulator2/log/rviz
 显式使用 `--odom-topic /odom`。`--goal X Y YAW` 指定地图坐标系中的评测目标（米、弧度），
 会写入 `/scenario/goal`；未指定时目标为空，不能把遥控终点直接视为任务目标。
 
-原始话题在 bag 内统一加 `/reference` 前缀：`/map`、`/scan`、`/tf`、`/tf_static`、
-所选里程计、`/cmd_vel`、`/goal_pose`、`/initialpose`、`/status`。不会把前缀话题发布到在线系统。
-扫描和 TF 保留原时间戳。`/reference/trajectory` 是约 20Hz 的 PoseStamped 流，
+录制保留原始话题名，不添加 `/reference` 前缀：`/map`、`/scan`、`/tf`、`/tf_static`、
+所选里程计、`/cmd_vel`、`/goal_pose`、`/initialpose`、`/status`。录制器不向在线系统发布消息。
+扫描和 TF 保留原时间戳。`/current_pose` 是约 20Hz 的 PoseStamped 流，
 由 map→base_link 最新公共 TF 时间提取，不积分 cmd_vel；同一 TF 时间不会重复写入。
 首个轨迹位姿另写为 `/scenario/start`。
 开录时补写就绪检查期间最近 2 秒 TF 和缓存的地图/全部静态变换，保留消息内部原时间戳，
@@ -66,7 +71,9 @@ export CYCLONEDDS_URI=file:///home/didi/junbin.zhang/MobileManipulator2/log/rviz
 
 地图和静态 TF 使用 reliable/transient-local 订阅，能够接收开始录制前已发布且仍由
 存活发布者缓存的数据；若现场发布者不提供这些 QoS，检查会失败，需检查发布链路。
-结果 bag 为 sqlite3，不依赖额外 MCAP 插件；保留各话题 QoS 元数据供以后回放使用。
+录制、裁剪和仿真输出统一为 MCAP，保留话题 QoS、消息定义与索引。
+依赖 ROS 插件 ros-humble-rosbag2-storage-mcap；缺失时明确报错，不回退到 SQLite。
+读取通过 bag_io.py 自动识别存储格式，兼容旧 SQLite bag。
 
 结束后检查：
 
@@ -87,7 +94,7 @@ cat data/navigation_scenarios/<name>_<UTC>/scenario.json
 从多角度观察；保存失败案例。地图外和未观测区域不视为可通行。
 验包会离线读取独立 TF Buffer，检查各扫描时刻 TF 覆盖率、消息数量、时间倒退，
 并逐格核对指定二维地图；输出 verification.json。不会向在线系统发布回放数据。
-该工具仅负责采集和数据检查；控制器闭环仿真、目标后补和导航评测器尚未实现。
+采集和验包工具不执行导航；离线闭环测试使用 prepare_test.py 和 test_navigation.py。
 
 ## 巡检导航任务录制
 
@@ -97,7 +104,7 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 管理相机/底盘/GC/NC。该模式为检测和接近，不能标记为实机抓取。
 
 在已有健康 session 中，低层 record.py 支持 `--extra-topic /话题`（可重复），
-按发现的实际消息类型录入 `/reference/话题`，指定话题无法发现会报错。
+按发现的实际消息类型、原话题名录入，指定话题无法发现会报错。
 `--task-description 'inspect_objects:垃圾桶;skip_grasp=true'` 只将意图写进
 `/scenario/task`，不执行任务。可录 `/gc/run_task/_action/feedback`、
 `/gc/run_task/_action/status`、`/nc/approach/_action/feedback`、`/plan`、`/local_plan`、
@@ -118,7 +125,7 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 回到 0 秒会重新打开 RViz，清除上一段图像和轨迹缓存。
 日志在 `~/.ros/navigation_bag_viewer/`。依赖 ROS 2 Humble、RViz2、PyQt5、PyYAML。
 
-裁剪：`python3 scripts/navigation_scenarios/trim.py <场景目录>` 按保存的确认接收时间
+历史数据修复（不属于新录制流程）：`python3 scripts/navigation_scenarios/trim.py <场景目录>` 按保存的确认接收时间
 保留正式区间，另存 `_trimmed`。不修改原 bag；补齐地图、静态 TF、相机标定及
 2 秒动态 TF 上下文。确认接收时间不是 UI 点击的精确时间，原始数据始终保留。
 
@@ -136,6 +143,9 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 
 ## 首版近似闭环测试
 
+依赖机器人工作区的 `robot_tasks.geometry` 和 `robot_tasks.vlm`，需先构建并 source
+对应工作区。当前检测类别仍固定为“垃圾桶”；话题命名支持通用物体，检测类别参数化尚未完成。
+
 `prepare_test.py <scene> <output>` 使用 bag 中同步 RGB-D、内参、原始 TF 和
 robot02 当前相机外参，通过真实千问检测与项目已有深度定位生成物体位置和候选停靠点。
 外参副本、检测图像和响应摘要保存在 output，不保存 API key。
@@ -148,8 +158,113 @@ local_costmap__local_costmap.yaml 和 global_costmap__global_costmap.yaml。
 行为树恢复或沿途重复检测。结果保存 result.json、trajectory.csv、result_bag 和节点日志。
 
 模型使用理想差速运动学、0.4 秒指令超时。静态场景近似观测来自原始 scan 经录制 TF
-转换的地图点，按当前仿真位姿匹配参考扫描，再投影到虚拟激光坐标；空射线保持未知。
+转换的地图点。仍按当前仿真位姿匹配参考扫描，但直接保留原始 ranges、角度和量程，
+不再生成 sim_scan 或做角度分桶。回放 TF 为 map → reference/base_link → reference/scan，
+使用录制时的完整底盘位姿和真实雷达外参，与仿真 map → odom → base_link 分离。
+/scan 只更新时间戳和 frame_id，配套变换写入 /tf。仿真结果不重复保存原始
+扫描和 TF；如需追溯原始时间戳及坐标系，读取原始场景 bag。
+局部和全局 costmap 的该扫描源均 marking=true、clearing=false；静态障碍标记可累积，
+不会将历史射线误用为仿真当前位置的自由空间证据。只修改本轮 test_params.yaml。
 不能生成新视角的遮挡信息，也不能代表动态障碍。距匹配参考位姿超过 0.5 米或
 朝向差超过 45 度时停止并标记观测近似失效；这些是首版工程限制，不是已验证安全边界。
 碰撞检查使用矩形足迹与地图占用栅格中心、匹配激光点，结果只表示该近似模型内的情况。
 轨迹误差按空间最近点计算，不能替代任务语义与终点朝向评价。
+
+## Foxglove 远程文件与时间轴
+
+`export_viewer_mcap.py <result_bag> <output.mcap>` 将已关闭的 MCAP 或旧 SQLite 仿真结果
+转换为带消息定义、分块索引的 MCAP，保留源消息字节和录制时间。额外生成
+缺少的 `/path`（每帧累积轨迹）、`/robot_box`，不再复制规划路径和目标。
+新录制和仿真结果已包含显示数据，无需此导出步骤。要求 ROS Humble 环境、
+`mcap`、`rosbags`；不支持缺少消息定义的自定义类型。
+
+机器人当前依赖安装在数据盘 `.viewer_deps`，不修改系统 ROS Python 环境：
+
+```bash
+source /opt/ros/humble/setup.bash
+export PYTHONPATH=/data/junbin.zhang/navigation_scenarios/.viewer_deps:$PYTHONPATH
+python3 scripts/navigation_scenarios/export_viewer_mcap.py \
+  /data/junbin.zhang/navigation_scenarios/simulation_runs/bin_20261015_03_reference_scan/result_bag \
+  /data/junbin.zhang/navigation_scenarios/remote_mcap/bin_20261015_03_reference_scan.mcap
+python3 scripts/navigation_scenarios/serve_mcap.py \
+  /data/junbin.zhang/navigation_scenarios/remote_mcap --bind 192.168.112.106 --port 8770
+```
+
+转换目标必须不存在，原 bag 不变。文件服务只开放指定目录下的 `.mcap`，拒绝子路径
+和符号链接，支持 HTTP Range、HEAD、OPTIONS 和 Foxglove 来源的 CORS。
+访问 `http://192.168.112.106:8770/` 选择文件进入 Foxglove Remote file 模式。
+此时底部时间轴直接暂停、播放、拖动，不使用 WebSocket 的服务调用按钮，也不需要
+机器人端 ros2 bag play。服务仅用于可访问该机器人 IP 的受信任局域网。
+浏览器端若要求 Foxglove 的本地网络访问权限，需由用户按浏览器提示允许。
+
+
+## MCAP 存储与旧数据迁移
+
+所有新录制的 `bag/`、仿真输出 `result_bag/` 内均为 `.mcap`，
+同时保留 ROS 标准 `metadata.yaml`。仿真直接读取 MCAP，不需要中间 SQLite 文件。
+测试集目录不变，清单无需因存储转换而改变场景 ID 或重新决定入集。
+
+机器人未提供免密 sudo，因此使用官方 ROS deb 的独立解包安装：
+`~/.local/opt/rosbag2_mcap` 指向数据盘的插件前缀。`bag_io.configure_storage()`
+自动加载该前缀，也支持 `NAVIGATION_MCAP_PREFIX` 指定其他位置。
+其他机器可正常安装 `ros-humble-rosbag2-storage-mcap`，无须独立前缀。
+独立前缀环境下直接使用 `ros2 bag play` 前，需将该路径加入 `AMENT_PREFIX_PATH`，
+并将其 `lib` 加入 `LD_LIBRARY_PATH`；本仓库查看器会自动配置子进程环境。
+
+`python3 scripts/navigation_scenarios/migrate_mcap.py <bag目录> ...`
+只处理已关闭且没有正在回放的 bag。转换完成后逐话题核对消息字节、时间戳、数量
+和 QoS，再将旧目录保留为 `bag_sqlite3_backup`（或 `result_bag_sqlite3_backup`），
+原目录切换为 MCAP。失败时不替换原始 bag；pending 目录用于排查，不视为成功数据。
+迁移只改变存储格式，不把原本失败/不完整的场景标记为合格。
+
+
+## 直接录入显示话题
+
+新录制和新仿真都写入 `/path`（截至当前帧的累积
+nav_msgs/Path）和 `/robot_box`（底盘轮廓 Marker）。只写入 bag，不向实机
+发布显示消息。box 与位姿使用相同时间戳，尺寸沿用导航足迹，显示高度不代表机械臂。
+参考轨迹直接用 `/reference/path`，规划路径用 `/plan`，导航终点用 `/goal_pose`，不再保存重复显示副本。
+因此新原生 MCAP 可直接供 Foxglove 使用，无需 export_viewer_mcap.py 生成显示副本；
+该导出工具只用于缺少这些话题的历史结果。裁剪时重新累计显示路径，避免预录轨迹混入。
+
+仿真结果还直接保存检测选中的物体位置：`/detected_target/position`
+（geometry_msgs/PointStamped，map 坐标系）和 `/detected_target`
+（紫色球形 Marker，Foxglove 可直接勾选）。位置来自 perception.json 的
+selected.xyz_map，不来自遥控终点。检测没有给出物体朝向，因此不伪造目标 Pose。
+每帧保存同一个检测位置以支持回放显示，不代表每帧重新检测。
+没有运行检测的原始遥控 bag 不含目标位置；仿真检测后将它写入结果 MCAP。
+
+结果 bag 命名统一：`/current_pose` 为当前位姿（逐帧保存），`/path` 为累积实际轨迹，
+`/cmd_vel` 为控制指令；`/plan` 为规划路径，`/goal_pose` 为导航终点。
+只有原始录制参考数据使用 `/reference/*`。新结果不使用 `/simulation/*` 或 `/replay/*`。
+
+仿真加载器 `scene_topics.py` 兼容无前缀录制和历史 `/reference/*` 录制。
+地图、扫描是算法输入，使用 `/map`、`/scan`；扫描的坐标系为 `reference/scan`，
+原始 TF 只用于重建观测位置，禁止直接混入仿真机器人 TF 树。
+参考回放采用 REFERENCE_TOPICS 白名单，原始位姿、规划、目标、控制指令、检测结果
+只发布到 `/reference/*`，不驱动算法。原始参考轨迹显示为 `/reference/path`。
+结果 writer 直接记录确定后的话题名，不进行重命名或复制显示副本。
+
+## 维护与提交
+
+| 文件 | 职责 |
+|---|---|
+| capture.sh / capture.py | 启动采集依赖、等待确认、录制后验包 |
+| record.py / readiness.py | 原名录制、定位和数据就绪检查 |
+| bag_io.py / scene_topics.py | MCAP 读写、输入名称兼容、参考话题白名单 |
+| display_messages.py | 轨迹、底盘方框、检测目标显示消息 |
+| prepare_test.py / test_navigation.py | RGB-D 检测准备、近似闭环测试 |
+| verify.py / test_set.yaml | 数据完整性检查、正式测试集成员 |
+| bag_viewer.py / trajectory_view.py / replay.rviz | RViz 回放与显示 |
+| serve_mcap.py / replay_web_control.py | 文件服务、旧 WebSocket 回放控制 |
+| trim.py / migrate_mcap.py / export_viewer_mcap.py | 历史数据修复和迁移 |
+
+提交代码和测试集清单，不提交 bag、output/、tmp/ 或生成的报告。以下检查不依赖 ROS：
+
+```bash
+python3 -m unittest discover -s scripts/navigation_scenarios/tests
+python3 -m compileall -q scripts/navigation_scenarios
+bash -n scripts/navigation_scenarios/capture.sh scripts/navigation_scenarios/view_bag.sh
+```
+
+完整仿真在隔离 ROS 域中运行，运行前确认该域没有其他测试。

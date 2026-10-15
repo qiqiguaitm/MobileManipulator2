@@ -62,7 +62,7 @@ Visualization Manager:
     Enabled: true
     Value: true
     Topic:
-      Value: /replay/path
+      Value: /path
       Depth: 10
       History Policy: Keep Last
       Reliability Policy: Best Effort
@@ -100,7 +100,7 @@ Visualization Manager:
     Enabled: true
     Value: true
     Topic:
-      Value: /replay/reference_path
+      Value: /reference/path
       Depth: 10
       History Policy: Keep Last
       Reliability Policy: Reliable
@@ -114,7 +114,7 @@ Visualization Manager:
     Enabled: true
     Value: true
     Topic:
-      Value: /replay/planned_path
+      Value: /plan
       Depth: 10
       History Policy: Keep Last
       Reliability Policy: Reliable
@@ -128,7 +128,7 @@ Visualization Manager:
     Enabled: true
     Value: true
     Topic:
-      Value: /replay/display_goal
+      Value: /goal_pose
       Depth: 10
       History Policy: Keep Last
       Reliability Policy: Reliable
@@ -142,7 +142,7 @@ Visualization Manager:
     Namespaces: {}
     Queue Size: 100
     Topic:
-      Value: /replay/robot_box
+      Value: /robot_box
       Depth: 1
       History Policy: Keep Last
       Reliability Policy: Reliable

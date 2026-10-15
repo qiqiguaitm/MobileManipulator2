@@ -2,6 +2,7 @@
 # bag 保存在数据盘，不随代码提交；路径相对于 data_root。
 # 新录制的场景须经用户确认后启用，不按目录扫描自动入集。
 schema_version: 1
+storage_format: mcap
 data_host: robot02
 data_root: /data/junbin.zhang/navigation_scenarios
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only ROS 2 scene recorder. Writes reference topics; publishes no commands."""
+"""Read-only ROS 2 scene recorder. Preserves source topic names; publishes no commands."""
 
 import argparse
+from bag_io import writer as mcap_writer, require_mcap
 from collections import Counter
 from datetime import datetime, timezone
 import json
@@ -17,42 +18,74 @@ import time
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("name", nargs="?", help="Scene name, e.g. straight_stop")
-    parser.add_argument("--check", action="store_true", help="Check live inputs without recording")
-    parser.add_argument("--duration", type=float, default=0, help="Seconds; 0 means until Ctrl-C")
-    parser.add_argument("--output", type=Path, default=Path("data/navigation_scenarios"))
+    parser.add_argument(
+        "--wait-for-start",
+        action="store_true",
+        help="After readiness, wait for SIGUSR1 before creating the bag; SIGINT stops recording",
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="Check live inputs without recording"
+    )
+    parser.add_argument(
+        "--duration", type=float, default=0, help="Seconds; 0 means until Ctrl-C"
+    )
+    parser.add_argument(
+        "--output", type=Path, default=Path("data/navigation_scenarios")
+    )
     parser.add_argument("--odom-topic", default="/odom/fused")
     parser.add_argument("--map-frame", default="map")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "YAW"))
     parser.add_argument("--description", default="")
-    parser.add_argument("--extra-topic", action="append", default=[], help="Additional discovered topic to record under /reference")
-    parser.add_argument("--task-description", default="", help="Record task intent (does not execute a task)")
+    parser.add_argument(
+        "--extra-topic",
+        action="append",
+        default=[],
+        help="Additional discovered topic to record unchanged",
+    )
+    parser.add_argument(
+        "--task-description",
+        default="",
+        help="Record task intent (does not execute a task)",
+    )
     parser.add_argument("--expected-map", type=Path)
     parser.add_argument("--status-topic", default="/status")
     parser.add_argument("--min-inlier", type=float, default=0.8)
     parser.add_argument("--ready-timeout", type=float, default=120)
     parser.add_argument("--ready-seconds", type=float, default=3)
     args = parser.parse_args()
-    if not args.check and (not args.name or not re.fullmatch(r"[a-zA-Z0-9_-]+", args.name)):
-        parser.error("A scene name containing only letters, digits, '_' or '-' is required")
+    if not args.check and (
+        not args.name or not re.fullmatch(r"[a-zA-Z0-9_-]+", args.name)
+    ):
+        parser.error(
+            "A scene name containing only letters, digits, '_' or '-' is required"
+        )
     if not math.isfinite(args.duration) or args.duration < 0:
         parser.error("--duration must be finite and non-negative")
     if args.goal and not all(math.isfinite(v) for v in args.goal):
         parser.error("--goal must contain finite numbers")
     if not 0 < args.min_inlier <= 1:
         parser.error("--min-inlier must be in (0, 1]")
-    if any(not math.isfinite(v) or v <= 0 for v in (args.ready_timeout, args.ready_seconds)):
+    if any(
+        not math.isfinite(v) or v <= 0 for v in (args.ready_timeout, args.ready_seconds)
+    ):
         parser.error("Readiness timeouts must be positive finite numbers")
     return args
 
 
 def main():
     args = arguments()
+    require_mcap()
     # Keep --help usable on machines without ROS.
     import rclpy
     import rosbag2_py
     import yaml
-    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+    from geometry_msgs.msg import (
+        PointStamped,
+        PoseStamped,
+        PoseWithCovarianceStamped,
+        Twist,
+    )
     from nav_msgs.msg import OccupancyGrid, Odometry
     from rclpy.duration import Duration
     from rclpy.node import Node
@@ -67,11 +100,15 @@ def main():
     from readiness import Readiness
     from rosidl_runtime_py.utilities import get_message
     from std_msgs.msg import String
+    from display_messages import RecordedDisplay
+    from nav_msgs.msg import Path as DisplayPath
+    from visualization_msgs.msg import Marker
 
     class Recorder(Node):
         def __init__(self):
             super().__init__("navigation_scene_recorder")
             self.counts = Counter()
+            self.display = RecordedDisplay(args.base_frame, path_topic="/path")
             self.tf = Buffer(cache_time=Duration(seconds=60))
             self.writer = None
             self.folder = None
@@ -88,8 +125,11 @@ def main():
             self.started_ros_ns = self.get_clock().now().nanoseconds
             self.started_utc = datetime.now(timezone.utc).isoformat()
             live = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
-            latched = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
-                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            latched = QoSProfile(
+                depth=100,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
             # Map/static TF must remain available to a late-joining recorder.
             self.specs = [
                 ("/map", OccupancyGrid, latched),
@@ -99,6 +139,10 @@ def main():
                 (args.odom_topic, Odometry, live),
                 ("/cmd_vel", Twist, live),
                 ("/goal_pose", PoseStamped, live),
+                ("/plan", DisplayPath, live),
+                ("/nc/navigation_goal", PoseStamped, live),
+                ("/detected_target", Marker, live),
+                ("/detected_target/position", PointStamped, live),
                 ("/initialpose", PoseWithCovarianceStamped, live),
                 (args.status_topic, ScanMatchingStatus, live),
             ]
@@ -111,30 +155,38 @@ def main():
                     if all(t in types for t in args.extra_topic):
                         break
                 known = {t for t, _, _ in self.specs}
+                known.update(("/current_pose", "/path", "/robot_box"))
                 for topic in args.extra_topic:
                     if topic in known:
                         continue
                     if topic not in types or len(types[topic]) != 1:
-                        raise RuntimeError('Missing or ambiguous extra topic: '+topic)
+                        raise RuntimeError("Missing or ambiguous extra topic: " + topic)
                     endpoints = self.get_publishers_info_by_topic(topic)
-                    qos = latched if endpoints and all(e.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL for e in endpoints) else live
+                    qos = (
+                        latched
+                        if endpoints
+                        and all(
+                            e.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+                            for e in endpoints
+                        )
+                        else live
+                    )
                     self.specs.append((topic, get_message(types[topic][0]), qos))
                     known.add(topic)
             if not args.check:
                 suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
                 self.folder = args.output / f"{args.name}_{suffix}"
                 self.folder.mkdir(parents=True, exist_ok=False)
-                self.writer = rosbag2_py.SequentialWriter()
-                self.writer.open(
-                    rosbag2_py.StorageOptions(uri=str(self.folder / "bag"), storage_id="sqlite3"),
-                    rosbag2_py.ConverterOptions("cdr", "cdr"))
+                self.writer = mcap_writer(self.folder / "bag")
                 for topic, msg_type, qos in self.specs:
-                    self.add_topic("/reference" + topic, msg_type, qos)
-                for topic in ("/reference/trajectory", "/scenario/start", "/scenario/goal"):
+                    self.add_topic(topic, msg_type, qos)
+                for topic in ("/current_pose", "/scenario/start", "/scenario/goal"):
                     self.add_topic(topic, PoseStamped, live)
+                self.add_topic("/path", DisplayPath, live)
+                self.add_topic("/robot_box", Marker, live)
                 if args.task_description:
-                    self.add_topic('/scenario/task', String, latched)
-                    self.write('/scenario/task', String(data=args.task_description))
+                    self.add_topic("/scenario/task", String, latched)
+                    self.write("/scenario/task", String(data=args.task_description))
                 if args.goal:
                     goal = PoseStamped()
                     goal.header.frame_id = args.map_frame
@@ -147,31 +199,50 @@ def main():
                 print(f"Recording into {self.folder.resolve()}", flush=True)
             self.subscriptions_kept = []
             for topic, msg_type, qos in self.specs:
-                self.subscriptions_kept.append(self.create_subscription(
-                    msg_type, topic, lambda msg, topic=topic: self.receive(topic, msg), qos))
+                self.subscriptions_kept.append(
+                    self.create_subscription(
+                        msg_type,
+                        topic,
+                        lambda msg, topic=topic: self.receive(topic, msg),
+                        qos,
+                    )
+                )
             self.create_timer(0.05, self.sample_pose)
 
         def add_topic(self, topic, msg_type, qos):
             package, namespace = msg_type.__module__.split(".")[:2]
             typename = package + "/" + namespace + "/" + msg_type.__name__
-            profile = [{"history": 1, "depth": qos.depth,
-                        "reliability": int(qos.reliability), "durability": int(qos.durability),
-                        "deadline": {"sec": 9223372036, "nsec": 854775807},
-                        "lifespan": {"sec": 9223372036, "nsec": 854775807},
-                        "liveliness": 1,
-                        "liveliness_lease_duration": {"sec": 9223372036, "nsec": 854775807},
-                        "avoid_ros_namespace_conventions": False}]
-            self.writer.create_topic(rosbag2_py.TopicMetadata(
-                name=topic, type=typename, serialization_format="cdr",
-                offered_qos_profiles=yaml.safe_dump(profile)))
+            profile = [
+                {
+                    "history": 1,
+                    "depth": qos.depth,
+                    "reliability": int(qos.reliability),
+                    "durability": int(qos.durability),
+                    "deadline": {"sec": 9223372036, "nsec": 854775807},
+                    "lifespan": {"sec": 9223372036, "nsec": 854775807},
+                    "liveliness": 1,
+                    "liveliness_lease_duration": {"sec": 9223372036, "nsec": 854775807},
+                    "avoid_ros_namespace_conventions": False,
+                }
+            ]
+            self.writer.create_topic(
+                rosbag2_py.TopicMetadata(
+                    name=topic,
+                    type=typename,
+                    serialization_format="cdr",
+                    offered_qos_profiles=yaml.safe_dump(profile),
+                )
+            )
 
         def write(self, topic, msg):
             if self.writer:
-                self.writer.write(topic, serialize_message(msg), self.get_clock().now().nanoseconds)
+                self.writer.write(
+                    topic, serialize_message(msg), self.get_clock().now().nanoseconds
+                )
             self.counts[topic] += 1
 
         def receive(self, topic, msg):
-            self.write("/reference" + topic, msg)
+            self.write(topic, msg)
             if topic in ("/tf", "/tf_static"):
                 for transform in msg.transforms:
                     if topic == "/tf_static":
@@ -185,13 +256,18 @@ def main():
         def sample_pose(self):
             if self.scan is not None and time.monotonic() - self.scan_received < 1.0:
                 try:
-                    self.tf.lookup_transform(args.map_frame, self.scan.header.frame_id,
-                                             Time.from_msg(self.scan.header.stamp))
+                    self.tf.lookup_transform(
+                        args.map_frame,
+                        self.scan.header.frame_id,
+                        Time.from_msg(self.scan.header.stamp),
+                    )
                     self.scan_tf_ok = True
                 except TransformException as exc:
                     self.last_tf_error = str(exc)
             try:
-                transform = self.tf.lookup_transform(args.map_frame, args.base_frame, Time())
+                transform = self.tf.lookup_transform(
+                    args.map_frame, args.base_frame, Time()
+                )
             except TransformException as exc:
                 self.last_tf_error = str(exc)
                 return
@@ -206,27 +282,47 @@ def main():
             pose.pose.position.z = transform.transform.translation.z
             pose.pose.orientation = transform.transform.rotation
             self.last_pose_stamp = stamp
-            self.write("/reference/trajectory", pose)
+            self.write("/current_pose", pose)
+            if self.writer:
+                for topic, message in self.display.sample(pose):
+                    self.write(topic, message)
             q = pose.pose.orientation
-            current = {"stamp_ns": stamp, "frame_id": args.map_frame,
-                       "x": pose.pose.position.x, "y": pose.pose.position.y,
-                       "yaw": math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))}
+            current = {
+                "stamp_ns": stamp,
+                "frame_id": args.map_frame,
+                "x": pose.pose.position.x,
+                "y": pose.pose.position.y,
+                "yaw": math.atan2(
+                    2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)
+                ),
+            }
             if self.first_pose is None:
                 self.first_pose = current
                 self.write("/scenario/start", pose)
             if self.last_pose:
-                self.distance += math.hypot(current["x"] - self.last_pose["x"],
-                                            current["y"] - self.last_pose["y"])
+                self.distance += math.hypot(
+                    current["x"] - self.last_pose["x"],
+                    current["y"] - self.last_pose["y"],
+                )
             self.last_pose = current
             if not self.ready and not self.missing():
                 self.ready = True
-                print("READY: map, scan, odometry, TF and trajectory received. You may teleoperate.", flush=True)
+                print(
+                    "READY: map, scan, odometry, TF and trajectory received. You may teleoperate.",
+                    flush=True,
+                )
 
         def missing(self):
-            required = ["/map", "/scan", "/tf", "/tf_static", args.odom_topic, "/trajectory"]
-            missing = ["/reference" + t for t in required if not self.counts["/reference" + t]]
-            missing += ["/reference" + t for t in args.extra_topic
-                        if not self.counts["/reference" + t]]
+            required = [
+                "/map",
+                "/scan",
+                "/tf",
+                "/tf_static",
+                args.odom_topic,
+                "/current_pose",
+            ]
+            missing = [t for t in required if not self.counts[t]]
+            missing += [t for t in args.extra_topic if not self.counts[t]]
             if not self.scan_tf_ok:
                 missing.append("map <- scan.frame at scan timestamp")
             return missing
@@ -236,41 +332,72 @@ def main():
                 return
             try:
                 revision = subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+                    ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+                ).strip()
             except (OSError, subprocess.CalledProcessError):
                 revision = None
             manifest = {
-                "schema_version": 1, "name": args.name, "description": args.description,
+                "schema_version": 2,
+                "name": args.name,
+                "description": args.description,
                 "task_description": args.task_description,
-                "status": status, "started_utc": self.started_utc,
-                "failure_reason": getattr(self, 'failure_reason', None),
+                "status": status,
+                "started_utc": self.started_utc,
+                "failure_reason": getattr(self, "failure_reason", None),
                 "started_ros_ns": self.started_ros_ns,
                 "elapsed_wall_seconds": time.monotonic() - self.started,
-                "ros_domain_id": os.environ.get("ROS_DOMAIN_ID"), "git_revision": revision,
-                "map_frame": args.map_frame, "base_frame": args.base_frame,
-                "localization_gate": {"topic": args.status_topic, "min_inlier": args.min_inlier,
-                                      "stable_seconds": args.ready_seconds},
+                "ros_domain_id": os.environ.get("ROS_DOMAIN_ID"),
+                "git_revision": revision,
+                "map_frame": args.map_frame,
+                "base_frame": args.base_frame,
+                "localization_gate": {
+                    "topic": args.status_topic,
+                    "min_inlier": args.min_inlier,
+                    "stable_seconds": args.ready_seconds,
+                },
                 "expected_map": str(args.expected_map) if args.expected_map else None,
-                "topic_mapping": {t: "/reference" + t for t, _, _ in self.specs},
+                "topic_mapping": {t: t for t, _, _ in self.specs},
                 "trajectory_source": "TF map->base_link, latest common timestamp; not cmd_vel integration",
-                "start": self.first_pose, "recorded_endpoint": self.last_pose,
-                "goal": {"frame_id": args.map_frame, "x": args.goal[0],
-                         "y": args.goal[1], "yaw": args.goal[2]} if args.goal else None,
+                "start": self.first_pose,
+                "recorded_endpoint": self.last_pose,
+                "goal": (
+                    {
+                        "frame_id": args.map_frame,
+                        "x": args.goal[0],
+                        "y": args.goal[1],
+                        "yaw": args.goal[2],
+                    }
+                    if args.goal
+                    else None
+                ),
                 "goal_note": "Explicit --goal is the benchmark target; endpoint is NOT an implicit goal.",
                 "estimated_travel_m": self.distance,
-                "message_counts": dict(self.counts), "missing": self.missing(),
+                "message_counts": dict(self.counts),
+                "missing": self.missing(),
                 "scan_tf_resolved_at_least_once": self.scan_tf_ok,
                 "last_tf_error": self.last_tf_error,
                 "clock_policy": "Original message stamps preserved; bag uses ROS receive time. No clock remapping.",
             }
-            (self.folder / "scenario.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            (self.folder / "scenario.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            )
 
     from rclpy.signals import SignalHandlerOptions
+
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     stopping = False
+    start_requested = not args.wait_for_start
+
+    def request_start(signum, frame):
+        nonlocal start_requested
+        start_requested = True
+
+    signal.signal(signal.SIGUSR1, request_start)
+
     def request_stop(signum, frame):
         nonlocal stopping
         stopping = True
+
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     gate = Readiness(args)
@@ -284,15 +411,33 @@ def main():
             problems = gate.problems()
             now = time.monotonic()
             ready_since = (ready_since or now) if not problems else None
-            if ready_since and now-ready_since >= args.ready_seconds:
-                print('LOCALIZATION READY: stable localization, expected map, fresh scan/odom and TF.', flush=True)
-                gate_passed = True
-                break
+            if ready_since and now - ready_since >= args.ready_seconds:
+                if not getattr(gate, "_announced_wait", False):
+                    print(
+                        "LOCALIZATION READY: stable localization, expected map, fresh scan/odom and TF.",
+                        flush=True,
+                    )
+                if args.check or start_requested:
+                    gate_passed = True
+                    break
+                if not getattr(gate, "_announced_wait", False):
+                    print(
+                        f"AWAITING START: recorder_pid={os.getpid()}; send SIGUSR1 to start. No bag created yet.",
+                        flush=True,
+                    )
+                    gate._announced_wait = True
+                # Remain subscribed and keep validating readiness while waiting.
+                deadline = now + args.ready_timeout
+                continue
             if now >= next_notice:
-                print('WAITING: '+('; '.join(problems) or 'confirming stable readiness'), flush=True)
-                next_notice = now+5
+                print(
+                    "WAITING: "
+                    + ("; ".join(problems) or "confirming stable readiness"),
+                    flush=True,
+                )
+                next_notice = now + 5
             if now >= deadline:
-                print('Readiness timeout. No bag created.', flush=True)
+                print("Readiness timeout. No bag created.", flush=True)
                 return 2
         if not rclpy.ok() or stopping:
             return 2
@@ -308,10 +453,12 @@ def main():
     node = Recorder()
     # Preserve pre-roll transforms so the first delayed scan can be reconstructed.
     # Header stamps remain original; these seed messages are written at bag start.
-    node.receive('/map', gate.data['map'])
-    node.receive('/tf_static', TFMessage(transforms=list(gate.static_transforms.values())))
+    node.receive("/map", gate.data["map"])
+    node.receive(
+        "/tf_static", TFMessage(transforms=list(gate.static_transforms.values()))
+    )
     for _, message in gate.tf_history:
-        node.receive('/tf', message)
+        node.receive("/tf", message)
     executor = SingleThreadedExecutor()
     executor.add_node(gate)
     executor.add_node(node)
@@ -320,21 +467,26 @@ def main():
     failed = False
     unhealthy_since = None
     try:
-        while rclpy.ok() and not stopping and time.monotonic() - node.started < duration:
+        while (
+            rclpy.ok() and not stopping and time.monotonic() - node.started < duration
+        ):
             executor.spin_once(timeout_sec=0.05)
             problems = gate.problems()
             now = time.monotonic()
             unhealthy_since = (unhealthy_since or now) if problems else None
-            if unhealthy_since and now-unhealthy_since > 1.0:
+            if unhealthy_since and now - unhealthy_since > 1.0:
                 failed = True
-                node.failure_reason = '; '.join(problems)
-                print('STOP: readiness lost: '+ '; '.join(problems), flush=True)
+                node.failure_reason = "; ".join(problems)
+                print("STOP: readiness lost: " + "; ".join(problems), flush=True)
                 break
             if time.monotonic() >= next_status:
-                print(f"scans={node.counts['/reference/scan']} poses={node.counts['/reference/trajectory']} "
-                      f"rgb={node.counts['/reference/camera/top/color/image_raw']} "
-                      f"depth={node.counts['/reference/camera/top/aligned_depth_to_color/image_raw']} "
-                      f"travel≈{node.distance:.2f}m missing={node.missing()}", flush=True)
+                print(
+                    f"scans={node.counts['/scan']} poses={node.counts['/current_pose']} "
+                    f"rgb={node.counts['/camera/top/color/image_raw']} "
+                    f"depth={node.counts['/camera/top/aligned_depth_to_color/image_raw']} "
+                    f"travel≈{node.distance:.2f}m missing={node.missing()}",
+                    flush=True,
+                )
                 next_status += 5
     except KeyboardInterrupt:
         pass
@@ -347,8 +499,18 @@ def main():
         node.save_manifest(status)
         # Humble writer finalizes metadata on destruction.
         node.writer = None
-        print(json.dumps({"status": status, "missing": missing,
-                          "counts": dict(node.counts), "travel_m": node.distance}, ensure_ascii=False), flush=True)
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "missing": missing,
+                    "counts": dict(node.counts),
+                    "travel_m": node.distance,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         node.destroy_node()
         executor.shutdown()
         gate.destroy_node()
