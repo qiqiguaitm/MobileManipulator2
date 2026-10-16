@@ -172,10 +172,10 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 ## 首版近似闭环测试
 
 依赖机器人工作区的 `robot_tasks.geometry` 和 `robot_tasks.vlm`，需先构建并 source
-对应工作区。当前检测类别仍固定为“垃圾桶”；话题命名支持通用物体，检测类别参数化尚未完成。
+对应工作区。使用 `--target` 指定本次检测的物体描述，例如 `--target 红色灭火器`。
 
-`prepare_test.py <scene> <output>` 使用 bag 中同步 RGB-D、内参、原始 TF 和
-robot02 当前相机外参，通过真实千问检测与项目已有深度定位生成物体位置和候选停靠点。
+`prepare_test.py <scene> <output> --target <物体描述>` 使用 bag 中同步 RGB-D、内参、原始 TF 和
+场景 capture_assets 中同名的相机外参（缺失时使用 robot02 当前配置），通过真实千问检测与项目已有深度定位生成物体位置和候选停靠点。
 外参副本、检测图像和响应摘要保存在 output，不保存 API key。
 
 `test_navigation.py <scene> <output>` 必须在 `ROS_DOMAIN_ID=149` 中运行。

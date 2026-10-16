@@ -23,6 +23,7 @@ def main():
     p.add_argument("scene", type=Path)
     p.add_argument("output", type=Path)
     p.add_argument("--workspace", type=Path, default=Path.cwd())
+    p.add_argument("--target", required=True, help="Object description for detection")
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=True)
     result = {"status": "failed", "stage": "load_snapshot", "scene": str(a.scene)}
@@ -72,6 +73,9 @@ def main():
             ).read_text()
         )["scene_perception"]["ros__parameters"]
         calib_path = a.workspace / profile["camera_extrinsics_file"]
+        recorded_calib = a.scene / "capture_assets" / calib_path.name
+        if recorded_calib.is_file():
+            calib_path = recorded_calib
         calib = yaml.safe_load(calib_path.read_text())
         (a.output / "camera_calibration.yaml").write_text(yaml.safe_dump(calib))
         tf = buffer.lookup_transform("map", "rslidar", Time.from_msg(im.header.stamp))
@@ -92,7 +96,8 @@ def main():
             calibration_source=str(calib_path),
         )
         started = time.monotonic()
-        detections, meta = Detector(timeout=20).detect(image, "垃圾桶")
+        result["target_description"] = a.target
+        detections, meta = Detector(timeout=20).detect(image, a.target)
         result.update(
             detections=detections,
             vlm=meta,
