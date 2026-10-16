@@ -31,6 +31,11 @@ def arguments():
         "--duration", type=float, default=0, help="Seconds; 0 means until Ctrl-C"
     )
     parser.add_argument("--output", type=Path, default=capture_output())
+    parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Skip post-recording visualization bag",
+    )
     parser.add_argument("--odom-topic", default="/odom/fused")
     parser.add_argument("--map-frame", default="map")
     parser.add_argument("--base-frame", default="base_link")
@@ -179,21 +184,12 @@ def main():
                 self.writer = mcap_writer(self.folder / "bag")
                 for topic, msg_type, qos in self.specs:
                     self.add_topic(topic, msg_type, qos)
-                for topic in ("/current_pose", "/scenario/start", "/scenario/goal"):
-                    self.add_topic(topic, PoseStamped, live)
+                self.add_topic("/current_pose", PoseStamped, live)
                 self.add_topic("/path", DisplayPath, live)
                 self.add_topic("/robot_box", Marker, live)
                 if args.task_description:
                     self.add_topic("/scenario/task", String, latched)
                     self.write("/scenario/task", String(data=args.task_description))
-                if args.goal:
-                    goal = PoseStamped()
-                    goal.header.frame_id = args.map_frame
-                    goal.header.stamp = self.get_clock().now().to_msg()
-                    goal.pose.position.x, goal.pose.position.y = args.goal[:2]
-                    goal.pose.orientation.z = math.sin(args.goal[2] / 2)
-                    goal.pose.orientation.w = math.cos(args.goal[2] / 2)
-                    self.write("/scenario/goal", goal)
                 self.save_manifest("recording")
                 print(f"Recording into {self.folder.resolve()}", flush=True)
             self.subscriptions_kept = []
@@ -297,7 +293,6 @@ def main():
             }
             if self.first_pose is None:
                 self.first_pose = current
-                self.write("/scenario/start", pose)
             if self.last_pose:
                 self.distance += math.hypot(
                     current["x"] - self.last_pose["x"],
@@ -515,6 +510,10 @@ def main():
         gate.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+    if not missing and not failed and not args.no_preview:
+        from preview import generate_preview_safe
+
+        generate_preview_safe(node.folder)
     return 2 if missing or failed else 0
 
 

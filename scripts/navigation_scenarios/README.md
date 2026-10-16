@@ -81,13 +81,13 @@ export CYCLONEDDS_URI=file:///home/didi/junbin.zhang/MobileManipulator2/log/rviz
 每次生成独立的 `data/navigation_scenarios/pending/<name>_<UTC>/`，包含 `bag/` 和
 `scenario.json`。加 `--duration 60` 可定时结束。定位使用 `/odom/fused`，没有融合里程计时
 显式使用 `--odom-topic /odom`。`--goal X Y YAW` 指定地图坐标系中的评测目标（米、弧度），
-会写入 `/scenario/goal`；未指定时目标为空，不能把遥控终点直接视为任务目标。
+仅保存到 scenario.json 的 goal 字段；未指定时目标为空，不能把遥控终点直接视为任务目标。
 
 录制保留原始话题名，不添加 `/reference` 前缀：`/map`、`/scan`、`/tf`、`/tf_static`、
 所选里程计、`/cmd_vel`、`/goal_pose`、`/initialpose`、`/status`。录制器不向在线系统发布消息。
 扫描和 TF 保留原时间戳。`/current_pose` 是约 20Hz 的 PoseStamped 流，
 由 map→base_link 最新公共 TF 时间提取，不积分 cmd_vel；同一 TF 时间不会重复写入。
-首个轨迹位姿另写为 `/scenario/start`。
+首个位姿保存到 scenario.json 的 start 字段，不另建起点话题。
 开录时补写就绪检查期间最近 2 秒 TF 和缓存的地图/全部静态变换，保留消息内部原时间戳，
 保证第一批带延迟的扫描可以查询变换；这些预备 TF 的 bag 接收时间为开录时刻。
 
@@ -279,7 +279,7 @@ selected.xyz_map，不来自遥控终点。检测没有给出物体朝向，因�
 `/cmd_vel` 为控制指令；`/plan` 为规划路径，`/goal_pose` 为导航终点。
 只有原始录制参考数据使用 `/reference/*`。新结果不使用 `/simulation/*` 或 `/replay/*`。
 
-仿真加载器 `scene_topics.py` 兼容无前缀录制和历史 `/reference/*` 录制。
+仿真加载器 `scene_topics.py` 只接受保留原话题名的输入 bag；发现 `/reference/*` 输入时明确报错，不自动去前缀。
 地图、扫描是算法输入，使用 `/map`、`/scan`；扫描的坐标系为 `reference/scan`，
 原始 TF 只用于重建观测位置，禁止直接混入仿真机器人 TF 树。
 参考回放采用 REFERENCE_TOPICS 白名单，原始位姿、规划、目标、控制指令、检测结果
@@ -288,12 +288,31 @@ selected.xyz_map，不来自遥控终点。检测没有给出物体朝向，因�
 
 ## 维护与提交
 
+### 录制后的轻量可视化文件
+
+正常录制结束后自动生成 `visualization_bag/`（MCAP）及 `visualization.json`。
+`bag/` 始终保留完整数据并用于仿真；可视化版不能替代仿真输入。
+每个相机保留开头、中间、结尾最多 3 帧 RGB，深度等同相机图像按消息时间戳
+匹配（最大差 50 ms），找不到匹配时不伪造或重复帧。其他话题完整保留，
+消息内容、时间戳、话题名和 QoS 不变。画面在采样点之间会保持或为空，不代表连续视频。
+生成失败不会覆盖原始录制；已有可视化目录不会被自动覆盖。
+
+已有场景可手动生成：
+
+```bash
+python3 scripts/navigation_scenarios/preview.py <场景目录> --samples 3
+```
+
+capture.py 在验包通过后生成；直接运行 record.py 时在正常关闭 bag 后生成，
+可用 `--no-preview` 跳过。生成期间不需要继续遥控。
+
 | 文件 | 职责 |
 |---|---|
 | capture.sh / capture.py | 启动采集依赖、等待确认、录制后验包 |
 | record.py / readiness.py | 原名录制、定位和数据就绪检查 |
-| bag_io.py / scene_topics.py | MCAP 读写、输入名称兼容、参考话题白名单 |
+| bag_io.py / scene_topics.py | MCAP 读写、输入名称检查、参考话题白名单 |
 | display_messages.py | 轨迹、底盘方框、检测目标显示消息 |
+| preview.py | 生成稀疏相机帧的轻量可视化 MCAP |
 | prepare_test.py / test_navigation.py | RGB-D 检测准备、近似闭环测试 |
 | verify.py / test_set.yaml | 数据完整性检查、正式测试集成员 |
 | bag_viewer.py / trajectory_view.py / replay.rviz | RViz 回放与显示 |

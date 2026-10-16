@@ -192,6 +192,7 @@ def main():
         cmd = [
             sys.executable,
             str(root / "scripts/navigation_scenarios/record.py"),
+            "--no-preview",
             args.name,
             "--duration",
             str(args.duration),
@@ -236,6 +237,10 @@ def main():
             str(map_dir / "map.yaml"),
         ]
     )
+    if result.returncode == 0 and recorder.returncode == 0:
+        from preview import generate_preview_safe
+
+        generate_preview_safe(scene)
     print("Scene:", scene, flush=True)
     print("Startup diagnostics:", folder, flush=True)
     return result.returncode or (0 if recorder.returncode == 0 else 2)

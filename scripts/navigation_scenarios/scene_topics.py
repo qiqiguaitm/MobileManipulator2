@@ -5,18 +5,13 @@ from bag_io import reader, messages
 
 def resolve_topics(names):
     names = set(names)
-    mapping = {}
-    for name in names:
-        canonical = (
-            name.removeprefix("/reference") if name.startswith("/reference/") else name
+    prefixed = sorted(name for name in names if name.startswith("/reference/"))
+    if prefixed:
+        raise ValueError(
+            "Simulation input must use original topic names without /reference/: "
+            + ", ".join(prefixed)
         )
-        if canonical in ("/trajectory", "/current_pose"):
-            canonical = "/current_pose"
-        candidates = [canonical, "/reference" + canonical]
-        if canonical == "/current_pose":
-            candidates += ["/trajectory", "/reference/trajectory"]
-        mapping[canonical] = next((n for n in candidates if n in names), name)
-    return mapping
+    return {name: name for name in names}
 
 
 class SceneInput:

@@ -62,7 +62,12 @@ def main():
     dst.mkdir()
     writer = mcap_writer(dst / "bag")
     for metadata in topics:
-        if metadata.name not in ("/replay/path", "/replay/robot_box"):
+        if metadata.name not in (
+            "/replay/path",
+            "/replay/robot_box",
+            "/scenario/start",
+            "/scenario/goal",
+        ):
             writer.create_topic(metadata)
     names = {t.name for t in topics}
     for name, kind in [
@@ -87,6 +92,7 @@ def main():
     for topic, raw, stamp in messages(bag, start=start, end=end):
         if topic in (
             "/scenario/start",
+            "/scenario/goal",
             "/reference/path",
             "/robot_box",
             "/replay/path",
@@ -96,8 +102,6 @@ def main():
         write(topic, raw, stamp)
         if topic == "/reference/trajectory":
             msg = deserialize_message(raw, PoseStamped)
-            if not poses:
-                write("/scenario/start", raw, stamp)
             poses.append(msg)
             for name, message in display.sample(msg):
                 write(name, serialize_message(message), stamp)
