@@ -160,14 +160,22 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 
 `scene_dir`、可选的 `original_scene_dir` 相对于 `data_root`；
 `map_config` 相对于代码库根目录。`scene_dir/bag` 是实际 rosbag 目录。
+共享清单现在以 `/data` 为根，同时收录 junbin.zhang 和 wangyibo 的场景；
+垃圾桶场景解析后的绝对路径不变，不移动同事数据，也不改变采集的默认目录。
 迁移数据盘时修改 data_root 即可，稳定的场景 id 不变。大文件 bag 不随代码提交。
 目前单次测试脚本仍接收显式场景路径；此清单维护成员关系，不会自动启动批量测试。
 清单不绑定某次仿真结果；结果保存在 simulation_runs 下，网页软链接独立维护。
 
+红色灭火器场景的共享位置、校验及复用命令见
+[灭火器场景说明](fire_extinguisher_20261016.md)。Git 仅提交清单、代码和说明，
+完整录像保留在 robot02 的 wangyibo 数据目录；其他机器需另行获取该场景目录。
+
 ## 首版近似闭环测试
 
 依赖机器人工作区的 `robot_tasks.geometry` 和 `robot_tasks.vlm`，需先构建并 source
-对应工作区。当前检测类别仍固定为“垃圾桶”；话题命名支持通用物体，检测类别参数化尚未完成。
+对应工作区。检测类别由 `prepare_test.py --target` 指定，默认仍为“垃圾桶”；
+灭火器场景需明确传 `--target 灭火器`，检测失败不回退其他类别。
+`--snapshot-offset` 选择录像中的时刻（秒，默认 0），优先使用录制时保存的相机外参。
 
 `prepare_test.py <scene> <output>` 使用 bag 中同步 RGB-D、内参、原始 TF 和
 robot02 当前相机外参，通过真实千问检测与项目已有深度定位生成物体位置和候选停靠点。

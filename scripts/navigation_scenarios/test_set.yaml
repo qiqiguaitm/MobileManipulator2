@@ -4,7 +4,9 @@
 schema_version: 1
 storage_format: mcap
 data_host: robot02
-data_root: /data/junbin.zhang/navigation_scenarios
+# Shared catalog root; individual owners keep their data in separate directories.
+# This does not change NAVIGATION_SCENARIOS_ROOT or the default capture directory.
+data_root: /data
 
 scenes:
   - id: bin_approach_20261015_01
@@ -13,7 +15,7 @@ scenes:
     inclusion_decision: accepted
     included_on: "2026-10-15"
     task_description: 接近垃圾桶
-    scene_dir: scenes/bin_approach_20261015_01
+    scene_dir: junbin.zhang/navigation_scenarios/scenes/bin_approach_20261015_01
     capture_mode: teleoperation
     duration_seconds: 28.39531684
     map_config: maps/auto_explore/remap_20261013_1349/navigation/map.yaml
@@ -30,3 +32,30 @@ scenes:
       - 目标位置由 RGB-D 检测生成；首轮基线使用千问、NavFn 和 TEB。
       - 当前仅验证一次接近，不含机械臂抓取或完整巡检循环。
       - 激光观测与运动模型是近似仿真，不能等同实机安全验证。
+
+  - id: fire_extinguisher_approach_20261016_01
+    name: 识别并接近红色灭火器
+    enabled: true
+    inclusion_decision: accepted
+    included_on: "2026-10-16"
+    task_description: 识别并接近红色灭火器
+    scene_dir: workspace/wangyibo/navigation_scenarios_mcap/scenes/fire_extinguisher_approach_20261016_01
+    original_scene_dir: workspace/wangyibo/navigation_scenarios/scene_02_20261016T030409_571423Z
+    capture_mode: teleoperation
+    duration_seconds: 34.54940867
+    map_config: maps/auto_explore/remap_20261013_1349/navigation/map.yaml
+    tags: [navigation, target_detection, static_scene, approximate_closed_loop, planning_failure_regression]
+    data_quality:
+      verification_status: passed_data_checks
+      scan_tf_coverage: 1.0
+      known_issues:
+        - 未指定人工评测目标 pose；遥控终点不作为算法输入目标。
+        - 旧录制转换为 MCAP，并显式恢复原话题名；消息字节、时间戳及 TF frame 保持不变。
+        - 既有仿真五个候选停靠点均规划失败，不能作为导航成功基准；地图与定位一致性仍待排查。
+    evaluation_notes:
+      - 用户于 2026-10-16 确认将 11:04 的 scene_02 灭火器录像正式收录。
+      - 人工遥控约 5.45 米；RGB、对齐深度及两路内参各 518 帧，轨迹 347 帧。
+      - 完整 bag/ 用于仿真；visualization_bag/ 每路相机仅三帧，只用于轻量预览。
+      - prepare_test.py 使用 --target 灭火器；不得回退到垃圾桶或空气净化器。
+      - 地图、相机外参和转换指纹位于场景目录；原始 SQLite 录像保留不动。
+      - 数据完整性通过不等于导航成功或实机安全验证；近似仿真不能生成新视角。
