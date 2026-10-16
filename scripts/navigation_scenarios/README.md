@@ -7,20 +7,20 @@
 ```text
 scenes/<场景ID>/                 正式场景，含 bag/ 和 scenario.json
 pending/<名称_时间>/              新录制，等待决定是否入集
-simulation_runs/<场景ID>/<运行>/  仿真结果
+simulation_runs/<运行ID>/report.html        本次运行的网页报告
+simulation_runs/<运行ID>/summary.json       本次运行的汇总指标
+simulation_runs/<运行ID>/test_set.yaml      本次选择的场景快照
+simulation_runs/<运行ID>/<场景ID>/          场景结果、metrics、日志和 result_bag
 playback/                        回放配置与日志
 archive/                         原始长录制、历史试录、验证数据和备份
-remote_mcap/                     当前网页查看入口
 ```
 
 新录制默认写入 pending/。可用 `NAVIGATION_SCENARIOS_ROOT` 指定数据根目录，
 或用 `--output` 明确指定录制父目录；没有机器人数据盘时，回退到代码库的
 `data/navigation_scenarios/pending/`。入集后移动目录并更新 test_set.yaml，不能仅凭目录自动入集。
-2026-10-16 按用户要求清理历史数据，目前仅保留正式 trimmed 场景与最新第 06 次仿真结果。
 pending/、playback/、archive/ 按需重新创建，不再保留旧试录和迁移备份。
-remote_mcap 中的当前文件使用相对软链接，不复制数据；移动目标后需更新软链接。
-当前网页入口为 `bin_approach_20261015_01.mcap`（正式场景）
-和 `bin_approach_20261015_01_20261015T113004Z.mcap`（最新结果）。
+网页服务直接以数据根目录为入口，不再维护 remote_mcap。首页依次展示运行报告、pending 场景、清单中 enabled 的场景。
+网页首页列出各次运行报告；报告提供原始可视化 bag 与本次仿真 bag 的 Foxglove 入口。
 
 在 robot02 上一键采集（需要机器人开机，遥控由人操作）：
 
@@ -157,8 +157,7 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 只有 `scenes` 下 `enabled: true` 的条目已正式收录；pending/deferred 条目不参与测试集。
 新录制完成后由用户选择是否加入，确认后在机器人运行：
 `python3 scripts/navigation_scenarios/enroll.py <场景ID>`。
-此命令将场景从 pending 移到 scenes、更新清单为 enabled/accepted，并自动创建
-`remote_mcap/<场景ID>_visualization.mcap` 相对软链接。重复执行不会重复登记。
+此命令将场景从 pending 移到 scenes、更新清单为 enabled/accepted，并自动出现在首页的测试集列表中。重复执行不会重复登记。
 入集前必须已有完整的 bag、visualization_bag 和 verification.json；缺少预览时先运行 preview.py。
 机器人清单更新后应同步回本地代码库，随代码提交。
 暂不加入不会删除 bag。试录数据和 `simulation_runs` 结果不会因出现在数据盘而自动入集。
@@ -167,9 +166,24 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 `map_config` 相对于代码库根目录。`scene_dir/bag` 是实际 rosbag 目录。
 迁移数据盘时修改 data_root 即可，稳定的场景 id 不变。大文件 bag 不随代码提交。
 目前单次测试脚本仍接收显式场景路径；此清单维护成员关系，不会自动启动批量测试。
-清单不绑定某次仿真结果；结果保存在 simulation_runs 下。输入预览软链接随入集自动创建。
+清单不绑定某次仿真结果；结果保存在 simulation_runs 下。原始预览直接通过场景目录访问。
 
 ## 首版近似闭环测试
+
+统一运行入口（先 source ROS/工作区并设置隔离域 149）：
+
+```bash
+export ROS_DOMAIN_ID=149
+python3 scripts/navigation_scenarios/run_test_set.py --params-dir <参数快照目录> --desc "TEB 基线回归"
+# 只运行一个或若干场景：追加一个或多个 --scene <场景ID>
+```
+
+参数目录必须含 controller_server.yaml，可包含两个 costmap 参数快照。
+场景的 detection_target 字段指定检测描述。无 --scene 时运行清单中全部 enabled 场景。
+每次创建 simulation_runs/run_<UTC时间>/；场景失败不会阻止其余场景执行。
+运行目录的 report.html 汇总指标，提供两个 Foxglove 链接；通过服务首页或输出的报告 URL 打开。
+默认 URL 使用 Mac 端 SSH 转发 http://127.0.0.1:18770，可用 --public-base-url 覆盖。
+以下 prepare_test/test_navigation 为底层步骤，日常单场景和多场景测试均使用统一入口。
 
 依赖机器人工作区的 `robot_tasks.geometry` 和 `robot_tasks.vlm`，需先构建并 source
 对应工作区。使用 `--target` 指定本次检测的物体描述，例如 `--target 红色灭火器`。
@@ -184,6 +198,13 @@ local_costmap__local_costmap.yaml 和 global_costmap__global_costmap.yaml。
 程序只启动 NavFn、TEB 和 lifecycle manager，不启动硬件驱动、定位、GC 或机械臂。
 在可达候选中选择最短路径，通过 FollowPath 执行一次接近；本版不运行整个巡检循环、
 行为树恢复或沿途重复检测。结果保存 result.json、trajectory.csv、result_bag 和节点日志。
+
+每次运行结束自动生成 `metrics.json`（机器可读）及 `metrics.md`（可读表格），
+包括成功状态、失败阶段、检测耗时、候选规划成功数、运动时间/距离、停靠误差、
+参考轨迹偏差、近似障碍间距和速度峰值。检测阶段失败也会生成报告。
+未评测或历史未记录的指标使用 null，不把规划失败计为零终点误差。
+历史结果可运行 `python3 scripts/navigation_scenarios/metrics.py <结果目录> ...` 补生成。
+参考轨迹是遥控对照，并非定位真值；最小间距不是实机安全保证。
 
 模型使用理想差速运动学、0.4 秒指令超时。静态场景近似观测来自原始 scan 经录制 TF
 转换的地图点。仍按当前仿真位姿匹配参考扫描，但直接保留原始 ranges、角度和量程，
@@ -211,19 +232,15 @@ local_costmap__local_costmap.yaml 和 global_costmap__global_costmap.yaml。
 ```bash
 source /opt/ros/humble/setup.bash
 export PYTHONPATH=/data/junbin.zhang/navigation_scenarios/.viewer_deps:$PYTHONPATH
-python3 scripts/navigation_scenarios/export_viewer_mcap.py \
-  /data/junbin.zhang/navigation_scenarios/simulation_runs/bin_approach_20261015_01/bin_20261015_03_reference_scan/result_bag \
-  /data/junbin.zhang/navigation_scenarios/remote_mcap/bin_20261015_03_reference_scan.mcap
 python3 scripts/navigation_scenarios/serve_mcap.py \
-  /data/junbin.zhang/navigation_scenarios/remote_mcap --bind 192.168.112.106 --port 8770 \
+  /data/junbin.zhang/navigation_scenarios --bind 192.168.112.106 --port 8770 \
   --allowed-root /data/junbin.zhang/navigation_scenarios \
   --public-base-url http://127.0.0.1:18770
 ```
 
-转换目标必须不存在，原 bag 不变。文件服务只展示指定目录顶层的 `.mcap` 入口，拒绝子路径。
-支持软链接，但真实目标必须是 `--allowed-root` 内的 `.mcap` 文件；未指定时只允许服务目录内的目标。
-失效、循环、越界链接不会展示或提供下载。支持 HTTP Range、HEAD、OPTIONS 和 Foxglove 来源的 CORS。
-访问 `http://192.168.112.106:8770/` 选择文件进入 Foxglove Remote file 模式。
+文件服务以数据根目录为入口，仅提供 scenes、pending 和 simulation_runs 内的允许文件类型。
+拒绝路径穿越、越界链接及隐藏依赖目录；支持 HTTP Range、HEAD、OPTIONS 和 Foxglove CORS。
+访问 `http://127.0.0.1:18770/` 查看报告、待入集场景与测试集。
 此时底部时间轴直接暂停、播放、拖动，不使用 WebSocket 的服务调用按钮，也不需要
 机器人端 ros2 bag play。服务仅用于可访问该机器人 IP 的受信任局域网。
 浏览器端若要求 Foxglove 的本地网络访问权限，需由用户按浏览器提示允许。
@@ -334,5 +351,7 @@ bash -n scripts/navigation_scenarios/capture.sh scripts/navigation_scenarios/vie
 
 完整仿真在隔离 ROS 域中运行，运行前确认该域没有其他测试。
 
-网页输入软链接命名为 `<场景目录名>.mcap`。仿真运行目录与输出软链接使用
-`<场景目录名>_<YYYYMMDDTHHMMSSZ>`，时间取该次运行的 UTC 时间，Z 表示 UTC。
+网页链接直接引用数据实际路径，不使用 remote_mcap。仿真目录使用 run_<UTC时间>，
+单场景与多场景均放在该运行目录下，首页从测试集清单读取正式成员。
+
+运行说明通过 `--desc` 填写，保存到运行根目录 run.json，首页和报告均展示。页面时间统一使用北京时间（Asia/Shanghai），目录 ID 保留 UTC 以保持稳定。

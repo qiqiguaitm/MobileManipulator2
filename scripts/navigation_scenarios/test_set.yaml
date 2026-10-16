@@ -9,10 +9,12 @@ data_root: /data/junbin.zhang/navigation_scenarios
 scenes:
   - id: bin_approach_20261015_01
     name: 接近垃圾桶
+    description: 人工遥控接近垃圾桶的室内场景，用于目标检测和导航控制回归；保留确认开始后的裁剪片段。
     enabled: true
     inclusion_decision: accepted
     included_on: "2026-10-15"
     task_description: 接近垃圾桶
+    detection_target: 垃圾桶
     scene_dir: scenes/bin_approach_20261015_01
     capture_mode: teleoperation
     duration_seconds: 28.39531684
@@ -33,10 +35,12 @@ scenes:
 
   - id: fire_extinguisher_approach_20261016_01
     name: 接近红色灭火器
+    description: 人工遥控接近红色灭火器，录制约 35 秒、行驶约 5.45 米；用于检测定位和候选停靠点规划测试。
     enabled: true
     inclusion_decision: accepted
     included_on: "2026-10-16"
     task_description: 识别并接近红色灭火器
+    detection_target: 红色灭火器
     scene_dir: scenes/fire_extinguisher_approach_20261016_01
     capture_mode: teleoperation
     duration_seconds: 34.54940867

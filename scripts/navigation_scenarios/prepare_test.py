@@ -16,6 +16,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from robot_tasks.geometry import rotation, depth_position, inspection_goals
 from robot_tasks.vlm import Detector
+from metrics import write_metrics
 
 
 def main():
@@ -154,6 +155,8 @@ def main():
             json.dumps(result, ensure_ascii=False, indent=2) + "\n"
         )
         print(json.dumps(result, ensure_ascii=False))
+        if result["status"] != "prepared":
+            write_metrics(a.output)
         rclpy.shutdown()
     return 0 if result["status"] == "prepared" else 2
 

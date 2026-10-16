@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enroll a user-approved capture and publish its visualization soft link."""
+"""Enroll a user-approved capture for automatic display in the catalog."""
 import argparse
 from datetime import date
 import json
@@ -36,13 +36,6 @@ def enroll(scene_id, manifest):
                 raise ValueError(f"Invalid bag file: {path}")
     if len(files) != 1:
         raise ValueError("Visualization bag must contain one MCAP file")
-    relative_file = Path("visualization_bag") / files[0]
-    link = root / "remote_mcap" / f"{scene_id}_visualization.mcap"
-    if link.exists() or link.is_symlink():
-        if not link.is_symlink() or link.resolve() not in (
-            (source / relative_file).resolve(), (target / relative_file).resolve()
-        ):
-            raise ValueError(f"Refusing to replace unrelated file: {link}")
     entries = config.setdefault("scenes", [])
     matches = [entry for entry in entries if entry["id"] == scene_id]
     if len(matches) > 1:
@@ -66,14 +59,10 @@ def enroll(scene_id, manifest):
     target.parent.mkdir(parents=True, exist_ok=True)
     if source != target:
         source.rename(target)
-    link.parent.mkdir(parents=True, exist_ok=True)
-    if link.is_symlink():
-        link.unlink()
-    link.symlink_to(os.path.relpath(target / relative_file, link.parent))
     temp = manifest.with_suffix(".yaml.pending")
     temp.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
     temp.replace(manifest)
-    return target, link
+    return (target,)
 
 
 if __name__ == "__main__":

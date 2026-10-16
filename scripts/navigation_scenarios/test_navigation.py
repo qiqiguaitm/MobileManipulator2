@@ -23,6 +23,7 @@ from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformBroadcaster, StaticTransformBroadcaster
 from nav2_msgs.action import ComputePathToPose, FollowPath
 from robot_tasks.geometry import rotation, wrap
+from metrics import write_metrics
 
 
 def xytheta(p):
@@ -334,6 +335,8 @@ def main():
     p.add_argument("output", type=FilePath)
     p.add_argument("--workspace", type=FilePath, default=FilePath.cwd())
     a = p.parse_args()
+    run_started = time.monotonic()
+    stage = "startup"
     if os.environ.get("ROS_DOMAIN_ID") != "149":
         raise SystemExit("Test requires isolated ROS_DOMAIN_ID=149")
     out = a.output
@@ -464,6 +467,8 @@ def main():
         for _ in range(100):
             rclpy.spin_once(node, timeout_sec=0.02)
         choices = []
+        stage = "planning"
+        planning_started = time.monotonic()
         summary["candidates"] = []
         for candidate in perception["candidates"]:
             req = ComputePathToPose.Goal()
@@ -496,6 +501,7 @@ def main():
                     for c, b in zip(path.poses, path.poses[1:])
                 )
                 choices.append((length, candidate, path))
+        summary["planning_seconds"] = time.monotonic() - planning_started
         if not choices:
             raise RuntimeError("No reachable stopping pose")
         length, goal, path = min(choices, key=lambda x: x[0])
@@ -507,6 +513,8 @@ def main():
         req.controller_id = "FollowPath"
         req.goal_checker_id = "goal_checker"
         node.active = True
+        stage = "control"
+        summary["navigation_started"] = True
         handle = wait(controller.send_goal_async(req), 5)
         if not handle.accepted:
             raise RuntimeError("Controller rejected path")
@@ -550,6 +558,7 @@ def main():
         )
     except Exception as e:
         summary["error"] = str(e)
+        summary["failure_stage"] = stage
     finally:
         if node:
             node.active = False
@@ -596,12 +605,16 @@ def main():
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+        summary["simulation_wall_seconds"] = time.monotonic() - run_started
+        if summary["status"] != "navigation_succeeded":
+            summary.setdefault("failure_stage", stage)
         (out / "result.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
         )
         print(json.dumps(summary, ensure_ascii=False), flush=True)
+        metrics = write_metrics(out)
         rclpy.shutdown()
-    return 0 if summary["status"] == "navigation_succeeded" else 2
+    return 0 if metrics["simulation_status"] == "completed" else 2
 
 
 if __name__ == "__main__":

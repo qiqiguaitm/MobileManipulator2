@@ -18,8 +18,11 @@
   `reference/*` 坐标系，与仿真机器人 TF 分开；结果录制器直接按当前话题名保存。
   机器人上优先存入 `/data/junbin.zhang/navigation_scenarios`，避免写满系统盘。
   新录制进入 `pending/`，确认入集后移动到 `scenes/<场景ID>/` 并更新清单。
-  仿真输出放入 `simulation_runs/<场景ID>/`，回放配置放入 `playback/`；
-  历史试录、迁移备份与临时验证放入 `archive/`，网页入口 `remote_mcap/` 只保留当前查看文件。
+  单场景或多场景仿真统一通过 scripts/navigation_scenarios/run_test_set.py 运行。
+  每次输出放入 `simulation_runs/<运行ID>/<场景ID>/`；运行根目录保存 report.html、summary.json
+  和测试集快照。网页报告必须包含每个场景的 metrics、原始 viz bag 和仿真 bag 的 Foxglove 链接。
+  回放配置放入 `playback/`；
+  历史试录、迁移备份与临时验证放入 `archive/`，网页服务直接读取数据根目录，不创建 remote_mcap 软链接。
 - 正常采集不经过预录裁剪：检查通过后弹出开始选项，收到确认后向等待中的 recorder
   发送 SIGUSR1；用户结束后发送 SIGINT，正常关闭 MCAP。默认不按固定时长自动结束。
   开录时补齐地图、静态 TF、标定与必要动态 TF 上下文，不累计开始前的行驶轨迹。
@@ -36,7 +39,7 @@
   的条目已入集。未确认条目保持 `enabled: false`、`inclusion_decision: pending`；
   确认加入后设为 true/accepted，暂不加入设为 false/deferred。
   用户确认入集后，统一运行 scripts/navigation_scenarios/enroll.py <场景ID>：
-  将 pending 中的场景移动到 scenes、更新清单，并自动在 remote_mcap 创建可视化 bag 的相对软链接。
+  将 pending 中的场景移动到 scenes、更新清单；首页自动显示新入集场景及原始 viz bag 入口。
   若缺少可视化 bag，先生成再入集；重复执行不得重复登记或覆盖无关文件。
   单纯编辑清单不删除数据；试录目录和 simulation_runs 输出不得自动当作测试场景。
 - 回放和仿真必须使用独立 ROS 域，禁止向实机域 144 回放运动指令、导航目标或任务 action。

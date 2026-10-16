@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""Serve only exported MCAPs with Range/CORS support for Foxglove remote files."""
+"""Serve the logsim catalog, reports, and dataset files with Range/CORS."""
 import argparse
-import html
+import mimetypes
+from catalog import catalog, resolve_artifact
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlsplit
-
-
-def resolve_mcap(root, allowed_root, name):
-    """Resolve a top-level entry, including links confined to the allowed tree."""
-    if not name or "/" in name or "\\" in name or Path(name).suffix != ".mcap":
-        return None
-    try:
-        target = (root / name).resolve(strict=True)
-        target.relative_to(allowed_root)
-        if target.suffix == ".mcap" and target.is_file():
-            return target
-    except (OSError, RuntimeError, ValueError):
-        pass
-    return None
+from urllib.parse import unquote, urlsplit
 
 
 def main():
@@ -36,6 +23,7 @@ def main():
         "--public-base-url",
         help="Browser-facing file URL, e.g. http://127.0.0.1:18770 through SSH forwarding",
     )
+    parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("test_set.yaml"))
     args = parser.parse_args()
     public_base_url = args.public_base_url or f"http://{args.bind}:{args.port}"
     parsed = urlsplit(public_base_url)
@@ -83,23 +71,7 @@ def main():
         def serve(self, body):
             name = unquote(urlsplit(self.path).path).lstrip("/")
             if not name:
-                links = []
-                for path in sorted(root.glob("*.mcap")):
-                    if resolve_mcap(root, allowed_root, path.name) is None:
-                        continue
-                    url = f"{public_base_url.rstrip('/')}/{quote(path.name)}"
-                    viewer = (
-                        "https://app.foxglove.dev/~/view?ds=remote-file&ds.url="
-                        + quote(url, safe="")
-                    )
-                    links.append(
-                        f'<li><a href="{html.escape(viewer)}">{html.escape(path.name)}</a></li>'
-                    )
-                data = (
-                    '<!doctype html><meta charset="utf-8"><title>仿真结果</title><h1>Foxglove 远程回放</h1><p>选择结果，在 Foxglove 中使用时间轴暂停和拖动。</p><ul>'
-                    + "".join(links)
-                    + "</ul>"
-                ).encode()
+                data = catalog(root, args.manifest, public_base_url).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -107,7 +79,7 @@ def main():
                 if body:
                     self.wfile.write(data)
                 return
-            path = resolve_mcap(root, allowed_root, name)
+            path = resolve_artifact(root, name)
             if path is None:
                 self.send_error(404)
                 return
@@ -139,7 +111,15 @@ def main():
                     self.end_headers()
                     return
             self.send_response(206 if partial else 200)
-            self.send_header("Content-Type", "application/octet-stream")
+            content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            if path.suffix in (".log", ".yaml", ".md", ".csv"):
+                content_type = "text/plain"
+            if path.suffix in (".html", ".json", ".md", ".yaml", ".log", ".csv"):
+                content_type += "; charset=utf-8"
+            self.send_header("Content-Type", content_type)
+            if path.suffix == ".log":
+                self.send_header("Content-Disposition", "inline")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(end - start + 1))
             self.send_header("ETag", etag)
             if partial:
