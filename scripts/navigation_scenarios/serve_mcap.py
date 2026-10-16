@@ -13,7 +13,22 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument(
+        "--public-base-url",
+        help="Browser-facing file URL, e.g. http://127.0.0.1:18770 through SSH forwarding",
+    )
     args = parser.parse_args()
+    public_base_url = args.public_base_url or f"http://{args.bind}:{args.port}"
+    parsed = urlsplit(public_base_url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.query
+        or parsed.fragment
+    ):
+        parser.error(
+            "--public-base-url must be an HTTP(S) base URL without query or fragment"
+        )
     root = args.directory.resolve(strict=True)
 
     class Handler(BaseHTTPRequestHandler):
@@ -50,7 +65,7 @@ def main():
                 for path in sorted(root.glob("*.mcap")):
                     if path.is_symlink():
                         continue
-                    url = f"http://{args.bind}:{args.port}/{quote(path.name)}"
+                    url = f"{public_base_url.rstrip('/')}/{quote(path.name)}"
                     viewer = (
                         "https://app.foxglove.dev/~/view?ds=remote-file&ds.url="
                         + quote(url, safe="")

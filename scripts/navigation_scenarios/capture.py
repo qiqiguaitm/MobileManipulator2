@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Start a capture stack, gate on localization, record, then verify. No driving commands."""
 import argparse
+from data_paths import capture_output
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -58,6 +59,7 @@ def main():
     parser.add_argument("--ready-timeout", type=float, default=180)
     parser.add_argument("--goal", type=float, nargs=3, metavar=("X", "Y", "YAW"))
     parser.add_argument("--description", default="")
+    parser.add_argument("--output", type=Path, default=capture_output())
     args = parser.parse_args()
     import math
 
@@ -146,7 +148,7 @@ def main():
         args.name + "_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     )
     folder.mkdir()
-    output = root / "data/navigation_scenarios"
+    output = args.output.expanduser().resolve()
     before = set(output.glob(args.name + "_*")) if output.exists() else set()
     launch = None
     recorder = None

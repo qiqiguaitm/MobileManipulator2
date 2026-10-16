@@ -17,6 +17,9 @@
   `/map`、`/scan`，原始参考位姿/规划/指令回放到 `/reference/*`。原始雷达 TF 使用
   `reference/*` 坐标系，与仿真机器人 TF 分开；结果录制器直接按当前话题名保存。
   机器人上优先存入 `/data/junbin.zhang/navigation_scenarios`，避免写满系统盘。
+  新录制进入 `pending/`，确认入集后移动到 `scenes/<场景ID>/` 并更新清单。
+  仿真输出放入 `simulation_runs/<场景ID>/`，回放配置放入 `playback/`；
+  历史试录、迁移备份与临时验证放入 `archive/`，网页入口 `remote_mcap/` 只保留当前查看文件。
 - 正常采集不经过预录裁剪：检查通过后弹出开始选项，收到确认后向等待中的 recorder
   发送 SIGUSR1；用户结束后发送 SIGINT，正常关闭 MCAP。默认不按固定时长自动结束。
   开录时补齐地图、静态 TF、标定与必要动态 TF 上下文，不累计开始前的行驶轨迹。

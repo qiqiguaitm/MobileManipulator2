@@ -2,6 +2,7 @@
 """Read-only ROS 2 scene recorder. Preserves source topic names; publishes no commands."""
 
 import argparse
+from data_paths import capture_output
 from bag_io import writer as mcap_writer, require_mcap
 from collections import Counter
 from datetime import datetime, timezone
@@ -29,9 +30,7 @@ def arguments():
     parser.add_argument(
         "--duration", type=float, default=0, help="Seconds; 0 means until Ctrl-C"
     )
-    parser.add_argument(
-        "--output", type=Path, default=Path("data/navigation_scenarios")
-    )
+    parser.add_argument("--output", type=Path, default=capture_output())
     parser.add_argument("--odom-topic", default="/odom/fused")
     parser.add_argument("--map-frame", default="map")
     parser.add_argument("--base-frame", default="base_link")

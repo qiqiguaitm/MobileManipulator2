@@ -13,13 +13,13 @@ scenes:
     inclusion_decision: accepted
     included_on: "2026-10-15"
     task_description: 接近垃圾桶
-    scene_dir: teleop_bin_20261015T022813_911433Z_trimmed
-    original_scene_dir: teleop_bin_20261015T022813_911433Z
+    scene_dir: scenes/bin_approach_20261015_01
+    original_scene_dir: archive/originals/teleop_bin_20261015T022813_911433Z
     capture_mode: teleoperation
     duration_seconds: 28.39531684
     map_config: maps/auto_explore/remap_20261013_1349/navigation/map.yaml
     tags: [navigation, target_detection, static_scene, approximate_closed_loop]
-    baseline_result_dir: simulation_runs/bin_20261015_02
+    baseline_result_dir: simulation_runs/bin_approach_20261015_01/bin_20261015_02
     data_quality:
       verification_status: passed_data_checks
       scan_tf_coverage: 0.9788732394366197

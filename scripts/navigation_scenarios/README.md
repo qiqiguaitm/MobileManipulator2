@@ -1,5 +1,24 @@
 # 导航场景采集
 
+## 数据目录
+
+机器人数据根目录为 `/data/junbin.zhang/navigation_scenarios`：
+
+```text
+scenes/<场景ID>/                 正式场景，含 bag/ 和 scenario.json
+pending/<名称_时间>/              新录制，等待决定是否入集
+simulation_runs/<场景ID>/<运行>/  仿真结果
+playback/                        回放配置与日志
+archive/                         原始长录制、历史试录、验证数据和备份
+remote_mcap/                     当前网页查看入口
+```
+
+新录制默认写入 pending/。可用 `NAVIGATION_SCENARIOS_ROOT` 指定数据根目录，
+或用 `--output` 明确指定录制父目录；没有机器人数据盘时，回退到代码库的
+`data/navigation_scenarios/pending/`。入集后移动目录并更新 test_set.yaml，不能仅凭目录自动入集。
+2026-10-16 的归档移动记录保存在数据根目录 `archive/organization_20261016.json`。
+remote_mcap 中的当前文件使用硬链接，移动原目录不影响现有网页链接。
+
 在 robot02 上一键采集（需要机器人开机，遥控由人操作）：
 
 ```bash
@@ -56,7 +75,7 @@ export CYCLONEDDS_URI=file:///home/didi/junbin.zhang/MobileManipulator2/log/rviz
   --description '绕过静态障碍物或通过直角转弯'
 ```
 
-每次生成独立的 `data/navigation_scenarios/<name>_<UTC>/`，包含 `bag/` 和
+每次生成独立的 `data/navigation_scenarios/pending/<name>_<UTC>/`，包含 `bag/` 和
 `scenario.json`。加 `--duration 60` 可定时结束。定位使用 `/odom/fused`，没有融合里程计时
 显式使用 `--odom-topic /odom`。`--goal X Y YAW` 指定地图坐标系中的评测目标（米、弧度），
 会写入 `/scenario/goal`；未指定时目标为空，不能把遥控终点直接视为任务目标。
@@ -78,9 +97,9 @@ export CYCLONEDDS_URI=file:///home/didi/junbin.zhang/MobileManipulator2/log/rviz
 结束后检查：
 
 ```bash
-ros2 bag info data/navigation_scenarios/<name>_<UTC>/bag
-cat data/navigation_scenarios/<name>_<UTC>/scenario.json
-/usr/bin/python3 scripts/navigation_scenarios/verify.py data/navigation_scenarios/<name>_<UTC> \
+ros2 bag info data/navigation_scenarios/pending/<name>_<UTC>/bag
+cat data/navigation_scenarios/pending/<name>_<UTC>/scenario.json
+/usr/bin/python3 scripts/navigation_scenarios/verify.py data/navigation_scenarios/pending/<name>_<UTC> \
   --expected-map maps/auto_explore/remap_20261013_1349/navigation/map.yaml
 ```
 
@@ -184,7 +203,7 @@ local_costmap__local_costmap.yaml 和 global_costmap__global_costmap.yaml。
 source /opt/ros/humble/setup.bash
 export PYTHONPATH=/data/junbin.zhang/navigation_scenarios/.viewer_deps:$PYTHONPATH
 python3 scripts/navigation_scenarios/export_viewer_mcap.py \
-  /data/junbin.zhang/navigation_scenarios/simulation_runs/bin_20261015_03_reference_scan/result_bag \
+  /data/junbin.zhang/navigation_scenarios/simulation_runs/bin_approach_20261015_01/bin_20261015_03_reference_scan/result_bag \
   /data/junbin.zhang/navigation_scenarios/remote_mcap/bin_20261015_03_reference_scan.mcap
 python3 scripts/navigation_scenarios/serve_mcap.py \
   /data/junbin.zhang/navigation_scenarios/remote_mcap --bind 192.168.112.106 --port 8770
@@ -196,6 +215,21 @@ python3 scripts/navigation_scenarios/serve_mcap.py \
 此时底部时间轴直接暂停、播放、拖动，不使用 WebSocket 的服务调用按钮，也不需要
 机器人端 ros2 bag play。服务仅用于可访问该机器人 IP 的受信任局域网。
 浏览器端若要求 Foxglove 的本地网络访问权限，需由用户按浏览器提示允许。
+
+### Mac 浏览器访问机器人文件
+
+HTTPS Foxglove 直接请求机器人 HTTP 地址可能被 Mixed Content 拦截。
+在 Mac 建立 SSH 转发，数据仍保存在机器人上：
+
+```bash
+ssh -fNT -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 -L 127.0.0.1:18770:192.168.112.106:8770 robot02
+```
+
+转发已运行时不重复执行。Mac 重启或隧道退出后重新运行。
+机器人文件服务启动时加 `--public-base-url http://127.0.0.1:18770`，
+使文件列表生成的 Foxglove 链接也使用转发地址，不再指向机器人 HTTP IP。
+在 Mac 打开 `http://127.0.0.1:18770/` 选择文件；若 Chrome 请求本地网络权限，允许此站点访问。
 
 
 ## MCAP 存储与旧数据迁移
