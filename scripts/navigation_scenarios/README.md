@@ -16,8 +16,11 @@ remote_mcap/                     当前网页查看入口
 新录制默认写入 pending/。可用 `NAVIGATION_SCENARIOS_ROOT` 指定数据根目录，
 或用 `--output` 明确指定录制父目录；没有机器人数据盘时，回退到代码库的
 `data/navigation_scenarios/pending/`。入集后移动目录并更新 test_set.yaml，不能仅凭目录自动入集。
-2026-10-16 的归档移动记录保存在数据根目录 `archive/organization_20261016.json`。
-remote_mcap 中的当前文件使用硬链接，移动原目录不影响现有网页链接。
+2026-10-16 按用户要求清理历史数据，目前仅保留正式 trimmed 场景与最新第 06 次仿真结果。
+pending/、playback/、archive/ 按需重新创建，不再保留旧试录和迁移备份。
+remote_mcap 中的当前文件使用相对软链接，不复制数据；移动目标后需更新软链接。
+当前网页入口为 `bin_approach_20261015_01.mcap`（正式场景）
+和 `bin_approach_20261015_01_20261015T113004Z.mcap`（最新结果）。
 
 在 robot02 上一键采集（需要机器人开机，遥控由人操作）：
 
@@ -155,10 +158,11 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 新录制完成后由用户选择是否加入，再修改对应 enabled 和 inclusion_decision 字段。
 暂不加入不会删除 bag。试录数据和 `simulation_runs` 结果不会因出现在数据盘而自动入集。
 
-`scene_dir`、`original_scene_dir`、`baseline_result_dir` 相对于 `data_root`；
+`scene_dir`、可选的 `original_scene_dir` 相对于 `data_root`；
 `map_config` 相对于代码库根目录。`scene_dir/bag` 是实际 rosbag 目录。
 迁移数据盘时修改 data_root 即可，稳定的场景 id 不变。大文件 bag 不随代码提交。
 目前单次测试脚本仍接收显式场景路径；此清单维护成员关系，不会自动启动批量测试。
+清单不绑定某次仿真结果；结果保存在 simulation_runs 下，网页软链接独立维护。
 
 ## 首版近似闭环测试
 
@@ -206,11 +210,14 @@ python3 scripts/navigation_scenarios/export_viewer_mcap.py \
   /data/junbin.zhang/navigation_scenarios/simulation_runs/bin_approach_20261015_01/bin_20261015_03_reference_scan/result_bag \
   /data/junbin.zhang/navigation_scenarios/remote_mcap/bin_20261015_03_reference_scan.mcap
 python3 scripts/navigation_scenarios/serve_mcap.py \
-  /data/junbin.zhang/navigation_scenarios/remote_mcap --bind 192.168.112.106 --port 8770
+  /data/junbin.zhang/navigation_scenarios/remote_mcap --bind 192.168.112.106 --port 8770 \
+  --allowed-root /data/junbin.zhang/navigation_scenarios \
+  --public-base-url http://127.0.0.1:18770
 ```
 
-转换目标必须不存在，原 bag 不变。文件服务只开放指定目录下的 `.mcap`，拒绝子路径
-和符号链接，支持 HTTP Range、HEAD、OPTIONS 和 Foxglove 来源的 CORS。
+转换目标必须不存在，原 bag 不变。文件服务只展示指定目录顶层的 `.mcap` 入口，拒绝子路径。
+支持软链接，但真实目标必须是 `--allowed-root` 内的 `.mcap` 文件；未指定时只允许服务目录内的目标。
+失效、循环、越界链接不会展示或提供下载。支持 HTTP Range、HEAD、OPTIONS 和 Foxglove 来源的 CORS。
 访问 `http://192.168.112.106:8770/` 选择文件进入 Foxglove Remote file 模式。
 此时底部时间轴直接暂停、播放、拖动，不使用 WebSocket 的服务调用按钮，也不需要
 机器人端 ros2 bag play。服务仅用于可访问该机器人 IP 的受信任局域网。
@@ -302,3 +309,6 @@ bash -n scripts/navigation_scenarios/capture.sh scripts/navigation_scenarios/vie
 ```
 
 完整仿真在隔离 ROS 域中运行，运行前确认该域没有其他测试。
+
+网页输入软链接命名为 `<场景目录名>.mcap`。仿真运行目录与输出软链接使用
+`<场景目录名>_<YYYYMMDDTHHMMSSZ>`，时间取该次运行的 UTC 时间，Z 表示 UTC。

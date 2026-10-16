@@ -8,11 +8,30 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 
+def resolve_mcap(root, allowed_root, name):
+    """Resolve a top-level entry, including links confined to the allowed tree."""
+    if not name or "/" in name or "\\" in name or Path(name).suffix != ".mcap":
+        return None
+    try:
+        target = (root / name).resolve(strict=True)
+        target.relative_to(allowed_root)
+        if target.suffix == ".mcap" and target.is_file():
+            return target
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument(
+        "--allowed-root",
+        type=Path,
+        help="Allowed resolved MCAP tree; defaults to the served directory",
+    )
     parser.add_argument(
         "--public-base-url",
         help="Browser-facing file URL, e.g. http://127.0.0.1:18770 through SSH forwarding",
@@ -30,6 +49,9 @@ def main():
             "--public-base-url must be an HTTP(S) base URL without query or fragment"
         )
     root = args.directory.resolve(strict=True)
+    allowed_root = (args.allowed_root or root).resolve(strict=True)
+    if not root.is_dir() or not allowed_root.is_dir():
+        parser.error("directory and --allowed-root must be directories")
 
     class Handler(BaseHTTPRequestHandler):
         def end_headers(self):
@@ -63,7 +85,7 @@ def main():
             if not name:
                 links = []
                 for path in sorted(root.glob("*.mcap")):
-                    if path.is_symlink():
+                    if resolve_mcap(root, allowed_root, path.name) is None:
                         continue
                     url = f"{public_base_url.rstrip('/')}/{quote(path.name)}"
                     viewer = (
@@ -85,14 +107,8 @@ def main():
                 if body:
                     self.wfile.write(data)
                 return
-            path = root / name
-            if (
-                "/" in name
-                or "\\" in name
-                or path.suffix != ".mcap"
-                or path.is_symlink()
-                or not path.is_file()
-            ):
+            path = resolve_mcap(root, allowed_root, name)
+            if path is None:
                 self.send_error(404)
                 return
             size = path.stat().st_size
