@@ -35,6 +35,9 @@
   测试集成员统一维护在 `scripts/navigation_scenarios/test_set.yaml`：只有 `enabled: true`
   的条目已入集。未确认条目保持 `enabled: false`、`inclusion_decision: pending`；
   确认加入后设为 true/accepted，暂不加入设为 false/deferred。
-  修改清单不删除或移动原始数据；试录目录和 simulation_runs 输出不得自动当作测试场景。
+  用户确认入集后，统一运行 scripts/navigation_scenarios/enroll.py <场景ID>：
+  将 pending 中的场景移动到 scenes、更新清单，并自动在 remote_mcap 创建可视化 bag 的相对软链接。
+  若缺少可视化 bag，先生成再入集；重复执行不得重复登记或覆盖无关文件。
+  单纯编辑清单不删除数据；试录目录和 simulation_runs 输出不得自动当作测试场景。
 - 回放和仿真必须使用独立 ROS 域，禁止向实机域 144 回放运动指令、导航目标或任务 action。
   现有 bag 近似仿真不能生成新视角观测，测试结论须保留这项限制。

@@ -155,14 +155,19 @@ use_odom_fused:=false`，定位就绪后由 `ros2 run robot_tasks session start 
 
 代码库中的 `scripts/navigation_scenarios/test_set.yaml` 是测试集成员的唯一清单。
 只有 `scenes` 下 `enabled: true` 的条目已正式收录；pending/deferred 条目不参与测试集。
-新录制完成后由用户选择是否加入，再修改对应 enabled 和 inclusion_decision 字段。
+新录制完成后由用户选择是否加入，确认后在机器人运行：
+`python3 scripts/navigation_scenarios/enroll.py <场景ID>`。
+此命令将场景从 pending 移到 scenes、更新清单为 enabled/accepted，并自动创建
+`remote_mcap/<场景ID>_visualization.mcap` 相对软链接。重复执行不会重复登记。
+入集前必须已有完整的 bag、visualization_bag 和 verification.json；缺少预览时先运行 preview.py。
+机器人清单更新后应同步回本地代码库，随代码提交。
 暂不加入不会删除 bag。试录数据和 `simulation_runs` 结果不会因出现在数据盘而自动入集。
 
 `scene_dir`、可选的 `original_scene_dir` 相对于 `data_root`；
 `map_config` 相对于代码库根目录。`scene_dir/bag` 是实际 rosbag 目录。
 迁移数据盘时修改 data_root 即可，稳定的场景 id 不变。大文件 bag 不随代码提交。
 目前单次测试脚本仍接收显式场景路径；此清单维护成员关系，不会自动启动批量测试。
-清单不绑定某次仿真结果；结果保存在 simulation_runs 下，网页软链接独立维护。
+清单不绑定某次仿真结果；结果保存在 simulation_runs 下。输入预览软链接随入集自动创建。
 
 ## 首版近似闭环测试
 
