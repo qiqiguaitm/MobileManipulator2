@@ -30,3 +30,25 @@ scenes:
       - 目标位置由 RGB-D 检测生成；首轮基线使用千问、NavFn 和 TEB。
       - 当前仅验证一次接近，不含机械臂抓取或完整巡检循环。
       - 激光观测与运动模型是近似仿真，不能等同实机安全验证。
+
+  - id: fire_extinguisher_approach_20261016_01
+    name: 接近红色灭火器
+    enabled: true
+    inclusion_decision: accepted
+    included_on: "2026-10-16"
+    task_description: 识别并接近红色灭火器
+    scene_dir: scenes/fire_extinguisher_approach_20261016_01
+    capture_mode: teleoperation
+    duration_seconds: 34.54940867
+    tags: [navigation, target_detection, approximate_closed_loop]
+    data_quality:
+      verification_status: passed_data_checks
+      scan_tf_coverage: 1.0
+      known_issues:
+        - 未指定独立的 benchmark goal；遥控终点不能作为算法输入目标。
+        - 历史采集仍包含 /scenario/start 话题。
+    evaluation_notes:
+      - 地图与标定副本保存在场景的 capture_assets 目录中。
+      - 入集依据已有数据完整性报告，尚未进行本场景的导航仿真评测。
+      - 目标位置应由 RGB-D 检测生成，遥控轨迹及终点只用于评价。
+      - 激光观测与运动模型是近似仿真，不能等同实机安全验证。
